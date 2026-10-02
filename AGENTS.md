@@ -177,3 +177,19 @@ Sequence these; don't parallelize on the same port.
 | `MESHTASTIC_UI_CAMERA_DEVICE_<ROLE>` | Per-role camera pinning (e.g. `MESHTASTIC_UI_CAMERA_DEVICE_ESP32S3=0` for the OLED-bearing heltec-v3).                                                                                                     |
 | `MESHTASTIC_UI_OCR_BACKEND`          | OCR engine selection: `easyocr` / `pytesseract` / `null` / `auto` (default).                                                                                                                               |
 | `MESHTASTIC_UI_TUI_CAMERA`           | Set to `1` to mount the live camera-feed panel in `meshtastic-mcp-test-tui`.                                                                                                                               |
+
+## Agent skills
+
+Fork-only section (the-Drunken-coder/meshtastic-firmware). Matt Pocock's engineering skills are vendored in `.agents/skills/` (`matt-*`). Upstream's "no docs/ and no write-ups in the tree" house rule still applies to anything proposed to meshtastic/firmware; the files below exist only for this fork's agent workflow.
+
+### Issue tracker
+
+Local markdown under `.scratch/<feature-slug>/` (GitHub Issues are disabled on this fork; never file upstream). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context. See `docs/agents/domain.md`.

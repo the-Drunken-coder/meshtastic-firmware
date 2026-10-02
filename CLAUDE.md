@@ -28,3 +28,19 @@ This file (`CLAUDE.md`) is a short pointer for Claude Code sessions. Slash comma
 ## House rule: documentation does not live in this repo
 
 This repository holds firmware code. There is no `docs/` directory - the design documents that used to sit there were published to [meshtastic/meshtastic](https://github.com/meshtastic/meshtastic) in #11488 and the directory was deleted - and it must not come back. Do not create a `.md` file to describe a feature, a configuration surface, an API, a wire format, or a design; write it in the docs repo and link that PR instead. Never leave a write-up behind in the tree: no investigation notes, no mitigation plans, no migration checklists, no "how we got here" narrative, no summaries of what a change did. That is what the PR description and the commit message are for, and they are the only place it belongs. When you do write documentation upstream, write a technical manual, not a novel - what the feature does, the settings it exposes in the user's terms, and the exact API or protocol a client speaks. No story of the debugging journey, no rationale essays, no changelog prose. Concise and factual, as short as the facts allow.
+
+## Agent skills
+
+Fork-only section (the-Drunken-coder/meshtastic-firmware). Matt Pocock's engineering skills are vendored in `.agents/skills/` (`matt-*`). Upstream's "no docs/ and no write-ups in the tree" house rule still applies to anything proposed to meshtastic/firmware; the files below exist only for this fork's agent workflow.
+
+### Issue tracker
+
+Local markdown under `.scratch/<feature-slug>/` (GitHub Issues are disabled on this fork; never file upstream). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context. See `docs/agents/domain.md`.
