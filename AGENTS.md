@@ -184,7 +184,7 @@ Fork-only section (the-Drunken-coder/meshtastic-firmware). Matt Pocock's enginee
 
 ### Issue tracker
 
-Local markdown under `.scratch/<feature-slug>/` (GitHub Issues are disabled on this fork; never file upstream). See `docs/agents/issue-tracker.md`.
+Use GitHub Issues on `the-Drunken-coder/meshtastic-workspace` for specs, tickets, decisions, and triage. Read `docs/agents/issue-tracker.md` before tracker operations.
 
 ### Triage labels
 
