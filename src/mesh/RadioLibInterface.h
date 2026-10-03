@@ -242,7 +242,7 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
      */
     virtual void startReceive();
 
-    /** can we detect a LoRa preamble on the current channel? */
+    /** Is the channel busy? Scans that stop RX must clear isReceiving; passive observations retain it. */
     virtual bool isChannelActive() = 0;
 
     /** are we actively receiving a packet (only called during receiving state)

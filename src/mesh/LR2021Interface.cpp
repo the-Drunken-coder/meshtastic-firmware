@@ -11,6 +11,22 @@
 #include "mesh/NodeDB.h"
 #include <cmath>
 
+namespace
+{
+bool isFlrcReceptionActive(uint32_t flags, uint32_t &activeReceiveStart)
+{
+    // FLRC has no LoRa header-valid flag; bound a stale sync/preamble by a maximum frame budget.
+    bool detected = flags & (RADIOLIB_LR2021_IRQ_SYNCWORD_VALID | RADIOLIB_LR2021_IRQ_PREAMBLE_DETECTED);
+    if (!detected || (flags & W12FlrcProfile::RECEIVE_IRQS)) {
+        activeReceiveStart = 0;
+        return false;
+    }
+    if (!activeReceiveStart)
+        activeReceiveStart = Time::skipZero(Time::getMillis());
+    return Throttle::isWithinTimespanMs(activeReceiveStart, W12FlrcProfile::durationMs(MAX_LORA_PAYLOAD_LEN));
+}
+} // namespace
+
 LR2021Interface::LR2021Interface(LockingArduinoHal *hal, RADIOLIB_PIN_TYPE cs, RADIOLIB_PIN_TYPE irq, RADIOLIB_PIN_TYPE rst,
                                  RADIOLIB_PIN_TYPE busy)
     : LR20x0Interface(hal, cs, irq, rst, busy)
@@ -42,6 +58,10 @@ bool LR2021Interface::init()
 
 bool LR2021Interface::beginFlrc()
 {
+    // Full profile setup stops RX; recovery callers must rearm it even if setup fails.
+    isReceiving = false;
+    activeReceiveStart = 0;
+    disableInterrupt();
 #if defined(MESHNOLOGY_W12) && !ARCH_PORTDUINO
     pinMode(LR2021_RF_SWITCH_SUBGHZ, OUTPUT);
     digitalWrite(LR2021_RF_SWITCH_SUBGHZ, HIGH);
@@ -133,6 +153,16 @@ bool LR2021Interface::isChannelActive()
     for (unsigned i = 0; i < 3; ++i) {
         float rssi = 0;
         if (W12FlrcProfile::readRssi(module, false, rssi) != RADIOLIB_ERR_NONE) {
+            uint32_t flags = 0;
+            if (W12FlrcProfile::readIrqFlags(module, flags) == RADIOLIB_ERR_NONE) {
+                if (flags & W12FlrcProfile::RECEIVE_IRQS) {
+                    // A failed energy sample must not reset the chip before a completed RX is consumed.
+                    notify(ISR_RX, true);
+                    return true;
+                }
+                if (isFlrcReceptionActive(flags, activeReceiveStart))
+                    return true;
+            }
             maybeRecoverChipStateLoss();
             return true;
         }
@@ -149,18 +179,10 @@ bool LR2021Interface::isActivelyReceiving()
 {
     if (!RadioMode::isFlrc())
         return LR20x0Interface::isActivelyReceiving();
-    // FLRC has no LoRa header-valid flag; bound a stale sync/preamble by a maximum frame budget.
     uint32_t flags = 0;
     if (W12FlrcProfile::readIrqFlags(module, flags) != RADIOLIB_ERR_NONE)
         return true;
-    bool detected = flags & (RADIOLIB_LR2021_IRQ_SYNCWORD_VALID | RADIOLIB_LR2021_IRQ_PREAMBLE_DETECTED);
-    if (!detected || (flags & W12FlrcProfile::RECEIVE_IRQS)) {
-        activeReceiveStart = 0;
-        return false;
-    }
-    if (!activeReceiveStart)
-        activeReceiveStart = Time::skipZero(Time::getMillis());
-    return Throttle::isWithinTimespanMs(activeReceiveStart, W12FlrcProfile::durationMs(MAX_LORA_PAYLOAD_LEN));
+    return isFlrcReceptionActive(flags, activeReceiveStart);
 }
 
 int16_t LR2021Interface::getCurrentRSSI()

@@ -4,11 +4,14 @@
 // reject terminal RX errors before reading payloads, and count TX only after TX_DONE.
 // These checks use the production adapter and pinned RadioLib driver with scripted SPI,
 // guarding against adapter recovery falling into LoRa and failed sends crediting success.
+// The shared TX-delay path must defer a busy passive observation without interrupting RX
+// or clearing RX_DONE before its queued notification delivers the received frame once.
 #if ARCH_PORTDUINO && RADIOLIB_EXCLUDE_LR2021 != 1
 
 #include "../test_radiolib_drivers/RecordingHal.h"
 #include "LR2021Interface.h"
 #include "PowerMon.h"
+#include "Router.h"
 #include "UptimeClock.h"
 #include "airtime.h"
 
@@ -31,19 +34,34 @@ class W12AdapterHal : public LockingArduinoHal
     bool interruptArmed = false;
     bool interruptArmedAtSetTx = false;
     bool rawStatusFailed = false;
+    unsigned rssiReads = 0;
+    unsigned injectIrqAtRssiRead = 0;
+    uint32_t irqOnRssiRead = 0;
+    unsigned irqReads = 0;
+    unsigned injectIrqAtRead = 0;
+    uint32_t irqOnRead = 0;
+
+    void signalReceive(uint32_t flags)
+    {
+        irq = flags;
+        if ((flags & W12FlrcProfile::RECEIVE_IRQS) && interruptCallback)
+            interruptCallback();
+    }
 
     void pinMode(uint32_t, uint32_t) override {}
     void digitalWrite(uint32_t, uint32_t) override {}
     uint32_t digitalRead(uint32_t) override { return 0; }
-    void attachInterrupt(uint32_t, void (*)(void), uint32_t) override
+    void attachInterrupt(uint32_t, void (*callback)(void), uint32_t) override
     {
         interruptsArmed++;
         interruptArmed = true;
+        interruptCallback = callback;
     }
     void detachInterrupt(uint32_t) override
     {
         interruptsDisarmed++;
         interruptArmed = false;
+        interruptCallback = nullptr;
     }
     void delay(RadioLibTime_t ms) override { recording.delay(ms); }
     void delayMicroseconds(RadioLibTime_t us) override { recording.delayMicroseconds(us); }
@@ -60,6 +78,8 @@ class W12AdapterHal : public LockingArduinoHal
         recording.spiTransfer(out, length, in);
         if (rssiReplyPending) {
             rssiReplyPending = false;
+            if (++rssiReads == injectIrqAtRssiRead)
+                signalReceive(irqOnRssiRead);
             in[0] = failCommand == RADIOLIB_LR2021_CMD_GET_RSSI_INST ? 0x02 : 0x04;
             in[1] = 0x04;
             in[2] = rssiHalfDbm >> 1;
@@ -83,6 +103,8 @@ class W12AdapterHal : public LockingArduinoHal
                 in[0] = 0x02;
         }
         if (length == 6 && std::all_of(out, out + length, [](uint8_t b) { return b == 0; })) {
+            if (++irqReads == injectIrqAtRead)
+                signalReceive(irqOnRead);
             in[0] = rawStatusFailed ? 0x02 : 0x04;
             in[1] = 0x04;
             in[2] = irq >> 24;
@@ -94,6 +116,7 @@ class W12AdapterHal : public LockingArduinoHal
 
   private:
     bool rssiReplyPending = false;
+    void (*interruptCallback)() = nullptr;
 };
 
 class TestableW12Adapter : public LR2021Interface
@@ -117,12 +140,38 @@ class TestableW12Adapter : public LR2021Interface
     size_t takeTransmission(meshtastic_MeshPacket *packet) { return beginSending(packet); }
     bool sendNow(meshtastic_MeshPacket *packet) { return startSend(packet); }
     void serviceNotifications() { checkNotification(); }
+    bool queueTransmission(meshtastic_MeshPacket *packet)
+    {
+        bool dropped = false;
+        if (!txQueue.enqueue(packet, &dropped))
+            return false;
+        return notify(TRANSMIT_DELAY_COMPLETED, true);
+    }
+    void releaseQueuedTransmissions()
+    {
+        while (auto *packet = txQueue.dequeue())
+            packetPool.release(packet);
+    }
 };
 
 static W12AdapterHal *adapterHal;
 static TestableW12Adapter *adapter;
 static AirTime *savedAdapterAirTime;
 static PowerMon *savedAdapterPowerMon;
+
+class AdapterPacketReceiver : public Router
+{
+  public:
+    void enqueueReceivedMessage(meshtastic_MeshPacket *packet) override
+    {
+        packets.push_back(*packet);
+        packetPool.release(packet);
+    }
+    std::vector<meshtastic_MeshPacket> packets;
+};
+
+static AdapterPacketReceiver *adapterReceiver;
+static Router *savedAdapterRouter;
 
 static void makeW12Adapter()
 {
@@ -153,6 +202,7 @@ static void makeW12Adapter()
 static void deleteW12Adapter()
 {
     if (adapter) {
+        adapter->releaseQueuedTransmissions();
         delete adapter;
         adapter = nullptr;
         delete adapterHal;
@@ -161,6 +211,11 @@ static void deleteW12Adapter()
         airTime = savedAdapterAirTime;
         delete powerMon;
         powerMon = savedAdapterPowerMon;
+    }
+    if (adapterReceiver) {
+        router = savedAdapterRouter;
+        delete adapterReceiver;
+        adapterReceiver = nullptr;
     }
     Time::useRealClock();
 }
@@ -318,6 +373,133 @@ static meshtastic_MeshPacket *makeAdapterTransmission()
     return packet;
 }
 
+static void prepareAdapterReception()
+{
+    savedAdapterRouter = router;
+    adapterReceiver = new AdapterPacketReceiver();
+    router = adapterReceiver;
+    PacketHeader header = {};
+    header.from = 0x5678;
+    header.to = NODENUM_BROADCAST;
+    header.id = 0x87654321;
+    const uint8_t payload[] = {0x42, 0x53, 0x64};
+    std::vector<uint8_t> frame(sizeof(header) + sizeof(payload));
+    memcpy(frame.data(), &header, sizeof(header));
+    memcpy(frame.data() + sizeof(header), payload, sizeof(payload));
+    adapterHal->recording.reply(op16(RADIOLIB_LR2021_CMD_GET_RX_PKT_LENGTH), 0,
+                                {0x04, 0x04, 0, static_cast<uint8_t>(frame.size())}, true);
+    frame.insert(frame.begin(), {0x04, 0x04});
+    adapterHal->recording.reply(op16(RADIOLIB_LR2021_CMD_READ_RX_FIFO), 0, frame);
+    // Stage an ordinary queued packet to reach contention handling even when native TX policy is gated.
+    TEST_ASSERT_TRUE(adapter->queueTransmission(makeAdapterTransmission()));
+    adapterHal->recording.transactions.clear();
+    adapterHal->irqReads = 0;
+}
+
+static void assertAdapterReceptionDeliveredOnce()
+{
+    adapter->serviceNotifications();
+    TEST_ASSERT_EQUAL_UINT32(1, adapterReceiver->packets.size());
+    const auto &received = adapterReceiver->packets.front();
+    TEST_ASSERT_EQUAL_HEX32(0x5678, received.from);
+    TEST_ASSERT_EQUAL_HEX32(0x87654321, received.id);
+    const uint8_t payload[] = {0x42, 0x53, 0x64};
+    TEST_ASSERT_EQUAL_MEMORY(payload, received.encrypted.bytes, sizeof(payload));
+    TEST_ASSERT_EQUAL_UINT32(sizeof(payload), received.encrypted.size);
+    TEST_ASSERT_TRUE(received.rx_snr_unavailable);
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->badReceives());
+    TEST_ASSERT_TRUE(adapter->receiving());
+    adapter->pollMissedIrqs();
+    TEST_ASSERT_EQUAL_UINT32(1, adapterReceiver->packets.size());
+}
+
+static void test_w12_adapter_busy_tx_delay_preserves_incoming_reception()
+{
+    makeW12Adapter();
+    prepareAdapterReception();
+    adapterHal->injectIrqAtRssiRead = 1;
+    adapterHal->irqOnRssiRead = RADIOLIB_LR2021_IRQ_SYNCWORD_VALID;
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+    TEST_ASSERT_EQUAL_UINT32(0, adapterReceiver->packets.size());
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_STANDBY)));
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_TX)));
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    assertAdapterReceptionDeliveredOnce();
+}
+
+static void test_w12_adapter_busy_tx_delay_preserves_rx_done_during_last_observation()
+{
+    makeW12Adapter();
+    prepareAdapterReception();
+    adapterHal->injectIrqAtRssiRead = 3;
+    adapterHal->irqOnRssiRead = RADIOLIB_LR2021_IRQ_RX_DONE;
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(3, adapterHal->rssiReads);
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+    TEST_ASSERT_EQUAL_UINT32(RADIOLIB_LR2021_IRQ_RX_DONE, adapterHal->irq);
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_CLEAR_IRQ)));
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_STANDBY)));
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+    assertAdapterReceptionDeliveredOnce();
+}
+
+static void test_w12_adapter_failed_observation_with_recovery_suppressed_preserves_rx_done()
+{
+    makeW12Adapter();
+    prepareAdapterReception();
+    adapter->lastChipRecoveryMs = Time::getMillis();
+    adapterHal->failCommand = RADIOLIB_LR2021_CMD_GET_RSSI_INST;
+    adapterHal->injectIrqAtRssiRead = 1;
+    adapterHal->irqOnRssiRead = RADIOLIB_LR2021_IRQ_RX_DONE;
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(RADIOLIB_LR2021_IRQ_RX_DONE, adapterHal->irq);
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_FLRC_SYNCWORD)));
+    adapterHal->failCommand = 0;
+    assertAdapterReceptionDeliveredOnce();
+}
+
+static void test_w12_adapter_failed_observation_defers_fresh_recovery_until_rx_done_is_delivered()
+{
+    makeW12Adapter();
+    prepareAdapterReception();
+    adapterHal->failCommand = RADIOLIB_LR2021_CMD_GET_RSSI_INST;
+    adapterHal->injectIrqAtRssiRead = 1;
+    adapterHal->irqOnRssiRead = RADIOLIB_LR2021_IRQ_RX_DONE;
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(RADIOLIB_LR2021_IRQ_RX_DONE, adapterHal->irq);
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_FLRC_SYNCWORD)));
+    adapterHal->failCommand = 0;
+    assertAdapterReceptionDeliveredOnce();
+}
+
+static void test_w12_adapter_failed_observation_preserves_active_reception_and_later_completion()
+{
+    makeW12Adapter();
+    prepareAdapterReception();
+    adapterHal->failCommand = RADIOLIB_LR2021_CMD_GET_RSSI_INST;
+    adapterHal->injectIrqAtRssiRead = 1;
+    adapterHal->irqOnRssiRead = RADIOLIB_LR2021_IRQ_SYNCWORD_VALID;
+    // If another IRQ observation is made after the checked active snapshot, the frame completes in that read.
+    adapterHal->injectIrqAtRead = 3;
+    adapterHal->irqOnRead = RADIOLIB_LR2021_IRQ_RX_DONE;
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_FLRC_SYNCWORD)));
+    adapterHal->failCommand = 0;
+    adapterHal->injectIrqAtRead = 0;
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    assertAdapterReceptionDeliveredOnce();
+}
+
 #if defined(MESHTASTIC_W12_FLRC_EXPERIMENTAL_TX) && MESHTASTIC_W12_FLRC_EXPERIMENTAL_TX
 // A chip finishing SET_TX before its return must complete from the real queued notification,
 // without waiting for the 100ms timeout or calling a transmit handler directly.
@@ -432,6 +614,11 @@ static void runW12AdapterTests()
     RUN_TEST(test_w12_adapter_failed_irq_status_keeps_channel_busy_and_rejects_stale_rx);
     RUN_TEST(test_w12_adapter_transmit_requires_tx_done_and_never_double_completes);
     RUN_TEST(test_w12_adapter_disabling_queued_tx_restores_receive);
+    RUN_TEST(test_w12_adapter_busy_tx_delay_preserves_incoming_reception);
+    RUN_TEST(test_w12_adapter_busy_tx_delay_preserves_rx_done_during_last_observation);
+    RUN_TEST(test_w12_adapter_failed_observation_with_recovery_suppressed_preserves_rx_done);
+    RUN_TEST(test_w12_adapter_failed_observation_defers_fresh_recovery_until_rx_done_is_delivered);
+    RUN_TEST(test_w12_adapter_failed_observation_preserves_active_reception_and_later_completion);
 #if defined(MESHTASTIC_W12_FLRC_EXPERIMENTAL_TX) && MESHTASTIC_W12_FLRC_EXPERIMENTAL_TX
     RUN_TEST(test_w12_adapter_short_send_arms_irq_before_set_tx_and_completes_immediately);
     RUN_TEST(test_w12_adapter_send_without_tx_done_times_out_and_releases_packet_once);

@@ -440,9 +440,10 @@ void RadioLibInterface::onNotify(uint32_t notification)
                 } else if (action == RadioTxHook::PRETX_DEFER) {
                     setTransmitDelay(); // the radio config moved, so re-run the delay and scan on it
                 } else {
-                    if (isChannelActive()) { // check if there is currently a LoRa packet on the channel
-                        if (!RadioTxHooks::holdsRadio(txp)) {
-                            startReceive(); // try receiving this packet, afterwards we'll be trying to transmit again
+                    if (isChannelActive()) {
+                        // Passive observations leave RX armed; restarting would discard the packet just detected.
+                        if (!isReceiving && !RadioTxHooks::holdsRadio(txp)) {
+                            startReceive();
                         }
                         setTransmitDelay();
                     } else {
