@@ -18,6 +18,7 @@
 #include "mesh/NextHopRouter.h"
 #include "mesh/NodeDB.h"
 #include "mesh/RadioInterface.h"
+#include "mesh/RadioMode.h"
 #include "mesh/ReliableRouter.h"
 #include "modules/RoutingModule.h"
 #include <cstdio>
@@ -73,6 +74,7 @@ class MockNodeDB : public NodeDB
         nodeInfoLiteSetBit(&node, NODEINFO_BITFIELD_IS_FAVORITE_MASK, favorite);
         nodeInfoLiteSetBit(&node, NODEINFO_BITFIELD_IS_IGNORED_MASK, ignored);
         nodeInfoLiteSetBit(&node, NODEINFO_BITFIELD_HAS_USER_MASK, true);
+        nodeInfoLiteSetHeardSlot(&node, committedLoraSlot(), RadioMode::isFlrc());
         testNodes.push_back(node);
         meshNodes = &testNodes;
         numMeshNodes = testNodes.size();
@@ -420,6 +422,10 @@ void setUp(void)
     reliableRadio->reset();
     mockRoutingModule->ackNaks.clear();
     configureBehaviorChannels();
+    config.lora.has_radio_mode = true;
+    config.lora.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_LORA;
+    RadioMode::initialize(config.lora);
+    mockNodeDB->refreshCommittedLoraSlot();
 }
 
 void tearDown(void) {}
@@ -432,6 +438,20 @@ void test_resolve_none_when_empty(void)
 {
     ResolvedNode r = mockNodeDB->resolveLastByte(0xAB, true);
     TEST_ASSERT_EQUAL(LastByteResolution::None, r.status);
+}
+
+// A recent LoRa neighbor is still a different physical mesh after an FLRC reboot.
+static void test_resolve_rejectsNeighborFromPreviousMode(void)
+{
+    mockNodeDB->addNode(0x222200AB, 0, true, 0);
+    TEST_ASSERT_EQUAL(LastByteResolution::Unique, mockNodeDB->resolveLastByte(0xAB, true).status);
+    config.lora.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_FLRC;
+    RadioMode::initialize(config.lora);
+    mockNodeDB->refreshCommittedLoraSlot();
+    TEST_ASSERT_EQUAL(LastByteResolution::None, mockNodeDB->resolveLastByte(0xAB, true).status);
+    auto *neighbor = mockNodeDB->getMeshNode(0x222200AB);
+    nodeInfoLiteSetHeardSlot(neighbor, mockNodeDB->committedLoraSlot(), true);
+    TEST_ASSERT_EQUAL(LastByteResolution::Unique, mockNodeDB->resolveLastByte(0xAB, true).status);
 }
 
 void test_resolve_zero_byte_is_none(void)
@@ -1086,6 +1106,7 @@ void setup()
     routingModule = mockRoutingModule;
 
     printf("\n=== resolveLastByte (M1) ===\n");
+    RUN_TEST(test_resolve_rejectsNeighborFromPreviousMode);
     RUN_TEST(test_resolve_none_when_empty);
     RUN_TEST(test_resolve_zero_byte_is_none);
     RUN_TEST(test_resolve_unique_neighbor);

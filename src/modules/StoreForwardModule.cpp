@@ -207,6 +207,7 @@ void StoreForwardModule::historyAdd(const meshtastic_MeshPacket &mp)
     this->packetHistory[this->packetHistoryTotalCount].rx_rssi = mp.rx_rssi;
     this->packetHistory[this->packetHistoryTotalCount].has_rx_rssi = mp.has_rx_rssi;
     this->packetHistory[this->packetHistoryTotalCount].rx_snr = mp.rx_snr;
+    this->packetHistory[this->packetHistoryTotalCount].rx_snr_unavailable = mp.rx_snr_unavailable;
     this->packetHistory[this->packetHistoryTotalCount].hop_start = mp.hop_start;
     this->packetHistory[this->packetHistoryTotalCount].hop_limit = mp.hop_limit;
     this->packetHistory[this->packetHistoryTotalCount].via_mqtt = mp.via_mqtt;
@@ -266,6 +267,7 @@ meshtastic_MeshPacket *StoreForwardModule::preparePayload(NodeNum dest, uint32_t
                 p->rx_rssi = this->packetHistory[i].rx_rssi;
                 p->has_rx_rssi = this->packetHistory[i].has_rx_rssi; // presence captured at store time, not replay time
                 p->rx_snr = this->packetHistory[i].rx_snr;
+                p->rx_snr_unavailable = this->packetHistory[i].rx_snr_unavailable;
                 p->hop_start = this->packetHistory[i].hop_start;
                 p->hop_limit = this->packetHistory[i].hop_limit;
                 p->via_mqtt = this->packetHistory[i].via_mqtt;

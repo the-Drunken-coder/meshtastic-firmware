@@ -95,6 +95,14 @@ typedef enum _meshtastic_AdminMessage_BackupLocation {
     meshtastic_AdminMessage_BackupLocation_SD = 1
 } meshtastic_AdminMessage_BackupLocation;
 
+typedef enum _meshtastic_RadioModeStatus_BlockedReason {
+    meshtastic_RadioModeStatus_BlockedReason_NONE = 0,
+    meshtastic_RadioModeStatus_BlockedReason_INVALID_CONFIGURATION = 1,
+    meshtastic_RadioModeStatus_BlockedReason_NOT_INITIALIZED = 2,
+    meshtastic_RadioModeStatus_BlockedReason_RF_APPROVAL_REQUIRED = 3,
+    meshtastic_RadioModeStatus_BlockedReason_TX_DISABLED = 4
+} meshtastic_RadioModeStatus_BlockedReason;
+
 /* Three stages of this request. */
 typedef enum _meshtastic_KeyVerificationAdmin_MessageType {
     /* This is the first stage, where a client initiates */
@@ -131,6 +139,21 @@ typedef struct _meshtastic_AdminMessage_OTAEvent {
  Used to verify the integrity of the firmware before applying an update. */
     meshtastic_AdminMessage_OTAEvent_ota_hash_t ota_hash;
 } meshtastic_AdminMessage_OTAEvent;
+
+/* Radio-mode contract version 1. Experimental TX is a build opt-in, not RF approval. */
+typedef struct _meshtastic_RadioModeStatus {
+    uint32_t capability_version;
+    bool flrc_supported;
+    meshtastic_Config_LoRaConfig_RadioMode configured_mode;
+    meshtastic_Config_LoRaConfig_RadioMode active_mode;
+    bool active_initialized;
+    bool restart_pending;
+    bool configuration_valid;
+    bool transmit_allowed;
+    bool experimental_tx_enabled;
+    float carrier_mhz;
+    meshtastic_RadioModeStatus_BlockedReason blocked_reason;
+} meshtastic_RadioModeStatus;
 
 typedef PB_BYTES_ARRAY_T(32) meshtastic_LockdownAuth_passphrase_t;
 /* Lockdown passphrase delivery payload.
@@ -542,6 +565,10 @@ typedef struct _meshtastic_AdminMessage {
      Replaces the earlier scheme that repurposed SecurityConfig.private_key
      to carry passphrase bytes; that hack is retired. */
         meshtastic_LockdownAuth lockdown_auth;
+        /* Read the radio-mode capability and the saved/active state before writing a mode. */
+        bool get_radio_mode_status_request;
+        /* Physical radio state, distinct from retained LoRa tuning configuration. */
+        meshtastic_RadioModeStatus get_radio_mode_status_response;
     };
     /* The node generates this key and sends it with any get_x_response packets.
  The client MUST include the same key with any set_x commands. Key expires after 300 seconds.
@@ -571,6 +598,10 @@ extern "C" {
 #define _meshtastic_AdminMessage_BackupLocation_MAX meshtastic_AdminMessage_BackupLocation_SD
 #define _meshtastic_AdminMessage_BackupLocation_ARRAYSIZE ((meshtastic_AdminMessage_BackupLocation)(meshtastic_AdminMessage_BackupLocation_SD+1))
 
+#define _meshtastic_RadioModeStatus_BlockedReason_MIN meshtastic_RadioModeStatus_BlockedReason_NONE
+#define _meshtastic_RadioModeStatus_BlockedReason_MAX meshtastic_RadioModeStatus_BlockedReason_TX_DISABLED
+#define _meshtastic_RadioModeStatus_BlockedReason_ARRAYSIZE ((meshtastic_RadioModeStatus_BlockedReason)(meshtastic_RadioModeStatus_BlockedReason_TX_DISABLED+1))
+
 #define _meshtastic_KeyVerificationAdmin_MessageType_MIN meshtastic_KeyVerificationAdmin_MessageType_INITIATE_VERIFICATION
 #define _meshtastic_KeyVerificationAdmin_MessageType_MAX meshtastic_KeyVerificationAdmin_MessageType_DO_NOT_VERIFY
 #define _meshtastic_KeyVerificationAdmin_MessageType_ARRAYSIZE ((meshtastic_KeyVerificationAdmin_MessageType)(meshtastic_KeyVerificationAdmin_MessageType_DO_NOT_VERIFY+1))
@@ -583,6 +614,10 @@ extern "C" {
 
 
 #define meshtastic_AdminMessage_OTAEvent_reboot_ota_mode_ENUMTYPE meshtastic_OTAMode
+
+#define meshtastic_RadioModeStatus_configured_mode_ENUMTYPE meshtastic_Config_LoRaConfig_RadioMode
+#define meshtastic_RadioModeStatus_active_mode_ENUMTYPE meshtastic_Config_LoRaConfig_RadioMode
+#define meshtastic_RadioModeStatus_blocked_reason_ENUMTYPE meshtastic_RadioModeStatus_BlockedReason
 
 
 
@@ -603,6 +638,7 @@ extern "C" {
 #define meshtastic_AdminMessage_init_default     {0, {0}, {0, {0}}}
 #define meshtastic_AdminMessage_InputEvent_init_default {0, 0, 0, 0}
 #define meshtastic_AdminMessage_OTAEvent_init_default {_meshtastic_OTAMode_MIN, {0, {0}}}
+#define meshtastic_RadioModeStatus_init_default  {0, 0, _meshtastic_Config_LoRaConfig_RadioMode_MIN, _meshtastic_Config_LoRaConfig_RadioMode_MIN, 0, 0, 0, 0, 0, 0, _meshtastic_RadioModeStatus_BlockedReason_MIN}
 #define meshtastic_LockdownAuth_init_default     {{0, {0}}, 0, 0, 0, 0, 0}
 #define meshtastic_HamParameters_init_default    {"", 0, 0, "", ""}
 #define meshtastic_NodeRemoteHardwarePinsResponse_init_default {0, {meshtastic_NodeRemoteHardwarePin_init_default, meshtastic_NodeRemoteHardwarePin_init_default, meshtastic_NodeRemoteHardwarePin_init_default, meshtastic_NodeRemoteHardwarePin_init_default, meshtastic_NodeRemoteHardwarePin_init_default, meshtastic_NodeRemoteHardwarePin_init_default, meshtastic_NodeRemoteHardwarePin_init_default, meshtastic_NodeRemoteHardwarePin_init_default, meshtastic_NodeRemoteHardwarePin_init_default, meshtastic_NodeRemoteHardwarePin_init_default, meshtastic_NodeRemoteHardwarePin_init_default, meshtastic_NodeRemoteHardwarePin_init_default, meshtastic_NodeRemoteHardwarePin_init_default, meshtastic_NodeRemoteHardwarePin_init_default, meshtastic_NodeRemoteHardwarePin_init_default, meshtastic_NodeRemoteHardwarePin_init_default}}
@@ -619,6 +655,7 @@ extern "C" {
 #define meshtastic_AdminMessage_init_zero        {0, {0}, {0, {0}}}
 #define meshtastic_AdminMessage_InputEvent_init_zero {0, 0, 0, 0}
 #define meshtastic_AdminMessage_OTAEvent_init_zero {_meshtastic_OTAMode_MIN, {0, {0}}}
+#define meshtastic_RadioModeStatus_init_zero     {0, 0, _meshtastic_Config_LoRaConfig_RadioMode_MIN, _meshtastic_Config_LoRaConfig_RadioMode_MIN, 0, 0, 0, 0, 0, 0, _meshtastic_RadioModeStatus_BlockedReason_MIN}
 #define meshtastic_LockdownAuth_init_zero        {{0, {0}}, 0, 0, 0, 0, 0}
 #define meshtastic_HamParameters_init_zero       {"", 0, 0, "", ""}
 #define meshtastic_NodeRemoteHardwarePinsResponse_init_zero {0, {meshtastic_NodeRemoteHardwarePin_init_zero, meshtastic_NodeRemoteHardwarePin_init_zero, meshtastic_NodeRemoteHardwarePin_init_zero, meshtastic_NodeRemoteHardwarePin_init_zero, meshtastic_NodeRemoteHardwarePin_init_zero, meshtastic_NodeRemoteHardwarePin_init_zero, meshtastic_NodeRemoteHardwarePin_init_zero, meshtastic_NodeRemoteHardwarePin_init_zero, meshtastic_NodeRemoteHardwarePin_init_zero, meshtastic_NodeRemoteHardwarePin_init_zero, meshtastic_NodeRemoteHardwarePin_init_zero, meshtastic_NodeRemoteHardwarePin_init_zero, meshtastic_NodeRemoteHardwarePin_init_zero, meshtastic_NodeRemoteHardwarePin_init_zero, meshtastic_NodeRemoteHardwarePin_init_zero, meshtastic_NodeRemoteHardwarePin_init_zero}}
@@ -640,6 +677,17 @@ extern "C" {
 #define meshtastic_AdminMessage_InputEvent_touch_y_tag 4
 #define meshtastic_AdminMessage_OTAEvent_reboot_ota_mode_tag 1
 #define meshtastic_AdminMessage_OTAEvent_ota_hash_tag 2
+#define meshtastic_RadioModeStatus_capability_version_tag 1
+#define meshtastic_RadioModeStatus_flrc_supported_tag 2
+#define meshtastic_RadioModeStatus_configured_mode_tag 3
+#define meshtastic_RadioModeStatus_active_mode_tag 4
+#define meshtastic_RadioModeStatus_active_initialized_tag 5
+#define meshtastic_RadioModeStatus_restart_pending_tag 6
+#define meshtastic_RadioModeStatus_configuration_valid_tag 7
+#define meshtastic_RadioModeStatus_transmit_allowed_tag 8
+#define meshtastic_RadioModeStatus_experimental_tx_enabled_tag 9
+#define meshtastic_RadioModeStatus_carrier_mhz_tag 10
+#define meshtastic_RadioModeStatus_blocked_reason_tag 11
 #define meshtastic_LockdownAuth_passphrase_tag   1
 #define meshtastic_LockdownAuth_boots_remaining_tag 2
 #define meshtastic_LockdownAuth_valid_until_epoch_tag 3
@@ -752,6 +800,8 @@ extern "C" {
 #define meshtastic_AdminMessage_ota_request_tag  102
 #define meshtastic_AdminMessage_sensor_config_tag 103
 #define meshtastic_AdminMessage_lockdown_auth_tag 104
+#define meshtastic_AdminMessage_get_radio_mode_status_request_tag 105
+#define meshtastic_AdminMessage_get_radio_mode_status_response_tag 106
 #define meshtastic_AdminMessage_session_passkey_tag 101
 
 /* Struct field encoding specification for nanopb */
@@ -814,7 +864,9 @@ X(a, STATIC,   ONEOF,    BOOL,     (payload_variant,nodedb_reset,nodedb_reset), 
 X(a, STATIC,   SINGULAR, BYTES,    session_passkey, 101) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,ota_request,ota_request), 102) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,sensor_config,sensor_config), 103) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,lockdown_auth,lockdown_auth), 104)
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,lockdown_auth,lockdown_auth), 104) \
+X(a, STATIC,   ONEOF,    BOOL,     (payload_variant,get_radio_mode_status_request,get_radio_mode_status_request), 105) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,get_radio_mode_status_response,get_radio_mode_status_response), 106)
 #define meshtastic_AdminMessage_CALLBACK NULL
 #define meshtastic_AdminMessage_DEFAULT NULL
 #define meshtastic_AdminMessage_payload_variant_get_channel_response_MSGTYPE meshtastic_Channel
@@ -838,6 +890,7 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload_variant,lockdown_auth,lockdown_auth)
 #define meshtastic_AdminMessage_payload_variant_ota_request_MSGTYPE meshtastic_AdminMessage_OTAEvent
 #define meshtastic_AdminMessage_payload_variant_sensor_config_MSGTYPE meshtastic_SensorConfig
 #define meshtastic_AdminMessage_payload_variant_lockdown_auth_MSGTYPE meshtastic_LockdownAuth
+#define meshtastic_AdminMessage_payload_variant_get_radio_mode_status_response_MSGTYPE meshtastic_RadioModeStatus
 
 #define meshtastic_AdminMessage_InputEvent_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UINT32,   event_code,        1) \
@@ -852,6 +905,21 @@ X(a, STATIC,   SINGULAR, UENUM,    reboot_ota_mode,   1) \
 X(a, STATIC,   SINGULAR, BYTES,    ota_hash,          2)
 #define meshtastic_AdminMessage_OTAEvent_CALLBACK NULL
 #define meshtastic_AdminMessage_OTAEvent_DEFAULT NULL
+
+#define meshtastic_RadioModeStatus_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, UINT32,   capability_version,   1) \
+X(a, STATIC,   SINGULAR, BOOL,     flrc_supported,    2) \
+X(a, STATIC,   SINGULAR, UENUM,    configured_mode,   3) \
+X(a, STATIC,   SINGULAR, UENUM,    active_mode,       4) \
+X(a, STATIC,   SINGULAR, BOOL,     active_initialized,   5) \
+X(a, STATIC,   SINGULAR, BOOL,     restart_pending,   6) \
+X(a, STATIC,   SINGULAR, BOOL,     configuration_valid,   7) \
+X(a, STATIC,   SINGULAR, BOOL,     transmit_allowed,   8) \
+X(a, STATIC,   SINGULAR, BOOL,     experimental_tx_enabled,   9) \
+X(a, STATIC,   SINGULAR, FLOAT,    carrier_mhz,      10) \
+X(a, STATIC,   SINGULAR, UENUM,    blocked_reason,   11)
+#define meshtastic_RadioModeStatus_CALLBACK NULL
+#define meshtastic_RadioModeStatus_DEFAULT NULL
 
 #define meshtastic_LockdownAuth_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, BYTES,    passphrase,        1) \
@@ -971,6 +1039,7 @@ X(a, STATIC,   OPTIONAL, UINT32,   set_tuning_cap_pf,   1)
 extern const pb_msgdesc_t meshtastic_AdminMessage_msg;
 extern const pb_msgdesc_t meshtastic_AdminMessage_InputEvent_msg;
 extern const pb_msgdesc_t meshtastic_AdminMessage_OTAEvent_msg;
+extern const pb_msgdesc_t meshtastic_RadioModeStatus_msg;
 extern const pb_msgdesc_t meshtastic_LockdownAuth_msg;
 extern const pb_msgdesc_t meshtastic_HamParameters_msg;
 extern const pb_msgdesc_t meshtastic_NodeRemoteHardwarePinsResponse_msg;
@@ -989,6 +1058,7 @@ extern const pb_msgdesc_t meshtastic_AS3935_config_msg;
 #define meshtastic_AdminMessage_fields &meshtastic_AdminMessage_msg
 #define meshtastic_AdminMessage_InputEvent_fields &meshtastic_AdminMessage_InputEvent_msg
 #define meshtastic_AdminMessage_OTAEvent_fields &meshtastic_AdminMessage_OTAEvent_msg
+#define meshtastic_RadioModeStatus_fields &meshtastic_RadioModeStatus_msg
 #define meshtastic_LockdownAuth_fields &meshtastic_LockdownAuth_msg
 #define meshtastic_HamParameters_fields &meshtastic_HamParameters_msg
 #define meshtastic_NodeRemoteHardwarePinsResponse_fields &meshtastic_NodeRemoteHardwarePinsResponse_msg
@@ -1014,6 +1084,7 @@ extern const pb_msgdesc_t meshtastic_AS3935_config_msg;
 #define meshtastic_KeyVerificationAdmin_size     25
 #define meshtastic_LockdownAuth_size             56
 #define meshtastic_NodeRemoteHardwarePinsResponse_size 496
+#define meshtastic_RadioModeStatus_size          29
 #define meshtastic_SCD30_config_size             27
 #define meshtastic_SCD4X_config_size             29
 #define meshtastic_SEN5X_config_size             9

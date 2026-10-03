@@ -5,6 +5,7 @@
 #include "FSCommon.h"
 #include "MeshService.h"
 #include "NodeDB.h"
+#include "RadioMode.h"
 #include "UIRenderer.h"
 #include "airtime.h"
 #include "gps/RTC.h"
@@ -228,7 +229,9 @@ void drawLoRaFocused(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x,
     // === Third Row: Radio Preset ===
     // For custom modem settings show the actual parameters; for presets use the preset name.
     char modeStr[16];
-    if (!config.lora.use_preset) {
+    if (RadioMode::isFlrc()) {
+        snprintf(modeStr, sizeof(modeStr), "FLRC");
+    } else if (!config.lora.use_preset) {
         snprintf(modeStr, sizeof(modeStr), "BW%u-SF%u-CR%u", static_cast<unsigned>(config.lora.bandwidth),
                  static_cast<unsigned>(config.lora.spread_factor), static_cast<unsigned>(config.lora.coding_rate));
     } else {
@@ -255,7 +258,7 @@ void drawLoRaFocused(OLEDDisplay *display, OLEDDisplayUiState *state, int16_t x,
     char freqStr[16];
     float freq = RadioLibInterface::instance->getFreq();
     snprintf(freqStr, sizeof(freqStr), "%.3f", freq);
-    if (config.lora.channel_num == 0) {
+    if (RadioMode::isFlrc() || config.lora.channel_num == 0) {
         if (currentResolution == ScreenResolution::UltraLow) {
             snprintf(frequencyslot, sizeof(frequencyslot), "%sMHz", freqStr);
         } else {

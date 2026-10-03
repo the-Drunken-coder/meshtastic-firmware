@@ -15,6 +15,9 @@ PB_BIND(meshtastic_AdminMessage_InputEvent, meshtastic_AdminMessage_InputEvent, 
 PB_BIND(meshtastic_AdminMessage_OTAEvent, meshtastic_AdminMessage_OTAEvent, AUTO)
 
 
+PB_BIND(meshtastic_RadioModeStatus, meshtastic_RadioModeStatus, AUTO)
+
+
 PB_BIND(meshtastic_LockdownAuth, meshtastic_LockdownAuth, AUTO)
 
 
@@ -52,16 +55,3 @@ PB_BIND(meshtastic_DS248X_config, meshtastic_DS248X_config, AUTO)
 
 
 PB_BIND(meshtastic_AS3935_config, meshtastic_AS3935_config, AUTO)
-
-
-
-
-
-
-
-
-
-
-
-
-

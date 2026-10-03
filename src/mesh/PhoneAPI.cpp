@@ -1305,6 +1305,7 @@ meshtastic_MeshPacket PhoneAPI::makeReplayPositionPacket(const meshtastic_NodeIn
     pkt.id = makeReplayPacketId(header->num, pkt.rx_time, meshtastic_PortNum_POSITION_APP);
     pkt.channel = header->channel;
     pkt.rx_snr = header->snr;
+    pkt.rx_snr_unavailable = nodeInfoLiteHeardFlrc(header);
     pkt.via_mqtt = nodeInfoLiteViaMqtt(header);
     setReplayHopFields(pkt, header);
     pkt.priority = meshtastic_MeshPacket_Priority_BACKGROUND;
@@ -1332,6 +1333,7 @@ meshtastic_MeshPacket PhoneAPI::makeReplayTelemetryPacket(const meshtastic_NodeI
     pkt.id = makeReplayPacketId(header->num, pkt.rx_time, meshtastic_Telemetry_device_metrics_tag);
     pkt.channel = header->channel;
     pkt.rx_snr = header->snr;
+    pkt.rx_snr_unavailable = nodeInfoLiteHeardFlrc(header);
     pkt.via_mqtt = nodeInfoLiteViaMqtt(header);
     setReplayHopFields(pkt, header);
     pkt.priority = meshtastic_MeshPacket_Priority_BACKGROUND;
@@ -1444,6 +1446,7 @@ meshtastic_MeshPacket PhoneAPI::makeReplayEnvironmentPacket(const meshtastic_Nod
     pkt.id = makeReplayPacketId(header->num, pkt.rx_time, meshtastic_Telemetry_environment_metrics_tag);
     pkt.channel = header->channel;
     pkt.rx_snr = header->snr;
+    pkt.rx_snr_unavailable = nodeInfoLiteHeardFlrc(header);
     pkt.via_mqtt = nodeInfoLiteViaMqtt(header);
     setReplayHopFields(pkt, header);
     pkt.priority = meshtastic_MeshPacket_Priority_BACKGROUND;
@@ -1512,6 +1515,7 @@ meshtastic_MeshPacket PhoneAPI::makeReplayStatusPacket(const meshtastic_NodeInfo
     pkt.id = makeReplayPacketId(header->num, pkt.rx_time, meshtastic_PortNum_NODE_STATUS_APP);
     pkt.channel = header->channel;
     pkt.rx_snr = header->snr;
+    pkt.rx_snr_unavailable = nodeInfoLiteHeardFlrc(header);
     pkt.via_mqtt = nodeInfoLiteViaMqtt(header);
     setReplayHopFields(pkt, header);
     pkt.priority = meshtastic_MeshPacket_Priority_BACKGROUND;

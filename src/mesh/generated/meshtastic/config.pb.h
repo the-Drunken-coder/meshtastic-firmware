@@ -235,6 +235,12 @@ typedef enum _meshtastic_Config_DisplayConfig_CompassOrientation {
     meshtastic_Config_DisplayConfig_CompassOrientation_DEGREES_270_INVERTED = 7
 } meshtastic_Config_DisplayConfig_CompassOrientation;
 
+/* Physical modulation. The retained LoRa tuning fields do not tune FLRC. */
+typedef enum _meshtastic_Config_LoRaConfig_RadioMode {
+    meshtastic_Config_LoRaConfig_RadioMode_LORA = 0,
+    meshtastic_Config_LoRaConfig_RadioMode_FLRC = 1
+} meshtastic_Config_LoRaConfig_RadioMode;
+
 typedef enum _meshtastic_Config_LoRaConfig_RegionCode {
     /* Region is not set */
     meshtastic_Config_LoRaConfig_RegionCode_UNSET = 0,
@@ -671,6 +677,10 @@ typedef struct _meshtastic_Config_LoRaConfig {
     meshtastic_Config_LoRaConfig_FEM_LNA_Mode fem_lna_mode;
     /* Don't use radiolib to initialize the radio, instead listen for a serialHal connection */
     bool serial_hal_only;
+    /* Device-wide mode, applied after reboot. Old saved configuration defaults to
+ LoRa; an omitted field in an update preserves the current selection. */
+    bool has_radio_mode;
+    meshtastic_Config_LoRaConfig_RadioMode radio_mode;
 } meshtastic_Config_LoRaConfig;
 
 typedef struct _meshtastic_Config_BluetoothConfig {
@@ -784,6 +794,10 @@ extern "C" {
 #define _meshtastic_Config_DisplayConfig_CompassOrientation_MAX meshtastic_Config_DisplayConfig_CompassOrientation_DEGREES_270_INVERTED
 #define _meshtastic_Config_DisplayConfig_CompassOrientation_ARRAYSIZE ((meshtastic_Config_DisplayConfig_CompassOrientation)(meshtastic_Config_DisplayConfig_CompassOrientation_DEGREES_270_INVERTED+1))
 
+#define _meshtastic_Config_LoRaConfig_RadioMode_MIN meshtastic_Config_LoRaConfig_RadioMode_LORA
+#define _meshtastic_Config_LoRaConfig_RadioMode_MAX meshtastic_Config_LoRaConfig_RadioMode_FLRC
+#define _meshtastic_Config_LoRaConfig_RadioMode_ARRAYSIZE ((meshtastic_Config_LoRaConfig_RadioMode)(meshtastic_Config_LoRaConfig_RadioMode_FLRC+1))
+
 #define _meshtastic_Config_LoRaConfig_RegionCode_MIN meshtastic_Config_LoRaConfig_RegionCode_UNSET
 #define _meshtastic_Config_LoRaConfig_RegionCode_MAX meshtastic_Config_LoRaConfig_RegionCode_ITU2_125CM
 #define _meshtastic_Config_LoRaConfig_RegionCode_ARRAYSIZE ((meshtastic_Config_LoRaConfig_RegionCode)(meshtastic_Config_LoRaConfig_RegionCode_ITU2_125CM+1))
@@ -824,6 +838,7 @@ extern "C" {
 #define meshtastic_Config_LoRaConfig_modem_preset_ENUMTYPE meshtastic_Config_LoRaConfig_ModemPreset
 #define meshtastic_Config_LoRaConfig_region_ENUMTYPE meshtastic_Config_LoRaConfig_RegionCode
 #define meshtastic_Config_LoRaConfig_fem_lna_mode_ENUMTYPE meshtastic_Config_LoRaConfig_FEM_LNA_Mode
+#define meshtastic_Config_LoRaConfig_radio_mode_ENUMTYPE meshtastic_Config_LoRaConfig_RadioMode
 
 #define meshtastic_Config_BluetoothConfig_mode_ENUMTYPE meshtastic_Config_BluetoothConfig_PairingMode
 
@@ -839,7 +854,7 @@ extern "C" {
 #define meshtastic_Config_NetworkConfig_init_default {0, "", "", "", 0, _meshtastic_Config_NetworkConfig_AddressMode_MIN, false, meshtastic_Config_NetworkConfig_IpV4Config_init_default, "", 0, 0}
 #define meshtastic_Config_NetworkConfig_IpV4Config_init_default {0, 0, 0, 0}
 #define meshtastic_Config_DisplayConfig_init_default {0, _meshtastic_Config_DisplayConfig_DeprecatedGpsCoordinateFormat_MIN, 0, 0, 0, _meshtastic_Config_DisplayConfig_DisplayUnits_MIN, _meshtastic_Config_DisplayConfig_OledType_MIN, _meshtastic_Config_DisplayConfig_DisplayMode_MIN, 0, 0, _meshtastic_Config_DisplayConfig_CompassOrientation_MIN, 0, 0, 0}
-#define meshtastic_Config_LoRaConfig_init_default {0, _meshtastic_Config_LoRaConfig_ModemPreset_MIN, 0, 0, 0, 0, _meshtastic_Config_LoRaConfig_RegionCode_MIN, 0, 0, 0, 0, 0, 0, 0, 0, 0, {0, 0, 0}, 0, 0, _meshtastic_Config_LoRaConfig_FEM_LNA_Mode_MIN, 0}
+#define meshtastic_Config_LoRaConfig_init_default {0, _meshtastic_Config_LoRaConfig_ModemPreset_MIN, 0, 0, 0, 0, _meshtastic_Config_LoRaConfig_RegionCode_MIN, 0, 0, 0, 0, 0, 0, 0, 0, 0, {0, 0, 0}, 0, 0, _meshtastic_Config_LoRaConfig_FEM_LNA_Mode_MIN, 0, false, _meshtastic_Config_LoRaConfig_RadioMode_MIN}
 #define meshtastic_Config_BluetoothConfig_init_default {0, _meshtastic_Config_BluetoothConfig_PairingMode_MIN, 0}
 #define meshtastic_Config_SecurityConfig_init_default {{0, {0}}, {0, {0}}, 0, {{0, {0}}, {0, {0}}, {0, {0}}}, 0, 0, 0, 0, _meshtastic_Config_SecurityConfig_PacketSignaturePolicy_MIN}
 #define meshtastic_Config_SessionkeyConfig_init_default {0}
@@ -850,7 +865,7 @@ extern "C" {
 #define meshtastic_Config_NetworkConfig_init_zero {0, "", "", "", 0, _meshtastic_Config_NetworkConfig_AddressMode_MIN, false, meshtastic_Config_NetworkConfig_IpV4Config_init_zero, "", 0, 0}
 #define meshtastic_Config_NetworkConfig_IpV4Config_init_zero {0, 0, 0, 0}
 #define meshtastic_Config_DisplayConfig_init_zero {0, _meshtastic_Config_DisplayConfig_DeprecatedGpsCoordinateFormat_MIN, 0, 0, 0, _meshtastic_Config_DisplayConfig_DisplayUnits_MIN, _meshtastic_Config_DisplayConfig_OledType_MIN, _meshtastic_Config_DisplayConfig_DisplayMode_MIN, 0, 0, _meshtastic_Config_DisplayConfig_CompassOrientation_MIN, 0, 0, 0}
-#define meshtastic_Config_LoRaConfig_init_zero   {0, _meshtastic_Config_LoRaConfig_ModemPreset_MIN, 0, 0, 0, 0, _meshtastic_Config_LoRaConfig_RegionCode_MIN, 0, 0, 0, 0, 0, 0, 0, 0, 0, {0, 0, 0}, 0, 0, _meshtastic_Config_LoRaConfig_FEM_LNA_Mode_MIN, 0}
+#define meshtastic_Config_LoRaConfig_init_zero   {0, _meshtastic_Config_LoRaConfig_ModemPreset_MIN, 0, 0, 0, 0, _meshtastic_Config_LoRaConfig_RegionCode_MIN, 0, 0, 0, 0, 0, 0, 0, 0, 0, {0, 0, 0}, 0, 0, _meshtastic_Config_LoRaConfig_FEM_LNA_Mode_MIN, 0, false, _meshtastic_Config_LoRaConfig_RadioMode_MIN}
 #define meshtastic_Config_BluetoothConfig_init_zero {0, _meshtastic_Config_BluetoothConfig_PairingMode_MIN, 0}
 #define meshtastic_Config_SecurityConfig_init_zero {{0, {0}}, {0, {0}}, 0, {{0, {0}}, {0, {0}}, {0, {0}}}, 0, 0, 0, 0, _meshtastic_Config_SecurityConfig_PacketSignaturePolicy_MIN}
 #define meshtastic_Config_SessionkeyConfig_init_zero {0}
@@ -938,6 +953,7 @@ extern "C" {
 #define meshtastic_Config_LoRaConfig_config_ok_to_mqtt_tag 105
 #define meshtastic_Config_LoRaConfig_fem_lna_mode_tag 106
 #define meshtastic_Config_LoRaConfig_serial_hal_only_tag 107
+#define meshtastic_Config_LoRaConfig_radio_mode_tag 108
 #define meshtastic_Config_BluetoothConfig_enabled_tag 1
 #define meshtastic_Config_BluetoothConfig_mode_tag 2
 #define meshtastic_Config_BluetoothConfig_fixed_pin_tag 3
@@ -1092,7 +1108,8 @@ X(a, STATIC,   REPEATED, UINT32,   ignore_incoming, 103) \
 X(a, STATIC,   SINGULAR, BOOL,     ignore_mqtt,     104) \
 X(a, STATIC,   SINGULAR, BOOL,     config_ok_to_mqtt, 105) \
 X(a, STATIC,   SINGULAR, UENUM,    fem_lna_mode,    106) \
-X(a, STATIC,   SINGULAR, BOOL,     serial_hal_only, 107)
+X(a, STATIC,   SINGULAR, BOOL,     serial_hal_only, 107) \
+X(a, STATIC,   OPTIONAL, UENUM,    radio_mode,      108)
 #define meshtastic_Config_LoRaConfig_CALLBACK NULL
 #define meshtastic_Config_LoRaConfig_DEFAULT NULL
 
@@ -1150,7 +1167,7 @@ extern const pb_msgdesc_t meshtastic_Config_SessionkeyConfig_msg;
 #define meshtastic_Config_BluetoothConfig_size   10
 #define meshtastic_Config_DeviceConfig_size      100
 #define meshtastic_Config_DisplayConfig_size     36
-#define meshtastic_Config_LoRaConfig_size        91
+#define meshtastic_Config_LoRaConfig_size        94
 #define meshtastic_Config_NetworkConfig_IpV4Config_size 20
 #define meshtastic_Config_NetworkConfig_size     204
 #define meshtastic_Config_PositionConfig_size    62

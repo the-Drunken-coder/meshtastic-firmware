@@ -349,7 +349,7 @@ void drawEntryHopSignal(OLEDDisplay *display, meshtastic_NodeInfoLite *node, int
     const bool isZeroHop = node->has_hops_away && node->hops_away == 0;
 
     // Show signal only for direct neighbors (0 hops)
-    if (isZeroHop) {
+    if (isZeroHop && nodeInfoLiteHasSnr(node)) {
         int bars = (node->snr > 5) ? 4 : (node->snr > 0) ? 3 : (node->snr > -5) ? 2 : (node->snr > -10) ? 1 : 0;
         int barStartX = x + barsXOffset;
         int barStartY = y + 1 + (FONT_HEIGHT_SMALL / 2) + 2;

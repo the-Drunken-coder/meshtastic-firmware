@@ -1228,6 +1228,9 @@ typedef struct _meshtastic_MeshPacket {
  key can check. This is a pairwise MAC that only the original sender can check, and it attests
  to delivery rather than to authorship. */
     meshtastic_MeshPacket_AckProofStatus ack_proof_status;
+    /* The receiver did not measure SNR. rx_snr must not be presented as a measurement.
+ Local metadata only; not included in the RF frame. */
+    bool rx_snr_unavailable;
 } meshtastic_MeshPacket;
 
 /* The bluetooth to device link:
@@ -1303,6 +1306,8 @@ typedef struct _meshtastic_NodeInfo {
  shared contact, which have never been heard over RF at all.
  Derived from LSB 11 and bits 12..23 of NodeInfoLite.bitfield. */
     bool heard_on_current_lora;
+    /* The last RF reception did not provide a measured SNR. */
+    bool snr_unavailable;
 } meshtastic_NodeInfo;
 
 typedef PB_BYTES_ARRAY_T(16) meshtastic_MyNodeInfo_device_id_t;
@@ -1848,8 +1853,8 @@ extern "C" {
 #define meshtastic_Waypoint_init_default         {0, false, 0, false, 0, 0, 0, "", "", 0, 0, false, meshtastic_BoundingBox_init_default, 0, 0, 0}
 #define meshtastic_StatusMessage_init_default    {""}
 #define meshtastic_MqttClientProxyMessage_init_default {"", 0, {{0, {0}}}, 0}
-#define meshtastic_MeshPacket_init_default       {0, 0, 0, 0, {meshtastic_Data_init_default}, 0, false, 0, 0, 0, 0, _meshtastic_MeshPacket_Priority_MIN, false, 0, _meshtastic_MeshPacket_Delayed_MIN, 0, 0, {0, {0}}, 0, 0, 0, 0, _meshtastic_MeshPacket_TransportMechanism_MIN, 0, _meshtastic_MeshPacket_AckProofStatus_MIN}
-#define meshtastic_NodeInfo_init_default         {0, false, meshtastic_User_init_default, false, meshtastic_Position_init_default, 0, 0, false, meshtastic_DeviceMetrics_init_default, 0, 0, false, 0, 0, 0, 0, 0, 0, 0}
+#define meshtastic_MeshPacket_init_default       {0, 0, 0, 0, {meshtastic_Data_init_default}, 0, false, 0, 0, 0, 0, _meshtastic_MeshPacket_Priority_MIN, false, 0, _meshtastic_MeshPacket_Delayed_MIN, 0, 0, {0, {0}}, 0, 0, 0, 0, _meshtastic_MeshPacket_TransportMechanism_MIN, 0, _meshtastic_MeshPacket_AckProofStatus_MIN, 0}
+#define meshtastic_NodeInfo_init_default         {0, false, meshtastic_User_init_default, false, meshtastic_Position_init_default, 0, 0, false, meshtastic_DeviceMetrics_init_default, 0, 0, false, 0, 0, 0, 0, 0, 0, 0, 0}
 #define meshtastic_MyNodeInfo_init_default       {0, 0, 0, {0, {0}}, "", _meshtastic_FirmwareEdition_MIN, 0}
 #define meshtastic_LogRecord_init_default        {"", 0, "", _meshtastic_LogRecord_Level_MIN}
 #define meshtastic_QueueStatus_init_default      {0, 0, 0, 0}
@@ -1887,8 +1892,8 @@ extern "C" {
 #define meshtastic_Waypoint_init_zero            {0, false, 0, false, 0, 0, 0, "", "", 0, 0, false, meshtastic_BoundingBox_init_zero, 0, 0, 0}
 #define meshtastic_StatusMessage_init_zero       {""}
 #define meshtastic_MqttClientProxyMessage_init_zero {"", 0, {{0, {0}}}, 0}
-#define meshtastic_MeshPacket_init_zero          {0, 0, 0, 0, {meshtastic_Data_init_zero}, 0, false, 0, 0, 0, 0, _meshtastic_MeshPacket_Priority_MIN, false, 0, _meshtastic_MeshPacket_Delayed_MIN, 0, 0, {0, {0}}, 0, 0, 0, 0, _meshtastic_MeshPacket_TransportMechanism_MIN, 0, _meshtastic_MeshPacket_AckProofStatus_MIN}
-#define meshtastic_NodeInfo_init_zero            {0, false, meshtastic_User_init_zero, false, meshtastic_Position_init_zero, 0, 0, false, meshtastic_DeviceMetrics_init_zero, 0, 0, false, 0, 0, 0, 0, 0, 0, 0}
+#define meshtastic_MeshPacket_init_zero          {0, 0, 0, 0, {meshtastic_Data_init_zero}, 0, false, 0, 0, 0, 0, _meshtastic_MeshPacket_Priority_MIN, false, 0, _meshtastic_MeshPacket_Delayed_MIN, 0, 0, {0, {0}}, 0, 0, 0, 0, _meshtastic_MeshPacket_TransportMechanism_MIN, 0, _meshtastic_MeshPacket_AckProofStatus_MIN, 0}
+#define meshtastic_NodeInfo_init_zero            {0, false, meshtastic_User_init_zero, false, meshtastic_Position_init_zero, 0, 0, false, meshtastic_DeviceMetrics_init_zero, 0, 0, false, 0, 0, 0, 0, 0, 0, 0, 0}
 #define meshtastic_MyNodeInfo_init_zero          {0, 0, 0, {0, {0}}, "", _meshtastic_FirmwareEdition_MIN, 0}
 #define meshtastic_LogRecord_init_zero           {"", 0, "", _meshtastic_LogRecord_Level_MIN}
 #define meshtastic_QueueStatus_init_zero         {0, 0, 0, 0}
@@ -2034,6 +2039,7 @@ extern "C" {
 #define meshtastic_MeshPacket_transport_mechanism_tag 21
 #define meshtastic_MeshPacket_xeddsa_signed_tag  22
 #define meshtastic_MeshPacket_ack_proof_status_tag 23
+#define meshtastic_MeshPacket_rx_snr_unavailable_tag 24
 #define meshtastic_NodeInfo_num_tag              1
 #define meshtastic_NodeInfo_user_tag             2
 #define meshtastic_NodeInfo_position_tag         3
@@ -2049,6 +2055,7 @@ extern "C" {
 #define meshtastic_NodeInfo_is_muted_tag         13
 #define meshtastic_NodeInfo_has_xeddsa_signed_tag 14
 #define meshtastic_NodeInfo_heard_on_current_lora_tag 15
+#define meshtastic_NodeInfo_snr_unavailable_tag  16
 #define meshtastic_MyNodeInfo_my_node_num_tag    1
 #define meshtastic_MyNodeInfo_reboot_count_tag   8
 #define meshtastic_MyNodeInfo_min_app_version_tag 11
@@ -2327,7 +2334,8 @@ X(a, STATIC,   SINGULAR, UINT32,   relay_node,       19) \
 X(a, STATIC,   SINGULAR, UINT32,   tx_after,         20) \
 X(a, STATIC,   SINGULAR, UENUM,    transport_mechanism,  21) \
 X(a, STATIC,   SINGULAR, BOOL,     xeddsa_signed,    22) \
-X(a, STATIC,   SINGULAR, UENUM,    ack_proof_status,  23)
+X(a, STATIC,   SINGULAR, UENUM,    ack_proof_status,  23) \
+X(a, STATIC,   SINGULAR, BOOL,     rx_snr_unavailable,  24)
 #define meshtastic_MeshPacket_CALLBACK NULL
 #define meshtastic_MeshPacket_DEFAULT NULL
 #define meshtastic_MeshPacket_payload_variant_decoded_MSGTYPE meshtastic_Data
@@ -2347,7 +2355,8 @@ X(a, STATIC,   SINGULAR, BOOL,     is_ignored,       11) \
 X(a, STATIC,   SINGULAR, BOOL,     is_key_manually_verified,  12) \
 X(a, STATIC,   SINGULAR, BOOL,     is_muted,         13) \
 X(a, STATIC,   SINGULAR, BOOL,     has_xeddsa_signed,  14) \
-X(a, STATIC,   SINGULAR, BOOL,     heard_on_current_lora,  15)
+X(a, STATIC,   SINGULAR, BOOL,     heard_on_current_lora,  15) \
+X(a, STATIC,   SINGULAR, BOOL,     snr_unavailable,  16)
 #define meshtastic_NodeInfo_CALLBACK NULL
 #define meshtastic_NodeInfo_DEFAULT NULL
 #define meshtastic_NodeInfo_user_MSGTYPE meshtastic_User
@@ -2698,12 +2707,12 @@ extern const pb_msgdesc_t meshtastic_ChunkedPayloadResponse_msg;
 #define meshtastic_LockdownStatus_size           53
 #define meshtastic_LogRecord_size                426
 #define meshtastic_LowEntropyKey_size            0
-#define meshtastic_MeshPacket_size               453
+#define meshtastic_MeshPacket_size               456
 #define meshtastic_MqttClientProxyMessage_size   501
 #define meshtastic_MyNodeInfo_size               83
 #define meshtastic_NeighborInfo_size             258
 #define meshtastic_Neighbor_size                 22
-#define meshtastic_NodeInfo_size                 329
+#define meshtastic_NodeInfo_size                 332
 #define meshtastic_NodeRemoteHardwarePin_size    29
 #define meshtastic_Position_size                 144
 #define meshtastic_QueueStatus_size              23

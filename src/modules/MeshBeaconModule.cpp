@@ -3,6 +3,7 @@
 #include "DisplayFormatters.h"
 #include "NodeDB.h"
 #include "RadioInterface.h"
+#include "RadioMode.h"
 #include "Router.h"
 #include "TransmitHistory.h"
 #include "configuration.h"
@@ -23,6 +24,11 @@ static MeshBeaconModule_TargetRadioSettings targetRadioSettings[8];
 // swaps and fired on legitimate channel edits.
 static bool radioSwitched = false;
 static uint32_t switchedForId = 0;
+
+static bool canUseLoraBeacon()
+{
+    return !RadioMode::isFlrc() && RadioMode::configuredMode(config.lora) == RadioMode::configuredMode(RadioMode::activeConfig());
+}
 
 static bool getTargetRadioSettings(const meshtastic_MeshPacket *p, meshtastic_Config_LoRaConfig_ModemPreset *preset,
                                    uint16_t *slot, bool *legacyHopOverride = nullptr,
@@ -139,6 +145,8 @@ bool MeshBeaconModule::beaconTxConfigInvalid(const meshtastic_MeshPacket *p)
     meshtastic_Config_LoRaConfig_RegionCode sidecarRegion = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
     if (!getTargetRadioSettings(p, &preset, nullptr, nullptr, &sidecarRegion))
         return false; // not a beacon-switch packet - nothing to validate, normal traffic unaffected
+    if (!canUseLoraBeacon())
+        return true;
 
     const meshtastic_Config_LoRaConfig_RegionCode region =
         (sidecarRegion != meshtastic_Config_LoRaConfig_RegionCode_UNSET) ? sidecarRegion : config.lora.region;
@@ -180,6 +188,9 @@ meshtastic_ChannelSettings MeshBeaconModule::beaconChannelSettings(const meshtas
 
 bool MeshBeaconModule::reconfigureForBeaconTX(RadioInterface *iface, meshtastic_MeshPacket *p)
 {
+    // Completion must restore an existing temporary switch even when new beacon switches are blocked.
+    if (p && !canUseLoraBeacon())
+        return false;
     // Consecutive switches with no restore between them, so a multi-target run can be read off the log
     // and the held home snapshot is attributable to a specific switch.
     static uint8_t switchDepth = 0;
@@ -410,6 +421,8 @@ void MeshBeaconBroadcastModule::sendBeaconPacket(meshtastic_MeshPacket *p, mesht
 
 void MeshBeaconBroadcastModule::sendBeacon()
 {
+    if (!canUseLoraBeacon())
+        return;
     const auto &bcfg = moduleConfig.mesh_beacon;
 
     const bool hasText = bcfg.broadcast_message[0] != '\0';
@@ -616,7 +629,7 @@ int32_t MeshBeaconBroadcastModule::runOnce()
     const uint32_t intervalMs =
         Default::getConfiguredOrMinimumValue(intervalSecs, default_mesh_beacon_min_broadcast_interval_secs) * 1000;
 
-    if ((bcfg.flags & MESH_BEACON_FLAG_BROADCAST_ENABLED) && airTime->isTxAllowedAirUtil() &&
+    if (canUseLoraBeacon() && (bcfg.flags & MESH_BEACON_FLAG_BROADCAST_ENABLED) && airTime->isTxAllowedAirUtil() &&
         config.device.role != meshtastic_Config_DeviceConfig_Role_CLIENT_HIDDEN) {
         // Throttle against the reboot-safe transmit history (mirrors NodeInfoModule): skip if we
         // broadcast within the interval, even across a reboot. 0 = never sent → send now.
@@ -649,12 +662,15 @@ MeshBeaconListenerModule::MeshBeaconListenerModule()
 
 bool MeshBeaconListenerModule::wantPacket(const meshtastic_MeshPacket *p)
 {
-    return moduleConfig.has_mesh_beacon && (moduleConfig.mesh_beacon.flags & MESH_BEACON_FLAG_LISTEN_ENABLED) &&
+    return canUseLoraBeacon() && moduleConfig.has_mesh_beacon &&
+           (moduleConfig.mesh_beacon.flags & MESH_BEACON_FLAG_LISTEN_ENABLED) &&
            p->decoded.portnum == meshtastic_PortNum_MESH_BEACON_APP;
 }
 
 bool MeshBeaconListenerModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshtastic_MeshBeacon *b)
 {
+    if (!canUseLoraBeacon())
+        return false;
     const bool hasOfferContent =
         b && (b->has_offer_channel || b->offer_region != meshtastic_Config_LoRaConfig_RegionCode_UNSET || b->has_offer_preset);
     const pb_size_t msgLen = b ? (pb_size_t)strnlen(b->message, sizeof(b->message) - 1) : 0;

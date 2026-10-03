@@ -3,7 +3,9 @@
 #include "MeshService.h"
 #include "RadioInterface.h"
 #include "RadioLibInterface.h"
+#include "RadioMode.h"
 #include "TestUtil.h"
+#include "W12FlrcProfile.h"
 #include "memory/MemAudit.h"
 #include <string.h>
 #include <unity.h>
@@ -12,6 +14,8 @@
 #include "support/MockMeshService.h"
 
 static MockMeshService *mockMeshService;
+
+#include "w12_adapter_tests.h"
 
 static void test_lr20x0BandClassification()
 {
@@ -62,6 +66,7 @@ class TestableRadioInterface : public RadioInterface
     uint8_t getCr() const { return cr; }
     uint8_t getSf() const { return sf; }
     float getBw() const { return bw; }
+    int8_t getPower() const { return power; }
 
     size_t beginSendingPublic(meshtastic_MeshPacket *p) { return beginSending(p); }
     meshtastic_MeshPacket *getSendingPacket() const { return sendingPacket; }
@@ -628,10 +633,68 @@ static void test_isRadioLibTimeError_separatesCodesFromDurations()
     TEST_ASSERT_FALSE(TestableRadioLibInterface::isRadioLibTimeErrorPublic(229ul * 1000ul * 1000ul));
 }
 
+// Public radio scheduling interface, using the profile estimates and software allowances recorded
+// in issue #2. No chip is claimed: profile restoration itself is exercised in the driver SPI suite.
+static void test_flrc_frame_duration_and_randomized_relay_guard()
+{
+    config.lora = meshtastic_Config_LoRaConfig_init_zero;
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+    config.lora.has_radio_mode = true;
+    config.lora.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_FLRC;
+    RadioMode::initialize(config.lora);
+    testRadio->reconfigure();
+    meshtastic_MeshPacket packet = meshtastic_MeshPacket_init_zero;
+    packet.which_payload_variant = meshtastic_MeshPacket_encrypted_tag;
+    TEST_ASSERT_EQUAL_UINT32(4, testRadio->RadioInterface::getPacketTime(&packet));
+    packet.encrypted.size = 128 - sizeof(PacketHeader);
+    TEST_ASSERT_EQUAL_UINT32(5, testRadio->RadioInterface::getPacketTime(&packet, true));
+    packet.encrypted.size = MAX_RADIO_PAYLOAD_LEN;
+    TEST_ASSERT_EQUAL_UINT32(6, testRadio->RadioInterface::getPacketTime(&packet));
+    TEST_ASSERT_EQUAL_UINT32(72, testRadio->getTxDelayMsecWeightedWorst(-20));
+    TEST_ASSERT_EQUAL_UINT32(72, testRadio->getTxDelayMsecWeightedWorst(10));
+    for (unsigned i = 0; i < 16; ++i) {
+        packet.rx_snr = i % 2 ? -20 : 10;
+        uint32_t delay = testRadio->getTxDelayMsecWeighted(&packet);
+        TEST_ASSERT_GREATER_OR_EQUAL_UINT32(2, delay);
+        TEST_ASSERT_LESS_OR_EQUAL_UINT32(72, delay);
+    }
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(4552, testRadio->getRetransmissionMsec(&packet));
+}
+
+static void test_flrc_profile_keeps_carrier_and_lora_preferences_until_reboot()
+{
+    config.lora = meshtastic_Config_LoRaConfig_init_zero;
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+    config.lora.use_preset = true;
+    config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST;
+    config.lora.tx_power = 17;
+    config.lora.has_radio_mode = true;
+    config.lora.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_FLRC;
+    RadioMode::initialize(config.lora);
+    testRadio->reconfigure();
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 915.0f, testRadio->getFreq());
+    TEST_ASSERT_EQUAL_INT8(-9, testRadio->getPower());
+    TEST_ASSERT_EQUAL_INT8(17, config.lora.tx_power);
+    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST, config.lora.modem_preset);
+    config.lora.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_LORA;
+    testRadio->reconfigure();
+    TEST_ASSERT_TRUE(RadioMode::isFlrc());
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 915.0f, testRadio->getFreq());
+    RadioMode::initialize(config.lora);
+    testRadio->reconfigure();
+    TEST_ASSERT_FALSE(RadioMode::isFlrc());
+    TEST_ASSERT_EQUAL_UINT8(11, testRadio->getSf());
+}
+
 void setUp(void)
 {
     mockMeshService = new MockMeshService();
     service = mockMeshService;
+
+    // Reset the active mode snapshot as well as saved settings between independent tests.
+    config.lora = meshtastic_Config_LoRaConfig_init_zero;
+    RadioMode::initialize(config.lora);
+    RadioMode::markInitialized(true);
 
     // RadioInterface computes slotTimeMsec during construction and expects myRegion to be valid.
     config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
@@ -641,6 +704,7 @@ void setUp(void)
 }
 void tearDown(void)
 {
+    deleteW12Adapter();
     delete testRadio;
     testRadio = nullptr;
     service = nullptr;
@@ -685,6 +749,9 @@ void setup()
     RUN_TEST(test_computePacketTime_reportsNoAirtimeWhenNothingCanBeComputed);
     RUN_TEST(test_computePacketTime_rxUsesHeaderInfoAndIsGuarded);
     RUN_TEST(test_isRadioLibTimeError_separatesCodesFromDurations);
+    RUN_TEST(test_flrc_frame_duration_and_randomized_relay_guard);
+    RUN_TEST(test_flrc_profile_keeps_carrier_and_lora_preferences_until_reboot);
+    runW12AdapterTests();
     exit(UNITY_END());
 }
 

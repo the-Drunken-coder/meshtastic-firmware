@@ -431,7 +431,7 @@ std::string MeshPacketSerializer::JsonSerialize(const meshtastic_MeshPacket *mp,
     // != 0 heuristic, since 0 dBm is a legitimate reading on some radios.
     if (mp->has_rx_rssi)
         jsonObj["rssi"] = (int)mp->rx_rssi;
-    if (mp->rx_snr != 0)
+    if (!mp->rx_snr_unavailable && mp->rx_snr != 0)
         jsonObj["snr"] = (float)mp->rx_snr;
     const int8_t hopsAway = getHopsAway(*mp);
     if (hopsAway >= 0) {
@@ -464,7 +464,7 @@ std::string MeshPacketSerializer::JsonSerializeEncrypted(const meshtastic_MeshPa
     // != 0 heuristic, since 0 dBm is a legitimate reading on some radios.
     if (mp->has_rx_rssi)
         jsonObj["rssi"] = (int)mp->rx_rssi;
-    if (mp->rx_snr != 0)
+    if (!mp->rx_snr_unavailable && mp->rx_snr != 0)
         jsonObj["snr"] = (float)mp->rx_snr;
     const int8_t hopsAway = getHopsAway(*mp);
     if (hopsAway >= 0) {

@@ -277,6 +277,7 @@ struct NodeHeardAt {
 /// What decides which LoRa slot this radio listens on. Only ever consumed as a fingerprint(), which
 /// is what each node stores and what the committed slot is compared against.
 struct LoraSlotSnapshot {
+    meshtastic_Config_LoRaConfig_RadioMode radio_mode = meshtastic_Config_LoRaConfig_RadioMode_LORA;
     meshtastic_Config_LoRaConfig_RegionCode region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
     bool use_preset = false;
     /// Only the modem fields actually in force are populated - see loraSlotSnapshotFrom().
@@ -363,9 +364,12 @@ class NodeDB
     /// against to derive NodeInfo.heard_on_current_lora.
     uint16_t committedLoraSlot() const { return committedSlot; }
 
+    bool heardOnCurrentRadio(const meshtastic_NodeInfoLite *node) const;
+
     /// Declare that config.lora holds a temporary radio switch - a beacon keying up on another preset.
     /// While set the committed slot is pinned, so neither the switch nor its restore reads as a move.
     void setLoraSlotTransient(bool transient) { loraSlotTransient = transient; }
+    bool isLoraSlotTransient() const { return loraSlotTransient; }
 
     void addFromContact(const meshtastic_SharedContact);
 
@@ -874,7 +878,9 @@ extern uint32_t error_address;
 #define NODEINFO_BITFIELD_HEARD_SLOT_SHIFT 12
 #define NODEINFO_BITFIELD_HEARD_SLOT_BITS 12
 #define NODEINFO_BITFIELD_HEARD_SLOT_MASK (((1u << NODEINFO_BITFIELD_HEARD_SLOT_BITS) - 1) << NODEINFO_BITFIELD_HEARD_SLOT_SHIFT)
-// Bits 24..31 reserved for future single-bit flags.
+// Bit 24 distinguishes FLRC RF provenance even if the 12-bit slot fingerprints collide.
+#define NODEINFO_BITFIELD_HEARD_FLRC_MASK (1u << 24)
+// Bits 25..31 reserved for future single-bit flags.
 
 // Convenience accessors so call sites read like the old struct fields.
 inline bool nodeInfoLiteHasUser(const meshtastic_NodeInfoLite *n)
@@ -929,19 +935,28 @@ inline bool nodeInfoLiteHasRfHear(const meshtastic_NodeInfoLite *n)
     return n && (n->bitfield & NODEINFO_BITFIELD_HAS_RF_HEAR_MASK);
 }
 
+inline bool nodeInfoLiteHeardFlrc(const meshtastic_NodeInfoLite *n)
+{
+    return n && (n->bitfield & NODEINFO_BITFIELD_HEARD_FLRC_MASK);
+}
+
 inline uint16_t nodeInfoLiteHeardSlot(const meshtastic_NodeInfoLite *n)
 {
     return n ? (n->bitfield & NODEINFO_BITFIELD_HEARD_SLOT_MASK) >> NODEINFO_BITFIELD_HEARD_SLOT_SHIFT : 0;
 }
 
 /// Record that this node was just heard over RF on `slot`.
-inline void nodeInfoLiteSetHeardSlot(meshtastic_NodeInfoLite *n, uint16_t slot)
+inline void nodeInfoLiteSetHeardSlot(meshtastic_NodeInfoLite *n, uint16_t slot, bool flrc = false)
 {
     if (!n)
         return;
     n->bitfield = (n->bitfield & ~NODEINFO_BITFIELD_HEARD_SLOT_MASK) |
                   (((uint32_t)slot << NODEINFO_BITFIELD_HEARD_SLOT_SHIFT) & NODEINFO_BITFIELD_HEARD_SLOT_MASK) |
                   NODEINFO_BITFIELD_HAS_RF_HEAR_MASK;
+    if (flrc)
+        n->bitfield |= NODEINFO_BITFIELD_HEARD_FLRC_MASK;
+    else
+        n->bitfield &= ~NODEINFO_BITFIELD_HEARD_FLRC_MASK;
 }
 
 /// True iff this node was last heard over RF on the slot the radio is committed to right now.

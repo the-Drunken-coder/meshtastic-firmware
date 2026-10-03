@@ -14,6 +14,7 @@
 #include "PacketHistory.h"
 #include "PowerFSM.h"
 #include "RadioInterface.h"
+#include "RadioMode.h"
 #include "Router.h"
 #include "SPILock.h"
 #include "SafeFile.h"
@@ -570,6 +571,8 @@ NodeDB::NodeDB()
         config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_EU_868;
     }
 
+    // Only boot selects the physical mode. Runtime reloads remain pending until reboot.
+    RadioMode::initialize(config.lora);
     resetRadioConfig(); // If bogus settings got saved, then fix them
     // nodeDB->LOG_DEBUG("region=%d, NODENUM=0x%x, dbsize=%d", config.lora.region, myNodeInfo.my_node_num, numMeshNodes);
 
@@ -837,7 +840,10 @@ void NodeDB::resetRadioConfig(bool is_fresh_install)
 LoraSlotSnapshot loraSlotSnapshotFrom(const meshtastic_Config_LoRaConfig &lora, const char *primaryChannelName)
 {
     LoraSlotSnapshot snap;
+    snap.radio_mode = RadioMode::configuredMode(lora);
     snap.region = lora.region;
+    if (snap.radio_mode == meshtastic_Config_LoRaConfig_RadioMode_FLRC)
+        return snap;
     snap.use_preset = lora.use_preset;
     // Record only the modem fields the radio is actually using. The unused half of the pair keeps
     // whatever the client last wrote into it, and editing a dormant field moves nothing on air.
@@ -866,6 +872,10 @@ uint16_t LoraSlotSnapshot::fingerprint() const
             h *= 16777619u;
         }
     };
+    if (radio_mode != meshtastic_Config_LoRaConfig_RadioMode_LORA) {
+        const uint8_t profile[] = {(uint8_t)radio_mode, 1}; // Fixed W12 US FLRC profile v1.
+        mix(profile, sizeof(profile));
+    }
     const uint8_t scalars[] = {(uint8_t)region,        (uint8_t)use_preset,  (uint8_t)modem_preset,
                                (uint8_t)coding_rate,   (uint8_t)bandwidth,   (uint8_t)(bandwidth >> 8),
                                (uint8_t)spread_factor, (uint8_t)channel_num, (uint8_t)(channel_num >> 8)};
@@ -879,7 +889,16 @@ uint16_t LoraSlotSnapshot::fingerprint() const
 
 LoraSlotSnapshot NodeDB::currentLoraSlot() const
 {
-    return loraSlotSnapshotFrom(config.lora, channels.getName(channels.getPrimaryIndex()));
+    // A saved mode switch is pending until reboot, so hears still belong to the active profile.
+    const auto &lora = RadioMode::configuredMode(config.lora) != RadioMode::configuredMode(RadioMode::activeConfig())
+                           ? RadioMode::activeConfig()
+                           : config.lora;
+    return loraSlotSnapshotFrom(lora, channels.getName(channels.getPrimaryIndex()));
+}
+
+bool NodeDB::heardOnCurrentRadio(const meshtastic_NodeInfoLite *node) const
+{
+    return nodeInfoLiteHeardOnSlot(node, committedSlot) && nodeInfoLiteHeardFlrc(node) == RadioMode::isFlrc();
 }
 
 void NodeDB::refreshCommittedLoraSlot()
@@ -2712,7 +2731,8 @@ void NodeDB::loadFromDisk()
 
     // Coerce LoRa config fields derived from presets while bootstrapping.
     // Some clients/UI components display bandwidth/spread_factor directly from config even in preset mode.
-    if (config.has_lora && config.lora.use_preset) {
+    if (config.has_lora && config.lora.use_preset &&
+        RadioMode::configuredMode(config.lora) == meshtastic_Config_LoRaConfig_RadioMode_LORA) {
         RadioInterface::clampConfigLora(config.lora);
     }
 
@@ -3966,15 +3986,16 @@ void NodeDB::updateFrom(const meshtastic_MeshPacket &mp)
         // too (so the client treats restored history as if heard over the air) but never has_rx_rssi.
         // Replay packets don't reach updateFrom() today; this check guards against a future change that
         // routes them back through this path silently recording a replayed rx_snr as a fresh measurement.
-        if (mp.transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA && mp.has_rx_rssi) {
-            info->snr = mp.rx_snr; // keep the most recent SNR we received for this node.
-            nodeInfoLiteSetBit(info, NODEINFO_BITFIELD_HAS_SNR_MASK, true);
+        if (mp.transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA &&
+            (mp.has_rx_rssi || mp.rx_snr_unavailable)) {
+            info->snr = mp.rx_snr_unavailable ? 0.0f : mp.rx_snr;
+            nodeInfoLiteSetBit(info, NODEINFO_BITFIELD_HAS_SNR_MASK, !mp.rx_snr_unavailable);
         }
 
         // RF-origin only (a via_mqtt rebroadcast proves the gateway is in earshot, not the node); not
         // has_rx_rssi-gated, as SimRadio omits it. Live slot, so a beacon-preset hear fails to match home.
         if (mp.transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA && !mp.via_mqtt)
-            nodeInfoLiteSetHeardSlot(info, currentLoraSlot().fingerprint());
+            nodeInfoLiteSetHeardSlot(info, currentLoraSlot().fingerprint(), RadioMode::isFlrc());
 
         nodeInfoLiteSetBit(info, NODEINFO_BITFIELD_VIA_MQTT_MASK,
                            mp.via_mqtt); // Store if we received this packet via MQTT
@@ -4200,7 +4221,8 @@ ResolvedNode NodeDB::resolveLastByte(uint8_t lastByte, bool requireDirectNeighbo
         // Relevance gate: is this node a plausible relay for the requested scope?
         bool relevant;
         if (requireDirectNeighbor) {
-            relevant = node->has_hops_away && node->hops_away == 0 && sinceLastSeen(node) < NEXTHOP_NEIGHBOR_FRESH_SECS;
+            relevant = node->has_hops_away && node->hops_away == 0 && sinceLastSeen(node) < NEXTHOP_NEIGHBOR_FRESH_SECS &&
+                       heardOnCurrentRadio(node);
         } else {
             const bool directNeighbor = node->has_hops_away && node->hops_away == 0;
             const bool routerRole =

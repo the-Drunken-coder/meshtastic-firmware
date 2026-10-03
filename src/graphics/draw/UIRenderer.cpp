@@ -882,7 +882,7 @@ void UIRenderer::drawFavoriteNode(OLEDDisplay *display, OLEDDisplayUiState *stat
 
             const bool isZeroHop = node->has_hops_away && node->hops_away == 0;
             const bool showHops = node->has_hops_away && node->hops_away > 0;
-            if (isZeroHop && node->snr > -100 && node->snr != 0) {
+            if (isZeroHop && nodeInfoLiteHasSnr(node)) {
                 char sigStr[16];
                 snprintf(sigStr, sizeof(sigStr), "SNR:%.1f", node->snr);
                 display->drawString(x, getTextPositions(display)[cline++], sigStr);
@@ -1043,7 +1043,7 @@ void UIRenderer::drawFavoriteNode(OLEDDisplay *display, OLEDDisplayUiState *stat
     // Signal text/bars are only for direct (zero-hop) nodes with valid SNR.
     if (isZeroHop) {
         float snr = node->snr;
-        if (snr > -100 && snr != 0) {
+        if (nodeInfoLiteHasSnr(node)) {
             float snrLimit = getSnrLimit(config.lora.modem_preset);
             // Determine signal quality label and bars using SNR-only grading.
             if (snr > snrLimit + 10) {
