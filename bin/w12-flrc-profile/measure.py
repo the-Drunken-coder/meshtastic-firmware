@@ -37,7 +37,7 @@ IDENTITIES = {
     "base": "44:B1:76:AE:19:14",
     "walker": "44:B1:76:AE:20:18",
 }
-EXPECTED_BUILD = "w12-flrc-profile-v2"
+EXPECTED_BUILD = "w12-flrc-profile-v5"
 DEFAULT_LENGTHS = (12, 16, 32, 64, 128, 240, 255)
 DEFAULT_DELAYS_US = (2000, 1000, 500, 250, 100, 0)
 MAX_FRAME_LENGTH = 255
@@ -1191,6 +1191,9 @@ class Runner:
                 session._discard_events("boot")
                 session.reboot_detection_armed = True
                 session.set_crc(4)
+                limit = session.command("RXLIMIT 255", "rx_limit").record
+                if as_int(limit.get("bytes")) != MAX_FRAME_LENGTH:
+                    raise RuntimeError(f"{role}: receive limit rejected: {limit}")
                 recovery = bool(self.state.get("error_recovery", False))
                 reply = session.command(
                     f"RECOVERY {int(recovery)}",

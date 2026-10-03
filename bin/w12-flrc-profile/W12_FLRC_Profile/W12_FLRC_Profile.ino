@@ -2,8 +2,9 @@
 #define RADIOLIB_GODMODE 1
 #include <RadioLib.h>
 #include <SPI.h>
+#include <stdarg.h>
 
-constexpr char kBuild[] = "w12-flrc-profile-v2";
+constexpr char kBuild[] = "w12-flrc-profile-v5";
 constexpr char kDriver[] = "510e00cfb05bbc3c2b7b524262785454944adb6e";
 constexpr uint32_t kTxTimeoutUs = 100000;
 constexpr uint32_t kEchoTimeoutUs = 50000;
@@ -38,10 +39,31 @@ uint32_t runId;
 uint32_t sequence = 0;
 uint32_t echoDelayUs = 2000;
 uint8_t crcBytes = 4;
+uint8_t receiveLimit = kMaxLength;
 uint8_t chipMajor = 0, chipMinor = 0;
 char command[96];
 size_t commandLength = 0;
 bool commandOverflow = false;
+
+void emitJson(bool controlReply, const char *format, ...)
+{
+    char record[1026];
+    va_list arguments;
+    va_start(arguments, format);
+    int length = vsnprintf(record, sizeof(record) - 1, format, arguments);
+    va_end(arguments);
+    if (length <= 0 || length >= int(sizeof(record) - 1) || record[length - 1] != '\n') {
+        Serial.println("{\"event\":\"error\",\"reason\":\"record_too_long\"}");
+        return;
+    }
+    Serial.print(record);
+    // Control replies need a separate short USB packet after ring-buffer wrap; telemetry stays buffered.
+    if (controlReply) {
+        Serial.flush();
+        Serial.write(' ');
+        Serial.flush();
+    }
+}
 
 void ARDUINO_ISR_ATTR onIrq()
 {
@@ -98,9 +120,21 @@ int16_t armReceive(uint32_t &armUs)
 {
     clearEdge();
     uint32_t started = micros();
-    int16_t status =
-        radio.startReceive(RADIOLIB_LR2021_RX_TIMEOUT_INF, RADIOLIB_IRQ_RX_DEFAULT_FLAGS,
-                           (1UL << RADIOLIB_IRQ_RX_DONE) | (1UL << RADIOLIB_IRQ_CRC_ERR) | (1UL << RADIOLIB_IRQ_HEADER_ERR));
+    RadioModeConfig_t config = {};
+    config.receive.timeout = RADIOLIB_LR2021_RX_TIMEOUT_INF;
+    config.receive.irqFlags = RADIOLIB_IRQ_RX_DEFAULT_FLAGS;
+    config.receive.irqMask = (1UL << RADIOLIB_IRQ_RX_DONE) | (1UL << RADIOLIB_IRQ_CRC_ERR) | (1UL << RADIOLIB_IRQ_HEADER_ERR);
+    int16_t status;
+    if (receiveLimit == kMaxLength) {
+        status = radio.startReceive(config.receive.timeout, config.receive.irqFlags, config.receive.irqMask);
+    } else {
+        status = radio.stageMode(RADIOLIB_RADIO_MODE_RX, &config);
+        // stageMode restores 255 bytes. Override while still in standby, before launching RX.
+        if (status == RADIOLIB_ERR_NONE)
+            status = radio.setFlrcPacketParams(7, 4, 1, 0x01, false, 3, receiveLimit);
+        if (status == RADIOLIB_ERR_NONE)
+            status = radio.launchMode();
+    }
     if (status == RADIOLIB_ERR_NONE)
         if (errorRecovery)
             status = radio.setDioIrqConfig(8, kRxIrqs);
@@ -125,8 +159,8 @@ int16_t quiesce()
 
 void reportStopped(int16_t status)
 {
-    Serial.printf("{\"event\":\"stopped\",\"status\":%d,\"quiescent\":%s}\n", status,
-                  status == RADIOLIB_ERR_NONE ? "true" : "false");
+    emitJson(true, "{\"event\":\"stopped\",\"status\":%d,\"quiescent\":%s}\n", status,
+             status == RADIOLIB_ERR_NONE ? "true" : "false");
 }
 
 int16_t readFrame(uint8_t *frame, size_t length, uint32_t flags)
@@ -149,29 +183,31 @@ void info()
     char boardId[18];
     snprintf(boardId, sizeof(boardId), "%02X:%02X:%02X:%02X:%02X:%02X", uint8_t(mac), uint8_t(mac >> 8), uint8_t(mac >> 16),
              uint8_t(mac >> 24), uint8_t(mac >> 32), uint8_t(mac >> 40));
-    Serial.printf("{\"event\":\"info\",\"build\":\"%s\",\"board_id\":\"%s\","
-                  "\"run\":%lu,\"ready\":%s,"
-                  "\"freq_mhz\":915.0,\"bitrate_kbps\":1040,\"cr\":\"3/"
-                  "4\",\"shaping\":\"BT0.5\","
-                  "\"preamble_bits\":32,\"sync_hex\":\"2D014B1D\",\"crc_bytes\":%"
-                  "u,\"drive_dbm\":-9,"
-                  "\"ramp_us\":48,\"role\":\"%s\",\"driver_version\":\"%s\","
-                  "\"chip_major\":%u,\"chip_minor\":%u,\"error_recovery\":%s}\n",
-                  kBuild, boardId, (unsigned long)runId, ready ? "true" : "false", crcBytes,
-                  sending     ? "tx"
-                  : receiving ? "rx"
-                              : "idle",
-                  kDriver, chipMajor, chipMinor, errorRecovery ? "true" : "false");
+    emitJson(true,
+             "{\"event\":\"info\",\"build\":\"%s\",\"board_id\":\"%s\","
+             "\"run\":%lu,\"ready\":%s,"
+             "\"freq_mhz\":915.0,\"bitrate_kbps\":1040,\"cr\":\"3/"
+             "4\",\"shaping\":\"BT0.5\","
+             "\"preamble_bits\":32,\"sync_hex\":\"2D014B1D\",\"crc_bytes\":%"
+             "u,\"drive_dbm\":-9,"
+             "\"ramp_us\":48,\"role\":\"%s\",\"driver_version\":\"%s\","
+             "\"chip_major\":%u,\"chip_minor\":%u,\"error_recovery\":%s}\n",
+             kBuild, boardId, (unsigned long)runId, ready ? "true" : "false", crcBytes,
+             sending     ? "tx"
+             : receiving ? "rx"
+                         : "idle",
+             kDriver, chipMajor, chipMinor, errorRecovery ? "true" : "false");
 }
 
 void stats()
 {
     uint16_t packets = 0, crcErrors = 0, lengthErrors = 0;
     int16_t status = radio.getFlrcRxStats(&packets, &crcErrors, &lengthErrors);
-    Serial.printf("{\"event\":\"stats\",\"run\":%lu,\"status\":%d,\"packets\":%u,\"crc_errors\":%u,"
-                  "\"length_errors\":%u,\"irq\":%lu,\"dio_level\":%d,\"recovered_irqs\":%lu}\n",
-                  (unsigned long)runId, status, packets, crcErrors, lengthErrors, (unsigned long)radio.getIrqFlags(),
-                  digitalRead(14), (unsigned long)recoveredIrqs);
+    emitJson(true,
+             "{\"event\":\"stats\",\"run\":%lu,\"status\":%d,\"packets\":%u,\"crc_errors\":%u,"
+             "\"length_errors\":%u,\"irq\":%lu,\"dio_level\":%d,\"recovered_irqs\":%lu}\n",
+             (unsigned long)runId, status, packets, crcErrors, lengthErrors, (unsigned long)radio.getIrqFlags(), digitalRead(14),
+             (unsigned long)recoveredIrqs);
 }
 
 void readCommands();
@@ -238,9 +274,10 @@ void runFrames(size_t length, uint32_t count, uint32_t gapMs)
     }
     sending = true;
     stopRequested = false;
-    Serial.printf("{\"event\":\"run_start\",\"run\":%lu,\"length\":%u,\"count\":%"
-                  "lu,\"gap_ms\":%lu}\n",
-                  (unsigned long)runId, unsigned(length), (unsigned long)count, (unsigned long)gapMs);
+    emitJson(true,
+             "{\"event\":\"run_start\",\"run\":%lu,\"length\":%u,\"count\":%"
+             "lu,\"gap_ms\":%lu}\n",
+             (unsigned long)runId, unsigned(length), (unsigned long)count, (unsigned long)gapMs);
     uint32_t completed = 0;
     for (; completed < count && !stopRequested; ++completed) {
         uint8_t frame[kMaxLength], echo[kMaxLength];
@@ -270,22 +307,22 @@ void runFrames(size_t length, uint32_t count, uint32_t gapMs)
             }
         }
         quiesce();
-        Serial.printf("{\"event\":\"attempt\",\"run\":%lu,\"seq\":%lu,\"length\":%u,\"tx_"
-                      "status\":%d,"
-                      "\"tx_done\":%s,\"start_call_us\":%lu,\"tx_done_us\":%lu,\"finish_tx_"
-                      "us\":%lu,"
-                      "\"stage_tx_us\":%lu,\"launch_call_us\":%lu,\"launch_to_tx_done_us\":%"
-                      "lu,"
-                      "\"rx_ready_after_tx_done_us\":%lu,"
-                      "\"rx_arm_us\":%lu,\"rx_arm_attempted\":%s,\"rx_arm_status\":%d,"
-                      "\"echo\":%s,\"rx_status\":%d,\"rtt_us\":%lu,"
-                      "\"driver_toa_us\":%lu}\n",
-                      (unsigned long)runId, (unsigned long)seq, unsigned(length), tx.status, tx.done ? "true" : "false",
-                      (unsigned long)tx.startCallUs, (unsigned long)tx.doneUs, (unsigned long)tx.finishUs,
-                      (unsigned long)tx.stageUs, (unsigned long)tx.launchUs,
-                      tx.done ? (unsigned long)(tx.started + tx.doneUs - tx.launchAt) : 0, (unsigned long)rxReadyAfterTxDoneUs,
-                      (unsigned long)armUs, rxArmAttempted ? "true" : "false", rxArmStatus, matched ? "true" : "false", rxStatus,
-                      (unsigned long)rttUs, (unsigned long)toa);
+        emitJson(false,
+                 "{\"event\":\"attempt\",\"run\":%lu,\"seq\":%lu,\"length\":%u,\"tx_"
+                 "status\":%d,"
+                 "\"tx_done\":%s,\"start_call_us\":%lu,\"tx_done_us\":%lu,\"finish_tx_"
+                 "us\":%lu,"
+                 "\"stage_tx_us\":%lu,\"launch_call_us\":%lu,\"launch_to_tx_done_us\":%"
+                 "lu,"
+                 "\"rx_ready_after_tx_done_us\":%lu,"
+                 "\"rx_arm_us\":%lu,\"rx_arm_attempted\":%s,\"rx_arm_status\":%d,"
+                 "\"echo\":%s,\"rx_status\":%d,\"rtt_us\":%lu,"
+                 "\"driver_toa_us\":%lu}\n",
+                 (unsigned long)runId, (unsigned long)seq, unsigned(length), tx.status, tx.done ? "true" : "false",
+                 (unsigned long)tx.startCallUs, (unsigned long)tx.doneUs, (unsigned long)tx.finishUs, (unsigned long)tx.stageUs,
+                 (unsigned long)tx.launchUs, tx.done ? (unsigned long)(tx.started + tx.doneUs - tx.launchAt) : 0,
+                 (unsigned long)rxReadyAfterTxDoneUs, (unsigned long)armUs, rxArmAttempted ? "true" : "false", rxArmStatus,
+                 matched ? "true" : "false", rxStatus, (unsigned long)rttUs, (unsigned long)toa);
         uint32_t gapStarted = micros();
         while (!stopRequested && uint32_t(micros() - gapStarted) < gapMs * 1000) {
             readCommands();
@@ -294,10 +331,11 @@ void runFrames(size_t length, uint32_t count, uint32_t gapMs)
     }
     sending = false;
     int16_t stopStatus = quiesce();
-    Serial.printf("{\"event\":\"run_end\",\"run\":%lu,\"attempts\":%lu,\"requested_count\":%lu,"
-                  "\"stopped\":%s,\"complete\":%s}\n",
-                  (unsigned long)runId, (unsigned long)completed, (unsigned long)count, stopRequested ? "true" : "false",
-                  completed == count && !stopRequested ? "true" : "false");
+    emitJson(true,
+             "{\"event\":\"run_end\",\"run\":%lu,\"attempts\":%lu,\"requested_count\":%lu,"
+             "\"stopped\":%s,\"complete\":%s}\n",
+             (unsigned long)runId, (unsigned long)completed, (unsigned long)count, stopRequested ? "true" : "false",
+             completed == count && !stopRequested ? "true" : "false");
     if (stopRequested)
         reportStopped(stopStatus);
 }
@@ -332,14 +370,20 @@ void processCommand(const char *line)
         stopRequested = false;
         uint32_t armUs;
         int16_t status = armReceive(armUs);
-        Serial.printf("{\"event\":\"rx_ready\",\"status\":%d,\"arm_us\":%lu}\n", status, (unsigned long)armUs);
+        emitJson(true, "{\"event\":\"rx_ready\",\"status\":%d,\"arm_us\":%lu}\n", status, (unsigned long)armUs);
         return;
     }
     unsigned long value, count, gap;
     char tail;
+    if (sscanf(line, "RXLIMIT %lu %c", &value, &tail) == 1 && !receiving && crcBytes == 4 && value >= kMinLength &&
+        value <= kMaxLength) {
+        receiveLimit = value;
+        emitJson(true, "{\"event\":\"rx_limit\",\"bytes\":%u}\n", receiveLimit);
+        return;
+    }
     if (sscanf(line, "RECOVERY %lu %c", &value, &tail) == 1 && !receiving && value <= 1) {
         errorRecovery = value != 0;
-        Serial.printf("{\"event\":\"recovery\",\"enabled\":%s}\n", errorRecovery ? "true" : "false");
+        emitJson(true, "{\"event\":\"recovery\",\"enabled\":%s}\n", errorRecovery ? "true" : "false");
         return;
     }
     if (sscanf(line, "RUN %lu %lu %lu %c", &value, &count, &gap, &tail) == 3 && ready && value >= kMinLength &&
@@ -349,14 +393,15 @@ void processCommand(const char *line)
     }
     if (sscanf(line, "DELAY %lu %c", &value, &tail) == 1 && !receiving && value <= 50000) {
         echoDelayUs = value;
-        Serial.printf("{\"event\":\"delay\",\"us\":%lu}\n", value);
+        emitJson(true, "{\"event\":\"delay\",\"us\":%lu}\n", value);
         return;
     }
-    if (sscanf(line, "CRC %lu %c", &value, &tail) == 1 && !receiving && ready && (value == 2 || value == 4)) {
+    if (sscanf(line, "CRC %lu %c", &value, &tail) == 1 && !receiving && ready && (value == 2 || value == 4) &&
+        (receiveLimit == kMaxLength || value == 4)) {
         int16_t status = radio.setCRC(value);
         if (status == RADIOLIB_ERR_NONE)
             crcBytes = value;
-        Serial.printf("{\"event\":\"crc\",\"bytes\":%u,\"status\":%d}\n", crcBytes, status);
+        emitJson(true, "{\"event\":\"crc\",\"bytes\":%u,\"status\":%d}\n", crcBytes, status);
         return;
     }
     Serial.println("{\"event\":\"error\",\"reason\":\"invalid_command_or_not_ready\"}");
@@ -405,16 +450,16 @@ void receiveFrame()
     }
     uint32_t rearmUs = 0;
     int16_t rearmStatus = stopRequested ? RADIOLIB_ERR_NONE : armReceive(rearmUs);
-    Serial.printf("{\"event\":\"rx\",\"run\":%lu,\"peer_run\":%lu,\"seq\":%lu,\"length\":%u,\"status\":"
-                  "%d,"
-                  "\"payload_valid\":%s,\"irq\":%lu,\"read_us\":%lu,\"echo_start_us\":%lu,"
-                  "\"echo_done_us\":%lu,\"echo_status\":%d,\"rx_rearm_us\":%lu,\"rearm_"
-                  "status\":%d,\"delay_us\":%lu,\"irq_source\":\"%s\"}\n",
-                  (unsigned long)runId, (unsigned long)peerRun, (unsigned long)seq, unsigned(length), status,
-                  valid ? "true" : "false", (unsigned long)flags, (unsigned long)readUs,
-                  valid ? (unsigned long)(echo.started - rxEdge) : 0,
-                  valid && echo.done ? (unsigned long)(echo.started + echo.doneUs - rxEdge) : 0, echo.status,
-                  (unsigned long)rearmUs, rearmStatus, (unsigned long)echoDelayUs, polled ? "poll" : "dio");
+    emitJson(false,
+             "{\"event\":\"rx\",\"run\":%lu,\"peer_run\":%lu,\"seq\":%lu,\"length\":%u,\"status\":"
+             "%d,"
+             "\"payload_valid\":%s,\"irq\":%lu,\"read_us\":%lu,\"echo_start_us\":%lu,"
+             "\"echo_done_us\":%lu,\"echo_status\":%d,\"rx_rearm_us\":%lu,\"rearm_"
+             "status\":%d,\"delay_us\":%lu,\"irq_source\":\"%s\"}\n",
+             (unsigned long)runId, (unsigned long)peerRun, (unsigned long)seq, unsigned(length), status, valid ? "true" : "false",
+             (unsigned long)flags, (unsigned long)readUs, valid ? (unsigned long)(echo.started - rxEdge) : 0,
+             valid && echo.done ? (unsigned long)(echo.started + echo.doneUs - rxEdge) : 0, echo.status, (unsigned long)rearmUs,
+             rearmStatus, (unsigned long)echoDelayUs, polled ? "poll" : "dio");
     if (stopRequested)
         reportStopped(stopStatus);
 }
@@ -449,7 +494,7 @@ void setup()
     ready = status == RADIOLIB_ERR_NONE;
     attachInterrupt(digitalPinToInterrupt(14), onIrq, RISING);
     quiesce();
-    Serial.printf("{\"event\":\"boot\",\"build\":\"%s\",\"status\":%d}\n", kBuild, status);
+    emitJson(true, "{\"event\":\"boot\",\"build\":\"%s\",\"status\":%d}\n", kBuild, status);
 }
 
 void loop()
