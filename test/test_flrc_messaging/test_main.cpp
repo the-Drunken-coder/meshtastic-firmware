@@ -1,6 +1,11 @@
 // Active FLRC must retain the native router's AES/PKI envelopes, explicit ACK handling,
 // frame ceiling, opaque forwarding and duplicate suppression. The radio seam captures
 // production frame packing and injects reception metadata; it proves no RF behavior.
+// Exercises Router::send() and perhapsDecode() in src/mesh/Router.cpp,
+// ReliableRouter::ackProofStatusFor() in src/mesh/ReliableRouter.cpp, and
+// RadioInterface::beginSending() in src/mesh/RadioInterface.cpp. These contracts prevent
+// a modulation change from bypassing encryption, accepting unauthenticated ACKs, or
+// forwarding frames outside the existing size and hop limits.
 #include "MeshTypes.h"
 #include "TestUtil.h"
 #include "airtime.h"

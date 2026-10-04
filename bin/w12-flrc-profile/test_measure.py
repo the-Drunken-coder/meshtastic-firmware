@@ -6,11 +6,132 @@ import io
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import measure  # noqa: E402
+
+
+class FakeRunnerSession:
+    """Small line-protocol peer that enforces the firmware's RX/CRC guard."""
+
+    def __init__(
+        self,
+        role: str,
+        *,
+        fail_run: bool = False,
+        run_exception: BaseException | None = None,
+        fail_crc4_calls: set[int] | None = None,
+        fail_stop_calls: set[int] | None = None,
+    ) -> None:
+        self.role = role
+        self.identity = {"role": role}
+        self.events: list[measure.SerialEvent] = []
+        self.queue: list[measure.SerialEvent] = []
+        self.calls: list[tuple[str, int | bool]] = []
+        self.receiving = False
+        self.crc = 4
+        self.fail_run = fail_run
+        self.run_exception = run_exception
+        self.fail_crc4_calls = fail_crc4_calls or set()
+        self.fail_stop_calls = fail_stop_calls or set()
+        self.stop_calls = 0
+        self.crc4_calls = 0
+
+    def _event(self, record: dict[str, object], *, queued: bool = False) -> measure.SerialEvent:
+        event = measure.SerialEvent(
+            self.role,
+            time.monotonic(),
+            "2026-01-01T00:00:00Z",
+            record,
+        )
+        self.events.append(event)
+        if queued:
+            self.queue.append(event)
+        return event
+
+    def stop(self, timeout: float = 10) -> measure.SerialEvent:
+        del timeout
+        self.stop_calls += 1
+        self.calls.append(("stop", self.receiving))
+        if self.stop_calls in self.fail_stop_calls:
+            raise RuntimeError(f"{self.role} STOP failed")
+        self.receiving = False
+        return self._event({"event": "stopped", "status": 0, "quiescent": True})
+
+    def set_crc(self, byte_count: int, timeout: float = 10) -> dict[str, object]:
+        del timeout
+        self.calls.append(("crc", byte_count))
+        if byte_count == 4:
+            self.crc4_calls += 1
+        if self.receiving:
+            raise RuntimeError(f"{self.role} CRC changed while RX active")
+        if byte_count == 4 and self.crc4_calls in self.fail_crc4_calls:
+            raise RuntimeError(f"{self.role} CRC4 restore failed")
+        self.crc = byte_count
+        return {"event": "crc", "status": 0, "bytes": byte_count}
+
+    def stats(self, timeout: float = 10) -> dict[str, object]:
+        del timeout
+        return {"event": "stats", "status": 0}
+
+    def receive(self) -> dict[str, object]:
+        self.receiving = True
+        return {"event": "rx_ready", "status": 0}
+
+    def command(self, text: str, event_name: str, timeout: float = 10) -> measure.SerialEvent:
+        del timeout
+        if text == "INFO":
+            return self._event(
+                {
+                    "event": "info",
+                    "build": measure.EXPECTED_BUILD,
+                    "run": 7,
+                    "ready": True,
+                    "board_id": measure.IDENTITIES[self.role],
+                }
+            )
+        if text.startswith("RUN "):
+            if self.run_exception is not None:
+                raise self.run_exception
+            if self.fail_run:
+                raise RuntimeError("RUN failed")
+            count = int(text.split()[2])
+            for sequence in range(count):
+                self._event(
+                    {
+                        "event": "attempt",
+                        "run": 7,
+                        "seq": sequence,
+                        "length": int(text.split()[1]),
+                    }
+                )
+            self._event(
+                {
+                    "event": "run_end",
+                    "run": 7,
+                    "attempts": count,
+                    "requested_count": count,
+                    "complete": True,
+                    "stopped": False,
+                },
+                queued=True,
+            )
+            return self._event({"event": event_name, "run": 7})
+        return self._event({"event": event_name, "status": 0})
+
+    def _take_event(self, event_name: str, predicate=None) -> measure.SerialEvent | None:
+        for index, event in enumerate(self.queue):
+            if event.record.get("event") == event_name and (
+                predicate is None or predicate(event.record)
+            ):
+                return self.queue.pop(index)
+        return None
+
+    def poll(self) -> None:
+        return
 
 
 class MeasureAnalysisTests(unittest.TestCase):
@@ -384,6 +505,125 @@ class MeasureAnalysisTests(unittest.TestCase):
             )
             summary = measure.summarize(directory)
             self.assertEqual(summary["protocol_errors_by_role"], {"base": 1})
+
+
+class RunnerCleanupTests(unittest.TestCase):
+    def make_runner(
+        self,
+        directory: Path,
+        *,
+        base: FakeRunnerSession | None = None,
+        walker: FakeRunnerSession | None = None,
+    ) -> measure.Runner:
+        runner = measure.Runner(
+            directory,
+            duration_seconds=60,
+            count=1,
+            gap_ms=0,
+            lengths=(12,),
+            delays_us=(0,),
+        )
+        runner.sessions = {
+            "base": base or FakeRunnerSession("base"),
+            "walker": walker or FakeRunnerSession("walker"),
+        }
+        runner.state["boards"] = {
+            role: {"info": {"run": 7}}
+            for role in ("base", "walker")
+        }
+        return runner
+
+    def test_crc_restore_stops_rx_before_each_crc_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runner = self.make_runner(Path(temporary))
+            runner.run_crc_negative_control(time.monotonic() + 10, 0)
+            for session in runner.sessions.values():
+                self.assertEqual(session.crc, 4)
+                self.assertFalse(session.receiving)
+                crc_index = max(
+                    index
+                    for index, call in enumerate(session.calls)
+                    if call == ("crc", 4)
+                )
+                stop_index = max(
+                    index
+                    for index, call in enumerate(session.calls[:crc_index])
+                    if call[0] == "stop"
+                )
+                self.assertLess(stop_index, crc_index)
+            self.assertTrue(runner.phases[0]["crc_restored"])
+            self.assertEqual(runner.phases[0]["cleanup_errors"], [])
+
+    def test_run_failure_while_receiver_rx_preserves_original_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            receiver = FakeRunnerSession("walker")
+            runner = self.make_runner(
+                Path(temporary),
+                base=FakeRunnerSession("base", fail_run=True),
+                walker=receiver,
+            )
+            with self.assertRaisesRegex(RuntimeError, "RUN failed"):
+                runner.run_crc_negative_control(time.monotonic() + 10, 0)
+            self.assertFalse(receiver.receiving)
+            self.assertEqual(runner.sessions["base"].crc, 4)
+            self.assertEqual(receiver.crc, 4)
+            self.assertEqual(runner.phases[0]["state"], "failed")
+            self.assertIn("RUN failed", runner.phases[0]["error"])
+
+    def test_keyboard_interrupt_still_cleans_up_receiver(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            receiver = FakeRunnerSession("walker")
+            runner = self.make_runner(
+                Path(temporary),
+                base=FakeRunnerSession("base", run_exception=KeyboardInterrupt()),
+                walker=receiver,
+            )
+            with self.assertRaises(KeyboardInterrupt):
+                runner.run_crc_negative_control(time.monotonic() + 10, 0)
+            self.assertFalse(receiver.receiving)
+            self.assertEqual(runner.sessions["base"].crc, 4)
+            self.assertEqual(receiver.crc, 4)
+            self.assertEqual(runner.phases[0]["state"], "failed")
+
+    def test_failed_receiver_stop_does_not_block_sender_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            receiver = FakeRunnerSession("walker", fail_stop_calls={2, 3})
+            runner = self.make_runner(Path(temporary), walker=receiver)
+            with self.assertRaisesRegex(RuntimeError, "STOP failed"):
+                runner.run_crc_negative_control(time.monotonic() + 10, 0)
+            sender = runner.sessions["base"]
+            self.assertEqual(sender.crc, 4)
+            self.assertEqual(receiver.crc, 4)
+            self.assertEqual(runner.phases[0]["cleanup"]["crc_restore"]["base"], "restored")
+            self.assertEqual(
+                runner.phases[0]["cleanup"]["crc_restore"]["walker"],
+                "skipped_stop_failed",
+            )
+            self.assertFalse(runner.phases[0]["crc_restored"])
+            self.assertTrue(runner.state["cleanup_errors"])
+
+    def test_cleanup_crc_failure_without_run_failure_is_phase_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            receiver = FakeRunnerSession("walker", fail_crc4_calls={2})
+            runner = self.make_runner(Path(temporary), walker=receiver)
+            with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
+                runner.run_crc_negative_control(time.monotonic() + 10, 0)
+            phase = runner.phases[0]
+            self.assertEqual(phase["state"], "failed")
+            self.assertFalse(phase["crc_restored"])
+            self.assertFalse(phase["run_completion"]["complete"])
+            self.assertTrue(phase["cleanup_errors"])
+
+    def test_initial_crc_failure_remains_original_when_restore_also_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            receiver = FakeRunnerSession("walker", fail_crc4_calls={1, 2})
+            runner = self.make_runner(Path(temporary), walker=receiver)
+            with self.assertRaisesRegex(RuntimeError, "CRC4 restore failed"):
+                runner.run_crc_negative_control(time.monotonic() + 10, 0)
+            phase = runner.phases[0]
+            self.assertEqual(phase["state"], "failed")
+            self.assertEqual(phase["error"], "RuntimeError: walker CRC4 restore failed")
+            self.assertIn("CRC4 restore failed", phase["cleanup_errors"][0])
 
 
 if __name__ == "__main__":

@@ -237,7 +237,9 @@ typedef enum _meshtastic_Config_DisplayConfig_CompassOrientation {
 
 /* Physical modulation. The retained LoRa tuning fields do not tune FLRC. */
 typedef enum _meshtastic_Config_LoRaConfig_RadioMode {
+    /* Use the retained LoRa modem and frequency settings. */
     meshtastic_Config_LoRaConfig_RadioMode_LORA = 0,
+    /* Use the fixed W12 FLRC profile, retaining LoRa settings for a later return. */
     meshtastic_Config_LoRaConfig_RadioMode_FLRC = 1
 } meshtastic_Config_LoRaConfig_RadioMode;
 

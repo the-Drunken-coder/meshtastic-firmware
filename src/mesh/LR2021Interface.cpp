@@ -228,7 +228,7 @@ bool LR2021Interface::validReceiveIrq()
     int16_t result = W12FlrcProfile::readIrqFlags(module, flags);
     if (result == RADIOLIB_ERR_NONE && W12FlrcProfile::acceptsIrq(flags))
         return true;
-    LOG_WARN("Reject FLRC RX status=%d IRQ=0x%08x", result, flags);
+    LOG_WARN("Reject FLRC RX status=%d IRQ=0x%x", result, flags);
     lora.clearIrqFlags(RADIOLIB_LR2021_IRQ_ALL);
     return false;
 }

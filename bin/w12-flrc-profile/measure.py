@@ -1361,6 +1361,7 @@ class Runner:
             "started_utc": utc_stamp(),
             "started_monotonic": time.monotonic(),
         }
+        original_error: BaseException | None = None
         try:
             sender_session.stop()
             receiver_session.stop()
@@ -1426,19 +1427,74 @@ class Runner:
             phase["state"] = (
                 "complete" if phase["run_completion"]["complete"] else "incomplete"
             )
-        except Exception as error:
+        except BaseException as error:
+            original_error = error
             phase["state"] = "failed"
             phase["error"] = f"{type(error).__name__}: {error}"
             phase["ended_monotonic"] = time.monotonic()
             phase["ended_utc"] = utc_stamp()
-            raise
-        finally:
+
+        cleanup_errors: list[str] = []
+        stop_confirmed: dict[str, bool] = {}
+        phase["cleanup"] = {"stop": {}, "crc_restore": {}}
+
+        # CRC changes are rejected by the firmware while RX is active. Stop each
+        # board independently so one failed STOP does not hide a safe restore.
+        for role, session in (
+            (sender, sender_session),
+            (receiver, receiver_session),
+        ):
             try:
-                sender_session.set_crc(4)
-                receiver_session.set_crc(4)
-            finally:
-                self.log_phase(phase)
-                self.save_state()
+                session.stop(timeout=10)
+            except BaseException as error:
+                stop_confirmed[role] = False
+                phase["cleanup"]["stop"][role] = "failed"
+                cleanup_errors.append(f"{role} STOP before CRC restore: {error}")
+            else:
+                stop_confirmed[role] = True
+                phase["cleanup"]["stop"][role] = "confirmed"
+
+        for role, session in (
+            (sender, sender_session),
+            (receiver, receiver_session),
+        ):
+            if not stop_confirmed.get(role, False):
+                phase["cleanup"]["crc_restore"][role] = "skipped_stop_failed"
+                continue
+            try:
+                session.set_crc(4)
+            except BaseException as error:
+                phase["cleanup"]["crc_restore"][role] = "failed"
+                cleanup_errors.append(f"{role} CRC4 restore: {error}")
+            else:
+                phase["cleanup"]["crc_restore"][role] = "restored"
+
+        phase["cleanup_errors"] = cleanup_errors
+        phase["crc_restored"] = all(
+            phase["cleanup"]["crc_restore"].get(role) == "restored"
+            for role in (sender, receiver)
+        )
+        if cleanup_errors:
+            self.state.setdefault("cleanup_errors", []).extend(
+                f"phase {phase_id}: {error}" for error in cleanup_errors
+            )
+            if original_error is None:
+                phase["state"] = "failed"
+                phase["error"] = (
+                    "CRC negative-control cleanup failed: "
+                    + "; ".join(cleanup_errors)
+                )
+                if isinstance(phase.get("run_completion"), dict):
+                    phase["run_completion"]["complete"] = False
+        cleanup_error: BaseException | None = None
+        if original_error is None and cleanup_errors:
+            cleanup_error = RuntimeError(phase["error"])
+
+        self.log_phase(phase)
+        self.save_state()
+        error_to_raise = original_error or cleanup_error
+        if error_to_raise is not None:
+            raise error_to_raise.with_traceback(error_to_raise.__traceback__)
 
     def run(self) -> dict[str, Any]:
         self.output.mkdir(parents=True, exist_ok=False)
@@ -1540,7 +1596,9 @@ class Runner:
         finally:
             self.state["state"] = "stopping"
             self.save_state()
-            self.state["cleanup_errors"] = self.stop_all()
+            cleanup_errors = list(self.state.get("cleanup_errors", []))
+            cleanup_errors.extend(self.stop_all())
+            self.state["cleanup_errors"] = cleanup_errors
             for role, session in self.sessions.items():
                 try:
                     session.close()

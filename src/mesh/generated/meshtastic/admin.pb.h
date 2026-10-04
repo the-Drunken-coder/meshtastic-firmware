@@ -96,10 +96,15 @@ typedef enum _meshtastic_AdminMessage_BackupLocation {
 } meshtastic_AdminMessage_BackupLocation;
 
 typedef enum _meshtastic_RadioModeStatus_BlockedReason {
+    /* The current selection and transmit policy allow transmission. */
     meshtastic_RadioModeStatus_BlockedReason_NONE = 0,
+    /* The active or saved selection is incompatible with the board or region. */
     meshtastic_RadioModeStatus_BlockedReason_INVALID_CONFIGURATION = 1,
+    /* The active FLRC radio has not completed initialization. */
     meshtastic_RadioModeStatus_BlockedReason_NOT_INITIALIZED = 2,
+    /* Standard FLRC firmware awaits measured RF approval. */
     meshtastic_RadioModeStatus_BlockedReason_RF_APPROVAL_REQUIRED = 3,
+    /* The saved transmit-enable preference is off. */
     meshtastic_RadioModeStatus_BlockedReason_TX_DISABLED = 4
 } meshtastic_RadioModeStatus_BlockedReason;
 
