@@ -9,6 +9,10 @@
  *  4. RadioInterface::clampConfigLora()
  *  5. RegionInfo preset lists (PRESETS_STD, PRESETS_EU_868, PRESETS_UNDEF)
  *  6. Channel spacing calculation (placeholder for future protobuf changes)
+ *  7. RadioMode in src/mesh/RadioMode.cpp through AdminModule and NodeDB persistence.
+ *     A saved modulation choice must retain tuning and wait for reboot. Missing fields,
+ *     rejected writes, and invalid boot settings must never enable an unintended radio.
+ *     A failed real filesystem save must retain RAM and disk settings and answer the client with a NAK.
  */
 
 #include "Channels.h"
@@ -18,8 +22,10 @@
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "RadioInterface.h"
+#include "RadioMode.h"
 #include "TestUtil.h"
 #include "graphics/draw/MenuHandler.h"
+#include "main.h"
 #include "mesh/Channels.h"
 #include "mesh/CryptoEngine.h" // crypto global: the tests swap in a stub engine to drive key derivation
 #include "mesh/Router.h"       // router global: allocErrorResponse() allocates the reply through it
@@ -995,6 +1001,15 @@ static void test_channelSpacingCalculation_placeholder()
 
 // AdminModuleTestShim comes from test/support - the friend seam AdminModule.h declares.
 static AdminModuleTestShim *testAdmin;
+#if defined(ARCH_PORTDUINO) && !defined(_WIN32)
+static bool radioModePowerSafe = true;
+// Drive the production disk-write safety gate, leaving NodeDB and SafeFile persistence intact.
+bool powerHAL_isPowerLevelSafe()
+{
+    return radioModePowerSafe;
+}
+#endif
+
 static NodeDB *savedNodeDB;
 static NodeDB *replacementNodeDB;
 static NodeInfoModule *savedNodeInfoModule;
@@ -1006,6 +1021,7 @@ static meshtastic_ChannelFile savedChannelFile;
 // Saved/torn down for every test so a failed assertion's longjmp cannot leave one dangling.
 static Router *savedRouter;
 static Router *hamMockRouter;
+static bool radioModePrefsTouched;
 
 // Called from setUp/tearDown for every test, not opted into by a handful. A shared NodeDB plus
 // unrestored config/owner/devicestate/channelFile means each test inherits whatever its
@@ -1029,6 +1045,10 @@ static void dropRestoreCryptoStub();
 
 static void restoreAdminRadioGlobals()
 {
+    if (radioModePrefsTouched) {
+        config = savedConfig;
+        nodeDB->saveToDisk(SEGMENT_CONFIG);
+    }
     dropRestoreCryptoStub();
     nodeInfoModule = savedNodeInfoModule;
     nodeDB = savedNodeDB;
@@ -1040,6 +1060,8 @@ static void restoreAdminRadioGlobals()
     devicestate = savedDeviceState;
     owner = savedOwner;
     config = savedConfig;
+    RadioMode::initialize(config.lora);
+    RadioMode::markInitialized(true);
     channelFile = savedChannelFile;
     initRegion();
 }
@@ -2433,6 +2455,392 @@ static meshtastic_Config_LoRaConfig loraAt(meshtastic_Config_LoRaConfig_RegionCo
     return lora;
 }
 
+// The existing local admin interface is the configuration seam. These checks preserve
+// optional-field wire semantics and the reboot boundary without substituting a fake radio policy.
+static void test_radioMode_legacyConfigDefaultsToLoraAndReportsCapability()
+{
+    config.lora = loraAt(meshtastic_Config_LoRaConfig_RegionCode_US, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST);
+    RadioMode::initialize(config.lora);
+    RadioMode::markInitialized(true);
+    hamMockRouter = new HamModeMockRouter();
+    router = hamMockRouter;
+
+    meshtastic_AdminMessage request = meshtastic_AdminMessage_init_zero;
+    request.which_payload_variant = meshtastic_AdminMessage_get_radio_mode_status_request_tag;
+    request.get_radio_mode_status_request = true;
+    meshtastic_MeshPacket packet = meshtastic_MeshPacket_init_zero;
+    packet.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    packet.decoded.want_response = true;
+    testAdmin->handleReceivedProtobuf(packet, &request);
+
+    const auto *reply = testAdmin->reply();
+    TEST_ASSERT_NOT_NULL(reply);
+    meshtastic_AdminMessage response = meshtastic_AdminMessage_init_zero;
+    TEST_ASSERT_TRUE(
+        pb_decode_from_bytes(reply->decoded.payload.bytes, reply->decoded.payload.size, &meshtastic_AdminMessage_msg, &response));
+    TEST_ASSERT_EQUAL(meshtastic_AdminMessage_get_radio_mode_status_response_tag, response.which_payload_variant);
+    TEST_ASSERT_EQUAL_UINT32(1, response.get_radio_mode_status_response.capability_version);
+    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_RadioMode_LORA, response.get_radio_mode_status_response.active_mode);
+    TEST_ASSERT_FALSE(response.get_radio_mode_status_response.restart_pending);
+    TEST_ASSERT_TRUE(response.get_radio_mode_status_response.configuration_valid);
+    testAdmin->drainReply();
+}
+
+static void primeRadioModeTest()
+{
+    config.lora = loraAt(meshtastic_Config_LoRaConfig_RegionCode_US, meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST);
+    config.lora.tx_enabled = true;
+    RadioInterface::clampConfigLora(config.lora);
+    RadioMode::initialize(config.lora);
+    RadioMode::markInitialized(true);
+    initRegion();
+    hamMockRouter = new HamModeMockRouter();
+    router = hamMockRouter;
+    radioModePrefsTouched = true;
+}
+
+static void writeRadioModeConfig(const meshtastic_Config_LoRaConfig &lora, bool wantResponse = false)
+{
+    meshtastic_AdminMessage request = meshtastic_AdminMessage_init_zero;
+    request.which_payload_variant = meshtastic_AdminMessage_set_config_tag;
+    request.set_config.which_payload_variant = meshtastic_Config_lora_tag;
+    request.set_config.payload_variant.lora = lora;
+    meshtastic_MeshPacket packet = meshtastic_MeshPacket_init_zero;
+    packet.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    packet.decoded.want_response = wantResponse;
+    testAdmin->handleReceivedProtobuf(packet, &request);
+}
+
+static void assertRadioModeStatusReply(RadioMode::Mode configuredMode)
+{
+    const auto *reply = testAdmin->reply();
+    TEST_ASSERT_NOT_NULL(reply);
+    TEST_ASSERT_EQUAL(meshtastic_PortNum_ADMIN_APP, reply->decoded.portnum);
+    meshtastic_AdminMessage response = meshtastic_AdminMessage_init_zero;
+    TEST_ASSERT_TRUE(
+        pb_decode_from_bytes(reply->decoded.payload.bytes, reply->decoded.payload.size, &meshtastic_AdminMessage_msg, &response));
+    TEST_ASSERT_EQUAL(meshtastic_AdminMessage_get_radio_mode_status_response_tag, response.which_payload_variant);
+    TEST_ASSERT_EQUAL(configuredMode, response.get_radio_mode_status_response.configured_mode);
+    testAdmin->drainReply();
+}
+
+static void assertRadioModeWriteRejected(const meshtastic_Config_LoRaConfig &lora)
+{
+    const auto before = config.lora;
+    writeRadioModeConfig(lora, true);
+    const auto *reply = testAdmin->reply();
+    TEST_ASSERT_NOT_NULL(reply);
+    meshtastic_Routing response = meshtastic_Routing_init_zero;
+    TEST_ASSERT_TRUE(
+        pb_decode_from_bytes(reply->decoded.payload.bytes, reply->decoded.payload.size, &meshtastic_Routing_msg, &response));
+    TEST_ASSERT_EQUAL(meshtastic_Routing_error_reason_tag, response.which_variant);
+    TEST_ASSERT_EQUAL(meshtastic_Routing_Error_BAD_REQUEST, response.error_reason);
+    TEST_ASSERT_EQUAL_MEMORY(&before, &config.lora, sizeof(before));
+    testAdmin->drainReply();
+}
+
+static void test_radioMode_rejectsUnknownAndUnsupportedSelections()
+{
+    primeRadioModeTest();
+    auto incoming = config.lora;
+    incoming.has_radio_mode = true;
+    incoming.radio_mode = static_cast<RadioMode::Mode>(99);
+    assertRadioModeWriteRejected(incoming);
+    incoming.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_FLRC;
+#ifndef MESHNOLOGY_W12
+    assertRadioModeWriteRejected(incoming);
+#endif
+    incoming.region = meshtastic_Config_LoRaConfig_RegionCode_EU_868;
+    assertRadioModeWriteRejected(incoming);
+    incoming.region = config.lora.region;
+    incoming.serial_hal_only = true;
+    assertRadioModeWriteRejected(incoming);
+}
+
+static void test_radioMode_omittedFieldPreservesExplicitLoraSelection()
+{
+    primeRadioModeTest();
+    config.lora.has_radio_mode = true;
+    config.lora.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_LORA;
+    auto legacy = config.lora;
+    legacy.has_radio_mode = false;
+    legacy.hop_limit = 4;
+    writeRadioModeConfig(legacy);
+    TEST_ASSERT_TRUE(config.lora.has_radio_mode);
+    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_RadioMode_LORA, config.lora.radio_mode);
+    TEST_ASSERT_EQUAL_UINT32(4, config.lora.hop_limit);
+}
+
+static void test_radioMode_explicitSameModeWriteReturnsApplyStatus()
+{
+    primeRadioModeTest();
+    auto incoming = config.lora;
+    incoming.has_radio_mode = true;
+    incoming.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_LORA;
+    writeRadioModeConfig(incoming, true);
+    assertRadioModeStatusReply(meshtastic_Config_LoRaConfig_RadioMode_LORA);
+}
+
+static void test_radioMode_rejectsExplicitSelectionInsideEditTransaction()
+{
+    primeRadioModeTest();
+    testAdmin->deferSaves();
+    auto incoming = config.lora;
+    incoming.has_radio_mode = true;
+    incoming.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_LORA;
+    assertRadioModeWriteRejected(incoming);
+    TEST_ASSERT_TRUE(testAdmin->editTransactionOpen());
+    TEST_ASSERT_EQUAL_INT(1, warningsContaining("commit the open edit transaction first"));
+}
+
+static void test_radioMode_transientBeaconSettingsCannotReplacePersistedHomeTuning()
+{
+    primeRadioModeTest();
+    const auto home = config.lora;
+    TEST_ASSERT_TRUE(nodeDB->saveToDisk(SEGMENT_CONFIG));
+    const uint32_t rebootBefore = rebootAtMsec;
+    ConfigChangedCounter counter;
+    counter.observe(&service->configChanged);
+    config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_SHORT_FAST;
+    config.lora.override_frequency = 916.0f;
+    nodeDB->setLoraSlotTransient(true);
+    auto incoming = config.lora;
+    incoming.has_radio_mode = true;
+#ifdef MESHNOLOGY_W12
+    incoming.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_FLRC;
+#else
+    incoming.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_LORA;
+#endif
+    assertRadioModeWriteRejected(incoming);
+    TEST_ASSERT_TRUE(nodeDB->isLoraSlotTransient());
+    TEST_ASSERT_EQUAL_UINT32(rebootBefore, rebootAtMsec);
+    TEST_ASSERT_EQUAL_INT(0, counter.count);
+    TEST_ASSERT_EQUAL_INT(1, warningsContaining("temporary beacon radio switch"));
+    meshtastic_LocalConfig persisted = meshtastic_LocalConfig_init_zero;
+    TEST_ASSERT_EQUAL(LOAD_SUCCESS, nodeDB->loadProto(configFileName, meshtastic_LocalConfig_size, sizeof(persisted),
+                                                      &meshtastic_LocalConfig_msg, &persisted));
+    TEST_ASSERT_EQUAL_MEMORY(&home, &persisted.lora, sizeof(home));
+    config.lora = home;
+    nodeDB->setLoraSlotTransient(false);
+}
+
+static void test_radioMode_rejectsInvalidExplicitLoraRegion()
+{
+    primeRadioModeTest();
+    auto incoming = config.lora;
+    incoming.has_radio_mode = true;
+    incoming.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_LORA;
+    incoming.region = static_cast<meshtastic_Config_LoRaConfig_RegionCode>(99);
+    assertRadioModeWriteRejected(incoming);
+}
+
+#if defined(ARCH_PORTDUINO) && !defined(_WIN32)
+static void assertFailedRadioModeSaveRetainsDisk(const meshtastic_Config_LoRaConfig &incoming)
+{
+    TEST_ASSERT_TRUE(nodeDB->saveToDisk(SEGMENT_CONFIG));
+    const auto before = config.lora;
+    const bool hadLora = config.has_lora;
+    radioModePowerSafe = false;
+    assertRadioModeWriteRejected(incoming);
+    radioModePowerSafe = true;
+    TEST_ASSERT_EQUAL(hadLora, config.has_lora);
+    meshtastic_LocalConfig persisted = meshtastic_LocalConfig_init_zero;
+    TEST_ASSERT_EQUAL(LOAD_SUCCESS, nodeDB->loadProto(configFileName, meshtastic_LocalConfig_size, sizeof(persisted),
+                                                      &meshtastic_LocalConfig_msg, &persisted));
+    TEST_ASSERT_EQUAL_MEMORY(&before, &persisted.lora, sizeof(before));
+    TEST_ASSERT_EQUAL_INT(1, warningsContaining("could not be saved"));
+}
+
+static void test_radioMode_failedSameModeSaveReturnsNakAndRetainsDisk()
+{
+    primeRadioModeTest();
+    auto incoming = config.lora;
+    incoming.has_radio_mode = true;
+    incoming.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_LORA;
+    incoming.hop_limit = 4;
+    assertFailedRadioModeSaveRetainsDisk(incoming);
+}
+
+#ifdef MESHNOLOGY_W12
+static void test_radioMode_failedFlrcSelectionSaveReturnsNakAndRetainsDisk()
+{
+    primeRadioModeTest();
+    auto incoming = config.lora;
+    incoming.has_radio_mode = true;
+    incoming.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_FLRC;
+    assertFailedRadioModeSaveRetainsDisk(incoming);
+    TEST_ASSERT_FALSE(RadioMode::status(config.lora).restart_pending);
+}
+#endif
+#endif
+
+static void test_radioMode_invalidBootDisablesTxAndAllowsLocalCorrection()
+{
+    primeRadioModeTest();
+    config.lora.has_radio_mode = true;
+    config.lora.radio_mode = static_cast<RadioMode::Mode>(99);
+    nodeDB->saveToDisk(SEGMENT_CONFIG);
+    NodeDB invalidBoot;
+    TEST_ASSERT_FALSE(RadioMode::canTransmit());
+    TEST_ASSERT_EQUAL(meshtastic_RadioModeStatus_BlockedReason_INVALID_CONFIGURATION,
+                      RadioMode::status(config.lora).blocked_reason);
+    auto corrected = config.lora;
+    corrected.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_LORA;
+    writeRadioModeConfig(corrected);
+    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_RadioMode_LORA, config.lora.radio_mode);
+    TEST_ASSERT_TRUE(RadioMode::status(config.lora).restart_pending);
+    TEST_ASSERT_FALSE(RadioMode::canTransmit());
+    NodeDB correctedBoot;
+    TEST_ASSERT_FALSE(RadioMode::status(config.lora).restart_pending);
+    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_RadioMode_LORA, RadioMode::status(config.lora).active_mode);
+    TEST_ASSERT_TRUE(RadioMode::canTransmit());
+}
+
+#ifdef MESHNOLOGY_W12
+static void assertCorrectiveLoraSurvivesBoot(const meshtastic_Config_LoRaConfig &corrected)
+{
+    writeRadioModeConfig(corrected, true);
+    assertRadioModeStatusReply(meshtastic_Config_LoRaConfig_RadioMode_LORA);
+    TEST_ASSERT_TRUE(RadioMode::isFlrc());
+    TEST_ASSERT_TRUE(RadioMode::status(config.lora).restart_pending);
+    meshtastic_LocalConfig persisted = meshtastic_LocalConfig_init_zero;
+    TEST_ASSERT_EQUAL(LOAD_SUCCESS, nodeDB->loadProto(configFileName, meshtastic_LocalConfig_size, sizeof(persisted),
+                                                      &meshtastic_LocalConfig_msg, &persisted));
+    TEST_ASSERT_EQUAL_MEMORY(&corrected, &persisted.lora, sizeof(corrected));
+    NodeDB correctedBoot;
+    TEST_ASSERT_FALSE(RadioMode::isFlrc());
+    TEST_ASSERT_FALSE(RadioMode::status(config.lora).restart_pending);
+    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_RegionCode_US, config.lora.region);
+    TEST_ASSERT_TRUE(RadioMode::canTransmit());
+}
+
+static void test_radioMode_invalidSavedFlrcRegionAllowsCompleteLoraCorrection()
+{
+    primeRadioModeTest();
+    config.lora.has_radio_mode = true;
+    config.lora.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_FLRC;
+    config.lora.region = static_cast<meshtastic_Config_LoRaConfig_RegionCode>(99);
+    TEST_ASSERT_TRUE(nodeDB->saveToDisk(SEGMENT_CONFIG));
+    NodeDB invalidBoot;
+    TEST_ASSERT_FALSE(RadioMode::canTransmit());
+    auto corrected = config.lora;
+    corrected.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_LORA;
+    corrected.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+    assertCorrectiveLoraSurvivesBoot(corrected);
+}
+
+static void test_radioMode_invalidRetainedLoraTuningAllowsCompleteCorrection()
+{
+    primeRadioModeTest();
+    config.lora.has_radio_mode = true;
+    config.lora.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_FLRC;
+    config.lora.modem_preset = static_cast<meshtastic_Config_LoRaConfig_ModemPreset>(99);
+    TEST_ASSERT_TRUE(nodeDB->saveToDisk(SEGMENT_CONFIG));
+    NodeDB flrcBoot;
+    auto corrected = config.lora;
+    corrected.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_LORA;
+    corrected.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST;
+    assertCorrectiveLoraSurvivesBoot(corrected);
+}
+
+static void test_radioMode_invalidRetainedCustomTuningAllowsCompleteCorrection()
+{
+    primeRadioModeTest();
+    config.lora.has_radio_mode = true;
+    config.lora.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_FLRC;
+    config.lora.use_preset = false;
+    config.lora.bandwidth = 0;
+    config.lora.spread_factor = 0;
+    config.lora.coding_rate = 0;
+    TEST_ASSERT_TRUE(nodeDB->saveToDisk(SEGMENT_CONFIG));
+    NodeDB flrcBoot;
+    auto corrected = config.lora;
+    corrected.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_LORA;
+    corrected.bandwidth = 250;
+    corrected.spread_factor = 9;
+    corrected.coding_rate = 5;
+    assertCorrectiveLoraSurvivesBoot(corrected);
+}
+
+static void test_radioMode_switchPersistsAndRetainsTuningUntilReboot()
+{
+    primeRadioModeTest();
+    const auto retained = config.lora;
+    ConfigChangedCounter counter;
+    counter.observe(&service->configChanged);
+    auto selected = retained;
+    selected.has_radio_mode = true;
+    selected.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_FLRC;
+    writeRadioModeConfig(selected);
+    TEST_ASSERT_EQUAL_INT(0, counter.count);
+    TEST_ASSERT_FALSE(RadioMode::isFlrc());
+    TEST_ASSERT_TRUE(RadioMode::status(config.lora).restart_pending);
+    TEST_ASSERT_EQUAL_INT(1, warningsContaining("reboot required"));
+
+    auto legacy = config.lora;
+    legacy.has_radio_mode = false;
+    legacy.hop_limit = 5;
+    writeRadioModeConfig(legacy);
+    TEST_ASSERT_TRUE(config.lora.has_radio_mode);
+    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_RadioMode_FLRC, config.lora.radio_mode);
+    auto tuningOverride = config.lora;
+    tuningOverride.tx_power++;
+    assertRadioModeWriteRejected(tuningOverride);
+
+    NodeDB flrcBoot;
+    TEST_ASSERT_TRUE(RadioMode::isFlrc());
+    TEST_ASSERT_EQUAL_UINT32(5, config.lora.hop_limit);
+    TEST_ASSERT_EQUAL(retained.modem_preset, config.lora.modem_preset);
+    TEST_ASSERT_EQUAL_UINT16(retained.bandwidth, config.lora.bandwidth);
+    TEST_ASSERT_EQUAL_UINT32(retained.spread_factor, config.lora.spread_factor);
+    TEST_ASSERT_EQUAL_UINT8(retained.coding_rate, config.lora.coding_rate);
+    TEST_ASSERT_EQUAL_UINT16(retained.channel_num, config.lora.channel_num);
+    TEST_ASSERT_FALSE(RadioMode::canTransmit());
+    RadioMode::markInitialized(true);
+    TEST_ASSERT_EQUAL(meshtastic_RadioModeStatus_BlockedReason_RF_APPROVAL_REQUIRED,
+                      RadioMode::status(config.lora).blocked_reason);
+    TEST_ASSERT_EQUAL_FLOAT(915.0f, RadioMode::status(config.lora).carrier_mhz);
+    selected = config.lora;
+    selected.tx_enabled = false;
+    writeRadioModeConfig(selected, true);
+    assertRadioModeStatusReply(meshtastic_Config_LoRaConfig_RadioMode_FLRC);
+    TEST_ASSERT_EQUAL(meshtastic_RadioModeStatus_BlockedReason_TX_DISABLED, RadioMode::status(config.lora).blocked_reason);
+    TEST_ASSERT_FALSE(RadioMode::canTransmit());
+
+    selected.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_LORA;
+    selected.tx_enabled = true;
+    writeRadioModeConfig(selected);
+    TEST_ASSERT_TRUE(RadioMode::isFlrc());
+    TEST_ASSERT_TRUE(RadioMode::status(config.lora).restart_pending);
+    selected.hop_limit = 6;
+    writeRadioModeConfig(selected);
+    TEST_ASSERT_EQUAL_INT(0, counter.count);
+    selected.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_SHORT_FAST;
+    assertRadioModeWriteRejected(selected);
+    NodeDB loraBoot;
+    TEST_ASSERT_FALSE(RadioMode::isFlrc());
+    TEST_ASSERT_FALSE(RadioMode::status(config.lora).restart_pending);
+    TEST_ASSERT_EQUAL(retained.modem_preset, config.lora.modem_preset);
+    TEST_ASSERT_TRUE(RadioMode::canTransmit());
+}
+
+static void test_radioMode_cancelPendingSwitchPreservesActiveTuning()
+{
+    primeRadioModeTest();
+    auto selected = config.lora;
+    selected.has_radio_mode = true;
+    selected.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_FLRC;
+    writeRadioModeConfig(selected);
+    selected.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_LORA;
+    selected.channel_num++;
+    assertRadioModeWriteRejected(selected);
+    selected.channel_num = config.lora.channel_num;
+    writeRadioModeConfig(selected);
+    TEST_ASSERT_FALSE(RadioMode::status(config.lora).restart_pending);
+    TEST_ASSERT_FALSE(RadioMode::isFlrc());
+}
+#endif
+
 #ifndef USERPREFS_LORACONFIG_MODEM_PRESET
 static void test_presetForRegionSelection_firstUsSelectionDefaultsToLongTurbo()
 {
@@ -2507,6 +2915,10 @@ static void test_presetForRegionSelection_ignoresNodesOnRawModemSettings()
 
 void setUp(void)
 {
+#if defined(ARCH_PORTDUINO) && !defined(_WIN32)
+    radioModePowerSafe = true;
+#endif
+    radioModePrefsTouched = false;
     mockMeshService = new MockMeshService();
     service = mockMeshService;
     testAdmin = new AdminModuleTestShim();
@@ -2516,6 +2928,9 @@ void setUp(void)
 }
 void tearDown(void)
 {
+#if defined(ARCH_PORTDUINO) && !defined(_WIN32)
+    radioModePowerSafe = true;
+#endif
     restoreAdminRadioGlobals();
     service = nullptr;
     delete mockMeshService;
@@ -2532,6 +2947,28 @@ void setup()
     initializeTestEnvironment();
 
     UNITY_BEGIN();
+
+    RUN_TEST(test_radioMode_legacyConfigDefaultsToLoraAndReportsCapability);
+    RUN_TEST(test_radioMode_rejectsUnknownAndUnsupportedSelections);
+    RUN_TEST(test_radioMode_omittedFieldPreservesExplicitLoraSelection);
+    RUN_TEST(test_radioMode_explicitSameModeWriteReturnsApplyStatus);
+    RUN_TEST(test_radioMode_rejectsExplicitSelectionInsideEditTransaction);
+    RUN_TEST(test_radioMode_rejectsInvalidExplicitLoraRegion);
+    RUN_TEST(test_radioMode_transientBeaconSettingsCannotReplacePersistedHomeTuning);
+#if defined(ARCH_PORTDUINO) && !defined(_WIN32)
+    RUN_TEST(test_radioMode_failedSameModeSaveReturnsNakAndRetainsDisk);
+#ifdef MESHNOLOGY_W12
+    RUN_TEST(test_radioMode_failedFlrcSelectionSaveReturnsNakAndRetainsDisk);
+#endif
+#endif
+    RUN_TEST(test_radioMode_invalidBootDisablesTxAndAllowsLocalCorrection);
+#ifdef MESHNOLOGY_W12
+    RUN_TEST(test_radioMode_invalidSavedFlrcRegionAllowsCompleteLoraCorrection);
+    RUN_TEST(test_radioMode_invalidRetainedLoraTuningAllowsCompleteCorrection);
+    RUN_TEST(test_radioMode_invalidRetainedCustomTuningAllowsCompleteCorrection);
+    RUN_TEST(test_radioMode_switchPersistsAndRetainsTuningUntilReboot);
+    RUN_TEST(test_radioMode_cancelPendingSwitchPreservesActiveTuning);
+#endif
 
     // getRegion()
     RUN_TEST(test_handleSetOwner_persistsLicensedChannelSanitation);

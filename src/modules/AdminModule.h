@@ -71,6 +71,7 @@ class AdminModule : public ProtobufModule<meshtastic_AdminMessage>, public Obser
     void handleGetModuleConfigResponse(const meshtastic_MeshPacket &req, meshtastic_AdminMessage *p);
     NOINLINE void handleGetOwner(const meshtastic_MeshPacket &req);
     NOINLINE void handleGetConfig(const meshtastic_MeshPacket &req, uint32_t configType);
+    NOINLINE void handleGetRadioModeStatus(const meshtastic_MeshPacket &req);
     NOINLINE void handleGetModuleConfig(const meshtastic_MeshPacket &req, uint32_t configType);
     NOINLINE void handleGetChannel(const meshtastic_MeshPacket &req, uint32_t channelIndex);
     NOINLINE void handleGetDeviceMetadata(const meshtastic_MeshPacket &req);
@@ -84,7 +85,7 @@ class AdminModule : public ProtobufModule<meshtastic_AdminMessage>, public Obser
     void handleSetChannel(const meshtastic_Channel &cc);
 
   protected:
-    void handleSetConfig(const meshtastic_Config &c, bool fromOthers);
+    bool handleSetConfig(const meshtastic_Config &c, bool fromOthers);
 
 #ifdef PIO_UNIT_TESTING
   protected:

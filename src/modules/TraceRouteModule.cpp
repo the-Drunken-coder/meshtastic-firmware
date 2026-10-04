@@ -143,7 +143,7 @@ void TraceRouteModule::alterReceivedProtobuf(meshtastic_MeshPacket &p, meshtasti
     insertUnknownHops(p, r, !incoming.request_id);
 
     // Append ID and SNR. If the last hop is to us, we only need to append the SNR
-    appendMyIDandSNR(r, p.rx_snr, !incoming.request_id, isToUs(&p));
+    appendMyIDandSNR(r, p.rx_snr, !incoming.request_id, isToUs(&p), !p.rx_snr_unavailable);
     if (!incoming.request_id)
         printRoute(r, p.from, p.to, true);
     else
@@ -402,7 +402,8 @@ void TraceRouteModule::insertUnknownHops(meshtastic_MeshPacket &p, meshtastic_Ro
     }
 }
 
-void TraceRouteModule::appendMyIDandSNR(meshtastic_RouteDiscovery *updated, float snr, bool isTowardsDestination, bool SNRonly)
+void TraceRouteModule::appendMyIDandSNR(meshtastic_RouteDiscovery *updated, float snr, bool isTowardsDestination, bool SNRonly,
+                                        bool snrAvailable)
 {
     pb_size_t *route_count;
     uint32_t *route;
@@ -427,7 +428,7 @@ void TraceRouteModule::appendMyIDandSNR(meshtastic_RouteDiscovery *updated, floa
         // -128 (=-32dB), which is bit-identical to the INT8_MIN "unknown SNR" sentinel used
         // throughout this file. Reserve -128 for the sentinel; clamp real readings to -127.
         int32_t q4 = clamp<int32_t>(lroundf(snr * 4.0f), -127, 127);
-        snr_list[*snr_count] = (int8_t)q4;
+        snr_list[*snr_count] = snrAvailable ? (int8_t)q4 : INT8_MIN;
         *snr_count += 1;
     }
     if (SNRonly)

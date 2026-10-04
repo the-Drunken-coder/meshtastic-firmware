@@ -155,7 +155,7 @@ void MeshService::loop()
 }
 
 /// The radioConfig object just changed, call this to force the hw to change to the new settings
-void MeshService::reloadConfig(int saveWhat)
+bool MeshService::reloadConfig(int saveWhat)
 {
     // Only LoRa config and channels (freq/PSK/slot) affect the radio. Saves that only touch
     // module config, device state, or the node database (e.g. favoriting a node) have no reason
@@ -172,7 +172,7 @@ void MeshService::reloadConfig(int saveWhat)
         // a client rolling through presets just moves this and moves it back.
         nodeDB->refreshCommittedLoraSlot();
     }
-    nodeDB->saveToDisk(saveWhat);
+    return nodeDB->saveToDisk(saveWhat);
 }
 
 /// The owner User record just got updated, update our node DB and broadcast the info into the mesh

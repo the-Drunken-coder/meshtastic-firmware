@@ -59,7 +59,8 @@ class TraceRouteModule : public ProtobufModule<meshtastic_RouteDiscovery>,
     void insertUnknownHops(meshtastic_MeshPacket &p, meshtastic_RouteDiscovery *r, bool isTowardsDestination);
 
     // Call to add your ID to the route array of a RouteDiscovery message
-    void appendMyIDandSNR(meshtastic_RouteDiscovery *r, float snr, bool isTowardsDestination, bool SNRonly);
+    void appendMyIDandSNR(meshtastic_RouteDiscovery *r, float snr, bool isTowardsDestination, bool SNRonly,
+                          bool snrAvailable = true);
 
     // Update next-hops in the routing table based on the returned route
     void updateNextHops(const meshtastic_MeshPacket &p, meshtastic_RouteDiscovery *r);

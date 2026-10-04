@@ -27,9 +27,12 @@
 #define ADC_MULTIPLIER (490.0 / 100.0)   // R50 390K + R51 100K, over R51
 
 // ─── LoRa radio ───────────────────────────────────────────────────────────────
-// RF switching is hardwired to the radio's CTX/CPS pins, and the external PA enables
-// (IO3 sub-GHz, IO4 2.4GHz) are pulled high, so no RF-switch DIO table is needed.
+// Historical schematic and bench use GPIO4 for sub-GHz, GPIO3 for HF, with DIO RF switching.
+// Actual board population and amplified output remain hardware acceptance checks.
 #define USE_LR2021
+#define LR2021_RF_SWITCH_SUBGHZ 4
+#define LR2021_RF_SWITCH_2_4GHZ 3
+#define LR2021_DIO_AS_RF_SWITCH
 #define LORA_SCK 9
 #define LORA_MISO 11
 #define LORA_MOSI 10

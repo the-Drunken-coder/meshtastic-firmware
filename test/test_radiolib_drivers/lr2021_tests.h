@@ -5,6 +5,7 @@
 
 #include "RecordingHal.h"
 #include "TestUtil.h"
+#include "W12FlrcProfile.h"
 #include <modules/LR2021/LR2021_registers.h>
 
 #include <type_traits>
@@ -143,6 +144,42 @@ static void test_lr2021_other_setters_and_modes_succeed()
 //   getRSSI() / getSNR() / getPacketStatus(): decoding of known reply bytes
 //   scanChannel(): the CAD parameters sent (LR2021 has two CAD commands)
 
+// Runs the production boot/recovery profile against the pinned driver. SPI replies model
+// the part's version and FLRC packet type, while commands and durations remain real driver code.
+static void test_lr2021_fixed_flrc_profile_restored_after_state_loss()
+{
+    RecordingHal &hal = freshHal();
+    hal.reply(op16(RADIOLIB_LR2021_CMD_GET_VERSION), 0x04, {0x04, 0x04, 0x01, 0x18}, true);
+    hal.reply(op16(RADIOLIB_LR2021_CMD_GET_PACKET_TYPE), 0x04, {0x04, 0x04, RADIOLIB_LR2021_PACKET_TYPE_FLRC}, true);
+    Module mod(&hal, 1, RADIOLIB_NC, RADIOLIB_NC, 2);
+    LR2021 radio(&mod);
+    radio.irqDioNum = 8;
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_NONE, W12FlrcProfile::begin(radio));
+    TEST_ASSERT_EQUAL_UINT32(276, radio.getTimeOnAir(12));
+    TEST_ASSERT_EQUAL_UINT32(1466, radio.getTimeOnAir(128));
+    TEST_ASSERT_EQUAL_UINT32(2769, radio.getTimeOnAir(255));
+
+    // A prior wrong waveform/CRC must be overwritten by precisely the same recovery entry point.
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_NONE, radio.setCRC(2));
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_NONE, W12FlrcProfile::begin(radio));
+    TEST_ASSERT_EQUAL_UINT32(2769, radio.getTimeOnAir(255));
+    TEST_ASSERT_TRUE(hal.count(op16(RADIOLIB_LR2021_CMD_SET_FLRC_SYNCWORD)) >= 2);
+    TEST_ASSERT_EQUAL_UINT32(0, hal.count(op16(RADIOLIB_LR2021_CMD_SET_LORA_MODULATION_PARAMS)));
+}
+
+static void test_lr2021_flrc_errors_rejected_even_with_rx_done()
+{
+    TEST_ASSERT_TRUE(W12FlrcProfile::acceptsIrq(RADIOLIB_LR2021_IRQ_RX_DONE));
+    const uint32_t errors[] = {
+        RADIOLIB_LR2021_IRQ_CRC_ERROR, RADIOLIB_LR2021_IRQ_LEN_ERROR, RADIOLIB_LR2021_IRQ_LORA_HDR_CRC_ERROR,
+        RADIOLIB_LR2021_IRQ_TIMEOUT,   RADIOLIB_LR2021_IRQ_ERROR,     RADIOLIB_LR2021_IRQ_CMD_ERROR};
+    for (auto error : errors) {
+        TEST_ASSERT_FALSE(W12FlrcProfile::acceptsIrq(error));
+        TEST_ASSERT_FALSE(W12FlrcProfile::acceptsIrq(error | RADIOLIB_LR2021_IRQ_RX_DONE));
+    }
+    TEST_ASSERT_FALSE(W12FlrcProfile::acceptsIrq(RADIOLIB_LR2021_IRQ_PREAMBLE_DETECTED));
+}
+
 static void runLr2021Tests()
 {
     if constexpr (HasDcdcWorkaround<LR2021>::value) {
@@ -150,6 +187,8 @@ static void runLr2021Tests()
         RUN_TEST(test_lr2021_dcdc_adc_ctrl_read_asks_for_one_word);
         RUN_TEST(test_lr2021_dcdc_freq_lf_write_sends_one_word);
     }
+    RUN_TEST(test_lr2021_fixed_flrc_profile_restored_after_state_loss);
+    RUN_TEST(test_lr2021_flrc_errors_rejected_even_with_rx_done);
     RUN_TEST(test_lr2021_setFrequency_sends_hertz);
     RUN_TEST(test_lr2021_lora_modulation_setters_send_modulation_params);
     RUN_TEST(test_lr2021_coding_rate_long_interleaves_except_4_7);

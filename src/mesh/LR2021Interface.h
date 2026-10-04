@@ -11,5 +11,28 @@ class LR2021Interface : public LR20x0Interface<LR2021>
     LR2021Interface(LockingArduinoHal *hal, RADIOLIB_PIN_TYPE cs, RADIOLIB_PIN_TYPE irq, RADIOLIB_PIN_TYPE rst,
                     RADIOLIB_PIN_TYPE busy);
     bool wideLora() override;
+    bool init() override;
+    bool reconfigure() override;
+    bool sleep() override;
+
+  protected:
+    void startReceive() override;
+    void setStandby() override;
+    bool isChannelActive() override;
+    bool isActivelyReceiving() override;
+    int16_t getCurrentRSSI() override;
+    void addReceiveMetadata(meshtastic_MeshPacket *mp) override;
+    uint32_t getPacketTime(uint32_t length, bool received) override;
+    bool recoverChipStateLoss() override;
+    bool receiveIrqPending() override;
+    bool validReceiveIrq() override;
+    bool validTransmitIrq() override;
+    bool armTransmitBeforeStart() override;
+    void onTransmitStarted() override;
+    void handleSoftwareLoraIrqPoll() override;
+
+  private:
+    bool beginFlrc();
+    int16_t standbyFlrc();
 };
 #endif

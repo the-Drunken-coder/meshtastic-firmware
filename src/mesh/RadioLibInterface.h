@@ -65,6 +65,9 @@ class STM32WLx_ModuleWrapper : public STM32WLx_Module
 
 class RadioLibInterface : public RadioInterface, protected concurrency::NotifiedWorkerThread
 {
+#ifdef PIO_UNIT_TESTING
+    friend class TestableW12Adapter;
+#endif
     MeshPacketQueue txQueue = MeshPacketQueue(MAX_TX_QUEUE);
 
   protected:
@@ -239,7 +242,7 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
      */
     virtual void startReceive();
 
-    /** can we detect a LoRa preamble on the current channel? */
+    /** Is the channel busy? Scans that stop RX must clear isReceiving; passive observations retain it. */
     virtual bool isChannelActive() = 0;
 
     /** are we actively receiving a packet (only called during receiving state)
@@ -326,7 +329,7 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
   protected:
     uint32_t activeReceiveStart = 0;
 
-    bool receiveDetected(uint16_t irq, unsigned long syncWordHeaderValidFlag, unsigned long preambleDetectedFlag);
+    bool receiveDetected(uint32_t irq, unsigned long syncWordHeaderValidFlag, unsigned long preambleDetectedFlag);
 
     /** Do any hardware setup needed on entry into send configuration for the radio.
      * Subclasses can customize, but must also call this base method */
@@ -342,12 +345,18 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
 
     /**
      * If a send was in progress finish it and return the buffer to the pool */
-    void completeSending();
+    void completeSending(bool success = true);
 
     /**
      * Add SNR data to received messages
      */
     virtual void addReceiveMetadata(meshtastic_MeshPacket *mp) = 0;
+
+    virtual bool receiveIrqPending() { return iface->checkIrq(RADIOLIB_IRQ_RX_DONE); }
+    virtual bool validReceiveIrq() { return true; }
+    virtual bool validTransmitIrq() { return true; }
+    virtual bool armTransmitBeforeStart() { return false; }
+    virtual void onTransmitStarted() {}
 
     /** Chip specific arm/disarm of the radio IRQ; call enableInterrupt()/disableInterrupt() instead */
     virtual void setRadioIsr(void (*callback)()) = 0;

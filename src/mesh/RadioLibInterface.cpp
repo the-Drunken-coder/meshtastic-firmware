@@ -2,6 +2,7 @@
 #include "MeshTypes.h"
 #include "NodeDB.h"
 #include "PowerMon.h"
+#include "RadioMode.h"
 #include "RadioTxHook.h"
 #include "SPILock.h"
 #include "Throttle.h"
@@ -119,7 +120,7 @@ bool RadioLibInterface::canSendImmediately()
         return true;
 }
 
-bool RadioLibInterface::receiveDetected(uint16_t irq, unsigned long syncWordHeaderValidFlag, unsigned long preambleDetectedFlag)
+bool RadioLibInterface::receiveDetected(uint32_t irq, unsigned long syncWordHeaderValidFlag, unsigned long preambleDetectedFlag)
 {
     bool detected = (irq & (syncWordHeaderValidFlag | preambleDetectedFlag));
     // Handle false detections
@@ -151,26 +152,15 @@ bool RadioLibInterface::receiveDetected(uint16_t irq, unsigned long syncWordHead
 /// bluetooth comms code.  If the txmit queue is empty it might return an error
 ErrorCode RadioLibInterface::send(meshtastic_MeshPacket *p)
 {
-
-#ifndef DISABLE_WELCOME_UNSET
-
-    if (config.lora.region != meshtastic_Config_LoRaConfig_RegionCode_UNSET) {
-        if (disabled || !config.lora.tx_enabled) {
-            LOG_WARN("send - !config.lora.tx_enabled");
-            packetPool.release(p);
-            return ERRNO_DISABLED;
-        }
-
-    } else {
-        LOG_WARN("send - lora tx disabled: Region unset");
+    if (disabled || !RadioMode::canTransmit()) {
+        LOG_WARN("Radio TX disabled: invalid, inactive, or RF-gated profile");
         packetPool.release(p);
         return ERRNO_DISABLED;
     }
-
-#else
-
-    if (disabled || !config.lora.tx_enabled) {
-        LOG_WARN("send - !config.lora.tx_enabled");
+#ifndef DISABLE_WELCOME_UNSET
+    if ((RadioMode::isFlrc() ? RadioMode::activeConfig().region : config.lora.region) ==
+        meshtastic_Config_LoRaConfig_RegionCode_UNSET) {
+        LOG_WARN("send - lora tx disabled: Region unset");
         packetPool.release(p);
         return ERRNO_DISABLED;
     }
@@ -450,9 +440,10 @@ void RadioLibInterface::onNotify(uint32_t notification)
                 } else if (action == RadioTxHook::PRETX_DEFER) {
                     setTransmitDelay(); // the radio config moved, so re-run the delay and scan on it
                 } else {
-                    if (isChannelActive()) { // check if there is currently a LoRa packet on the channel
-                        if (!RadioTxHooks::holdsRadio(txp)) {
-                            startReceive(); // try receiving this packet, afterwards we'll be trying to transmit again
+                    if (isChannelActive()) {
+                        // Passive observations leave RX armed; restarting would discard the packet just detected.
+                        if (!isReceiving && !RadioTxHooks::holdsRadio(txp)) {
+                            startReceive();
                         }
                         setTransmitDelay();
                     } else {
@@ -572,11 +563,11 @@ void RadioLibInterface::handleTransmitInterrupt()
     // This can be null if we forced the device to enter standby mode.  In that case
     // ignore the transmit interrupt
     if (sendingPacket)
-        completeSending();
+        completeSending(validTransmitIrq());
     powerMon->clearState(meshtastic_PowerMon_State_Lora_TXOn); // But our transmitter is definitely off now
 }
 
-void RadioLibInterface::completeSending()
+void RadioLibInterface::completeSending(bool success)
 {
     // We are careful to clear sending packet before calling printPacket because
     // that can take a long time
@@ -591,10 +582,15 @@ void RadioLibInterface::completeSending()
         uint32_t xmitMsec = getPacketTime(p);
         airTime->logAirtime(TX_LOG, xmitMsec);
 
-        txGood++;
-        if (!isFromUs(p))
-            txRelay++;
-        printPacket("Completed sending", p);
+        if (success) {
+            txGood++;
+            if (!isFromUs(p))
+                txRelay++;
+        } else {
+            txDrop++;
+            RECORD_CRITICALERROR(meshtastic_CriticalErrorCode_TRANSMIT_FAILED);
+        }
+        printPacket(success ? "Completed sending" : "Failed sending", p);
         // Keep this inside `if (p)`: completeSending() also runs on every setStandby(), where a hook
         // undoing its own pre-TX switch would recurse back through reconfigure().
         RadioTxHooks::packetReleased(this, p);
@@ -614,12 +610,16 @@ void RadioLibInterface::handleReceiveInterrupt()
     }
 
     isReceiving = false;
+    if (!validReceiveIrq()) {
+        rxBad++;
+        return;
+    }
 
     // read the number of actually received bytes
     size_t length = iface->getPacketLength();
 
     // Some drivers report this as a 16 bit value, so a bad readback can overrun radioBuffer in readData()
-    if (length > sizeof(radioBuffer)) {
+    if (length == 0 || length > MAX_LORA_PAYLOAD_LEN || length > sizeof(radioBuffer)) {
         LOG_ERROR("Ignore rx packet, bad length %u", (unsigned int)length);
         rxBad++;
         return;
@@ -628,7 +628,8 @@ void RadioLibInterface::handleReceiveInterrupt()
     uint32_t rxMsec = getPacketTime(length, true);
 
 #ifndef DISABLE_WELCOME_UNSET
-    if (config.lora.region == meshtastic_Config_LoRaConfig_RegionCode_UNSET) {
+    if ((RadioMode::isFlrc() ? RadioMode::activeConfig().region : config.lora.region) ==
+        meshtastic_Config_LoRaConfig_RegionCode_UNSET) {
         LOG_WARN("lora rx disabled: Region unset");
         airTime->logAirtime(RX_ALL_LOG, rxMsec);
         return;
@@ -783,7 +784,7 @@ bool RadioLibInterface::maybeRecoverChipStateLoss()
 
 void RadioLibInterface::checkRxDoneIrqFlag()
 {
-    if (iface->checkIrq(RADIOLIB_IRQ_RX_DONE)) {
+    if (receiveIrqPending()) {
         LOG_WARN("caught missed RX_DONE");
         notify(ISR_RX, true);
     }
@@ -814,33 +815,47 @@ bool RadioLibInterface::startSend(meshtastic_MeshPacket *txp)
 {
     /* NOTE: Minimize the actions before startTransmit() to keep the time between
              channel scan and actual transmit as low as possible to avoid collisions. */
-    if (disabled || !config.lora.tx_enabled) {
-        LOG_WARN("Drop Tx packet: LoRa Tx disabled");
+    if (disabled || !RadioMode::canTransmit()) {
+        LOG_WARN("Drop Tx packet: radio Tx disabled");
         // Never reaches completeSending(), so any per-packet radio state has to be released here.
         RadioTxHooks::packetReleased(this, txp);
         packetPool.release(txp);
+        startReceive();
         return false;
     } else {
         configHardwareForSend(); // must be after setStandby
 
         size_t numbytes = beginSending(txp);
 
-        int res = iface->startTransmit((uint8_t *)&radioBuffer, numbytes);
+        const bool fastIrq = armTransmitBeforeStart();
+        int res = RADIOLIB_ERR_NONE;
+        if (fastIrq) {
+            // A complete FLRC frame can finish before startTransmit() returns.
+            res = iface->clearIrqFlags(UINT32_MAX);
+            if (res == RADIOLIB_ERR_NONE)
+                enableInterrupt(isrTxLevel0);
+        }
+        // unset-sentinel-ok: sendingPacket is the armed flag, so 0 is a legal stamp.
+        lastTxStart = Time::getMillis();
+        if (res == RADIOLIB_ERR_NONE)
+            res = iface->startTransmit((uint8_t *)&radioBuffer, numbytes);
         if (res != RADIOLIB_ERR_NONE) {
             LOG_ERROR("startTransmit failed, error=%d", res);
             RECORD_CRITICALERROR(meshtastic_CriticalErrorCode_RADIO_SPI_BUG);
 
             // This send failed, but make sure to 'complete' it properly
-            completeSending();
+            disableInterrupt();
+            completeSending(false);
             powerMon->clearState(meshtastic_PowerMon_State_Lora_TXOn); // Transmitter off now
             startReceive(); // Restart receive mode (because startTransmit failed to put us in xmit mode)
         } else {
             // Must be done AFTER, starting transmit, because startTransmit clears (possibly stale) interrupt pending register
             // bits
-            enableInterrupt(isrTxLevel0);
-            // unset-sentinel-ok: busyTx/sendingPacket is the armed flag, so 0 is a legal stamp
-            lastTxStart = Time::getMillis();
+            if (!fastIrq)
+                enableInterrupt(isrTxLevel0);
             printPacket("Started Tx", txp);
+            onTransmitStarted();
+            checkTxDoneIrqFlag();
 #ifdef LED_LORA
             digitalWrite(LED_LORA, LED_STATE_ON);
 #endif

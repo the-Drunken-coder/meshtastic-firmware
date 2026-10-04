@@ -2,6 +2,7 @@
 #include "Default.h"
 #include "MeshService.h"
 #include "NodeDB.h"
+#include "RadioMode.h"
 #include "UptimeClock.h"
 #include "gps/RTC.h"
 #include <Throttle.h>
@@ -61,6 +62,9 @@ entries and max time Assumes that the neighborInfo packet has been allocated
 */
 uint32_t NeighborInfoModule::collectNeighborInfo(meshtastic_NeighborInfo *neighborInfo)
 {
+    // The legacy neighbor payload has no representation for unavailable FLRC SNR.
+    if (RadioMode::isFlrc())
+        return 0;
     NodeNum my_node_id = nodeDB->getNodeNum();
     neighborInfo->node_id = my_node_id;
     neighborInfo->last_sent_by_id = my_node_id;
@@ -139,6 +143,10 @@ int32_t NeighborInfoModule::runOnce()
 
 meshtastic_MeshPacket *NeighborInfoModule::allocReply()
 {
+    if (RadioMode::isFlrc()) {
+        ignoreRequest = true;
+        return nullptr;
+    }
     LOG_INFO("NeighborInfoRequested");
     if (lastSentReply && Throttle::isWithinTimespanMs(lastSentReply, 3 * 60 * 1000)) {
         LOG_DEBUG("Skip Neighbors reply since we sent a reply <3min ago");
@@ -163,6 +171,8 @@ Pass it to an upper client; do not persist this data on the mesh
 */
 bool NeighborInfoModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshtastic_NeighborInfo *np)
 {
+    if (mp.rx_snr_unavailable || RadioMode::isFlrc())
+        return false;
     LOG_TRACE("NeighborInfo: handleReceivedProtobuf");
     if (np) {
         printNeighborInfo("RECEIVED", np);

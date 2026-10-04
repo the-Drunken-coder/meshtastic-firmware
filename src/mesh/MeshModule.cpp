@@ -85,6 +85,7 @@ meshtastic_MeshPacket *MeshModule::allocAckNak(meshtastic_Routing_Error err, Nod
         p->has_rx_rssi = relaySource->has_rx_rssi;
         p->rx_rssi = relaySource->rx_rssi;
         p->rx_snr = relaySource->rx_snr;
+        p->rx_snr_unavailable = relaySource->rx_snr_unavailable;
     }
 #if !(MESHTASTIC_EXCLUDE_PKI)
     // Prove to the original sender that this ack came from the node holding their pairwise key.

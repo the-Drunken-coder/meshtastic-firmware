@@ -52,6 +52,21 @@ class TraceRouteModuleTestShim : public TraceRouteModule
     using TraceRouteModule::alterReceivedProtobuf;
 };
 
+static void test_flrc_unknownSnrRetainsTracerouteHop(void)
+{
+    meshtastic_RouteDiscovery route = meshtastic_RouteDiscovery_init_zero;
+    meshtastic_MeshPacket packet = meshtastic_MeshPacket_init_zero;
+    packet.from = NODE_D;
+    packet.to = LOCAL_NODE;
+    packet.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    packet.decoded.portnum = meshtastic_PortNum_TRACEROUTE_APP;
+    packet.rx_snr_unavailable = true;
+    TraceRouteModuleTestShim module;
+    module.alterReceivedProtobuf(packet, &route);
+    TEST_ASSERT_EQUAL_UINT32(1, route.snr_towards_count);
+    TEST_ASSERT_EQUAL_INT8(INT8_MIN, route.snr_towards[0]);
+}
+
 static MockNodeDB *mockNodeDB = nullptr;
 static TraceRouteModuleTestShim *shim = nullptr;
 
@@ -153,6 +168,7 @@ void setup()
 
     initializeTestEnvironment();
     UNITY_BEGIN();
+    RUN_TEST(test_flrc_unknownSnrRetainsTracerouteHop);
     RUN_TEST(test_nexthop_learned_when_route_matches_relay);
     RUN_TEST(test_nexthop_ignored_when_route_contradicts_relay);
     RUN_TEST(test_nexthop_ignored_without_a_relay);

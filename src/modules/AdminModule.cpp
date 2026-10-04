@@ -34,6 +34,7 @@
 #include "MeshRadio.h"
 #include "MessageStore.h"
 #include "RadioInterface.h"
+#include "RadioMode.h"
 #include "TypeConversions.h"
 #include "mesh/RadioLibInterface.h"
 #ifdef MESHTASTIC_PHONEAPI_ACCESS_CONTROL
@@ -272,6 +273,10 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
         handleGetConfig(mp, r->get_config_request);
         break;
 
+    case meshtastic_AdminMessage_get_radio_mode_status_request_tag:
+        handleGetRadioModeStatus(mp);
+        break;
+
     case meshtastic_AdminMessage_get_module_config_request_tag:
         LOG_DEBUG("Client got module config");
         handleGetModuleConfig(mp, r->get_module_config_request);
@@ -327,10 +332,20 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
             break;
         }
 
+        meshtastic_Config_LoRaConfig merged;
+        if (!RadioMode::validateUpdate(r->set_config.payload_variant.lora, config.lora, merged)) {
+            sendWarning("Radio mode update rejected: unsupported mode, board, region, or fixed FLRC tuning");
+            myReply = allocErrorResponse(meshtastic_Routing_Error_BAD_REQUEST, &mp);
+            break;
+        }
+
         // Only LORA_24 requires hardware capability validation.
         if (r->set_config.payload_variant.lora.region != meshtastic_Config_LoRaConfig_RegionCode_LORA_24) {
             LOG_DEBUG("LoRa config, region is not LORA_24, applying directly");
-            handleSetConfig(r->set_config, fromOthers);
+            if (!handleSetConfig(r->set_config, fromOthers))
+                myReply = allocErrorResponse(meshtastic_Routing_Error_BAD_REQUEST, &mp);
+            else if (r->set_config.payload_variant.lora.has_radio_mode)
+                handleGetRadioModeStatus(mp);
             break;
         }
 
@@ -338,7 +353,10 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
         // Fail closed: null instance is treated as incapable.
         if (RadioLibInterface::instance && RadioLibInterface::instance->wideLora()) {
             LOG_DEBUG("LORA_24 requested, radio hardware supports 2.4 GHz, applying");
-            handleSetConfig(r->set_config, fromOthers);
+            if (!handleSetConfig(r->set_config, fromOthers))
+                myReply = allocErrorResponse(meshtastic_Routing_Error_BAD_REQUEST, &mp);
+            else if (r->set_config.payload_variant.lora.has_radio_mode)
+                handleGetRadioModeStatus(mp);
             break;
         }
 
@@ -877,8 +895,26 @@ static bool isBareKeypairRotation(const meshtastic_Config_SecurityConfig &incomi
                meshtastic_Config_SecurityConfig_PacketSignaturePolicy_PACKET_SIGNATURE_POLICY_COMPATIBLE;
 }
 
-void AdminModule::handleSetConfig(const meshtastic_Config &c, bool fromOthers)
+bool AdminModule::handleSetConfig(const meshtastic_Config &c, bool fromOthers)
 {
+    const bool modeWrite = c.which_payload_variant == meshtastic_Config_lora_tag && c.payload_variant.lora.has_radio_mode;
+    const auto priorLora = config.lora;
+    const bool hadLora = config.has_lora;
+    if (modeWrite && nodeDB->isLoraSlotTransient()) {
+        sendWarning(
+            "Radio mode cannot be saved during a temporary beacon radio switch; retry after the home profile is restored");
+        return false;
+    }
+    if (modeWrite && hasOpenEditTransaction) {
+        sendWarning("Radio mode requires a verified disk save; commit the open edit transaction first");
+        return false;
+    }
+    if (modeWrite && RadioMode::configuredMode(c.payload_variant.lora) == meshtastic_Config_LoRaConfig_RadioMode_LORA &&
+        (!RadioInterface::checkConfigRegion(c.payload_variant.lora) ||
+         !RadioInterface::validateConfigLora(c.payload_variant.lora))) {
+        sendWarning("Explicit radio configuration rejected: invalid LoRa region or tuning");
+        return false;
+    }
     auto changes = SEGMENT_CONFIG;
     auto existingRole = config.device.role;
     bool isRegionUnset = (config.lora.region == meshtastic_Config_LoRaConfig_RegionCode_UNSET);
@@ -1005,7 +1041,31 @@ void AdminModule::handleSetConfig(const meshtastic_Config &c, bool fromOthers)
     case meshtastic_Config_lora_tag: {
         // Wrap the entire case in a block to scope variables and avoid crossing initialization
         auto oldLoraConfig = config.lora;
-        auto validatedLora = c.payload_variant.lora;
+        meshtastic_Config_LoRaConfig validatedLora;
+        if (!RadioMode::validateUpdate(c.payload_variant.lora, config.lora, validatedLora)) {
+            sendWarning("Radio mode update rejected: unsupported mode, board, region, or fixed FLRC tuning");
+            return false;
+        }
+
+        if (RadioMode::configuredMode(validatedLora) != RadioMode::configuredMode(oldLoraConfig) ||
+            RadioMode::configuredMode(validatedLora) == meshtastic_Config_LoRaConfig_RadioMode_FLRC || RadioMode::isFlrc()) {
+            // Retained LoRa fields are not active FLRC tuning. Save without a live radio reconfigure.
+            config.has_lora = true;
+            config.lora = validatedLora;
+            if (hasOpenEditTransaction) {
+                editTransactionActivityMs = millis();
+                deferredEditSegments |= SEGMENT_CONFIG;
+            } else if (!nodeDB->saveToDisk(SEGMENT_CONFIG)) {
+                config.lora = priorLora;
+                config.has_lora = hadLora;
+                sendWarning("Radio configuration could not be saved; previous settings retained");
+                return false;
+            }
+            if (RadioMode::status(config.lora).restart_pending)
+                sendWarning(hasOpenEditTransaction ? "Radio mode staged; commit and reboot required to apply it"
+                                                   : "Radio mode saved; reboot required to apply it");
+            return true;
+        }
 
         LOG_INFO("Set config: LoRa");
         config.has_lora = true;
@@ -1244,12 +1304,25 @@ void AdminModule::handleSetConfig(const meshtastic_Config &c, bool fromOthers)
         disableBluetooth();
     } // end of switch case which_payload_variant
 
-    saveChanges(changes, requiresReboot);
+    if (modeWrite) {
+        if (!service->reloadConfig(changes)) {
+            config.lora = priorLora;
+            config.has_lora = hadLora;
+            initRegion();
+            service->configChanged.notifyObservers(NULL);
+            nodeDB->refreshCommittedLoraSlot();
+            sendWarning("Radio configuration could not be saved; previous settings retained");
+            return false;
+        }
+    } else {
+        saveChanges(changes, requiresReboot);
+    }
     if (loraPresetWarnPending)
         warnOnLoraPresetChange(pendingOldLora, pendingNewLora);
     // Inside an edit transaction the queued warnings are flushed once at commit; otherwise emit now.
     if (!hasOpenEditTransaction)
         flushChannelWarnings();
+    return true;
 } // end of handleSetConfig
 
 bool AdminModule::handleSetModuleConfig(const meshtastic_ModuleConfig &c)
@@ -1903,6 +1976,19 @@ void AdminModule::expireStaleEditTransaction()
     flushChannelWarnings();
 }
 
+void AdminModule::handleGetRadioModeStatus(const meshtastic_MeshPacket &req)
+{
+    if (!req.decoded.want_response)
+        return;
+    meshtastic_AdminMessage response = meshtastic_AdminMessage_init_zero;
+    response.which_payload_variant = meshtastic_AdminMessage_get_radio_mode_status_response_tag;
+    response.get_radio_mode_status_response = RadioMode::status(config.lora);
+    setPassKey(&response);
+    myReply = allocDataProtobuf(response);
+    if (myReply && req.pki_encrypted)
+        myReply->pki_encrypted = true;
+}
+
 void AdminModule::saveChanges(int saveWhat, bool shouldReboot)
 {
 #ifdef PIO_UNIT_TESTING
@@ -2043,6 +2129,7 @@ bool AdminModule::messageIsResponse(const meshtastic_AdminMessage *r)
     if (r->which_payload_variant == meshtastic_AdminMessage_get_channel_response_tag ||
         r->which_payload_variant == meshtastic_AdminMessage_get_owner_response_tag ||
         r->which_payload_variant == meshtastic_AdminMessage_get_config_response_tag ||
+        r->which_payload_variant == meshtastic_AdminMessage_get_radio_mode_status_response_tag ||
         r->which_payload_variant == meshtastic_AdminMessage_get_module_config_response_tag ||
         r->which_payload_variant == meshtastic_AdminMessage_get_canned_message_module_messages_response_tag ||
         r->which_payload_variant == meshtastic_AdminMessage_get_device_metadata_response_tag ||
@@ -2065,6 +2152,8 @@ static pb_size_t adminResponseForRequest(pb_size_t requestVariant)
         return meshtastic_AdminMessage_get_owner_response_tag;
     case meshtastic_AdminMessage_get_config_request_tag:
         return meshtastic_AdminMessage_get_config_response_tag;
+    case meshtastic_AdminMessage_get_radio_mode_status_request_tag:
+        return meshtastic_AdminMessage_get_radio_mode_status_response_tag;
     case meshtastic_AdminMessage_get_module_config_request_tag:
         return meshtastic_AdminMessage_get_module_config_response_tag;
     case meshtastic_AdminMessage_get_canned_message_module_messages_request_tag:
@@ -2095,7 +2184,11 @@ void AdminModule::noteOutgoingAdminRequest(const meshtastic_MeshPacket &p)
     meshtastic_AdminMessage admin = meshtastic_AdminMessage_init_zero;
     if (!pb_decode_from_bytes(p.decoded.payload.bytes, p.decoded.payload.size, &meshtastic_AdminMessage_msg, &admin))
         return;
-    const pb_size_t responseVariant = adminResponseForRequest(admin.which_payload_variant);
+    const bool modeWrite = admin.which_payload_variant == meshtastic_AdminMessage_set_config_tag &&
+                           admin.set_config.which_payload_variant == meshtastic_Config_lora_tag &&
+                           admin.set_config.payload_variant.lora.has_radio_mode;
+    const pb_size_t responseVariant = modeWrite ? meshtastic_AdminMessage_get_radio_mode_status_response_tag
+                                                : adminResponseForRequest(admin.which_payload_variant);
     if (!responseVariant)
         return; // not a getter whose response we can pair
 
@@ -2175,6 +2268,7 @@ bool AdminModule::messageIsRequest(const meshtastic_AdminMessage *r)
     if (r->which_payload_variant == meshtastic_AdminMessage_get_channel_request_tag ||
         r->which_payload_variant == meshtastic_AdminMessage_get_owner_request_tag ||
         r->which_payload_variant == meshtastic_AdminMessage_get_config_request_tag ||
+        r->which_payload_variant == meshtastic_AdminMessage_get_radio_mode_status_request_tag ||
         r->which_payload_variant == meshtastic_AdminMessage_get_module_config_request_tag ||
         r->which_payload_variant == meshtastic_AdminMessage_get_canned_message_module_messages_request_tag ||
         r->which_payload_variant == meshtastic_AdminMessage_get_device_metadata_request_tag ||

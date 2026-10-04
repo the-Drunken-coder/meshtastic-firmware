@@ -10,11 +10,13 @@
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "RF95Interface.h"
+#include "RadioMode.h"
 #include "Router.h"
 #include "SX1262Interface.h"
 #include "SX1268Interface.h"
 #include "SX1280Interface.h"
 #include "UptimeClock.h"
+#include "W12FlrcProfile.h"
 #include "configuration.h"
 #include "detect/LoRaRadioType.h"
 #include "main.h"
@@ -801,12 +803,14 @@ uint32_t RadioInterface::getPacketTime(const meshtastic_MeshPacket *p, bool rece
         size_t numbytes = pb_encode_to_bytes(bytes, sizeof(bytes), &meshtastic_Data_msg, &p->decoded);
         pl = numbytes + sizeof(PacketHeader);
     }
-    return getPacketTime(pl, received);
+    return RadioMode::isFlrc() ? W12FlrcProfile::durationMs(pl) : getPacketTime(pl, received);
 }
 
 /** The delay to use for retransmitting dropped packets */
 uint32_t RadioInterface::getRetransmissionMsec(const meshtastic_MeshPacket *p)
 {
+    if (RadioMode::isFlrc())
+        return PROCESSING_TIME_MSEC + 2 * getPacketTime(p) + 40 + getTxDelayMsec();
     size_t numbytes = p->which_payload_variant == meshtastic_MeshPacket_decoded_tag
                           ? pb_encode_to_bytes(bytes, sizeof(bytes), &meshtastic_Data_msg, &p->decoded)
                           : p->encrypted.size + MESHTASTIC_HEADER_LENGTH;
@@ -823,6 +827,8 @@ uint32_t RadioInterface::getRetransmissionMsec(const meshtastic_MeshPacket *p)
 /** The delay to use when we want to send something */
 uint32_t RadioInterface::getTxDelayMsec()
 {
+    if (RadioMode::isFlrc())
+        return W12FlrcProfile::TURNAROUND_MS + random(0, pow_of_2(CWmin)) * W12FlrcProfile::SLOT_MS;
     /** We wait a random multiple of 'slotTimes' (see definition in header file) in order to avoid collisions.
     The pool to take a random multiple from is the contention window (CW), which size depends on the
     current channel utilization. */
@@ -835,6 +841,8 @@ uint32_t RadioInterface::getTxDelayMsec()
 /** The CW size to use when calculating SNR_based delays */
 uint8_t RadioInterface::getCWsize(float snr)
 {
+    if (RadioMode::isFlrc())
+        return CWmin;
     // The minimum value for a LoRa SNR
     const int32_t SNR_MIN = -20;
 
@@ -847,6 +855,8 @@ uint8_t RadioInterface::getCWsize(float snr)
 /** The worst-case SNR_based packet delay */
 uint32_t RadioInterface::getTxDelayMsecWeightedWorst(float snr)
 {
+    if (RadioMode::isFlrc())
+        return W12FlrcProfile::TURNAROUND_MS + (pow_of_2(CWmin) - 1) * W12FlrcProfile::SLOT_MS;
     uint8_t CWsize = getCWsize(snr);
     // offset the maximum delay for routers: (2 * CWmax * slotTimeMsec)
     return (2 * CWmax * slotTimeMsec) + pow_of_2(CWsize) * slotTimeMsec;
@@ -866,6 +876,8 @@ bool RadioInterface::shouldRebroadcastEarlyLikeRouter(meshtastic_MeshPacket *p)
 /** The delay to use when we want to flood a message */
 uint32_t RadioInterface::getTxDelayMsecWeighted(meshtastic_MeshPacket *p)
 {
+    if (RadioMode::isFlrc())
+        return getTxDelayMsec();
     //  high SNR = large CW size (Long Delay)
     //  low SNR = small CW size (Short Delay)
     float snr = p->rx_snr;
@@ -1290,6 +1302,17 @@ void RadioInterface::clampConfigLora(meshtastic_Config_LoRaConfig &loraConfig)
  */
 void RadioInterface::applyModemConfig()
 {
+    if (RadioMode::isFlrc()) {
+        myRegion = getRegion(RadioMode::activeConfig().region);
+        saveFreq(W12FlrcProfile::FREQUENCY_MHZ);
+        saveChannelNum(0);
+        power = W12FlrcProfile::CHIP_POWER_DBM;
+        preambleLength = W12FlrcProfile::PREAMBLE_BITS;
+        preambleTimeMsec = 1;
+        slotTimeMsec = W12FlrcProfile::SLOT_MS;
+        LOG_INFO("FLRC fixed profile 915MHz, RF acceptance pending");
+        return;
+    }
     // Set up default configuration
     // No Sync Words in LORA mode
     meshtastic_Config_LoRaConfig &loraConfig = config.lora;
@@ -1403,6 +1426,7 @@ void RadioInterface::applyModemConfig()
 
     slotTimeMsec = computeSlotTimeMsec();
     preambleTimeMsec = preambleLength * (pow_of_2(sf) / bw);
+    RadioMode::refreshActiveLoraConfig(loraConfig);
 
     LOG_INFO("Radio freq=%.3f, config.lora.frequency_offset=%.3f", freq, loraConfig.frequency_offset);
     LOG_INFO("Set radio: region=%s, name=%s, config=%u, ch=%d, power=%d", newRegion->name, channelName, loraConfig.modem_preset,
@@ -1427,6 +1451,8 @@ void RadioInterface::applyModemConfig()
   - MAC processing time (measured on T-beam) */
 uint32_t RadioInterface::computeSlotTimeMsec()
 {
+    if (RadioMode::isFlrc())
+        return W12FlrcProfile::SLOT_MS;
     float sumPropagationTurnaroundMACTime = 0.2 + 0.4 + 7; // in milliseconds
     float symbolTime = pow_of_2(sf) / bw;                  // in milliseconds
 

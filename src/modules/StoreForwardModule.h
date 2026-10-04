@@ -24,6 +24,7 @@ struct PacketHistoryStruct {
     int32_t rx_rssi;
     bool has_rx_rssi; // whether rx_rssi was a genuine measurement (e.g. not MQTT-relayed) when captured
     float rx_snr;
+    bool rx_snr_unavailable;
     uint8_t hop_start;
     uint8_t hop_limit;
     bool via_mqtt;

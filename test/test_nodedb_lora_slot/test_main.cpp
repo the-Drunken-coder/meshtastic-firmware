@@ -13,6 +13,8 @@
 #endif
 
 #include "mesh/NodeDB.h"
+#include "mesh/RadioInterface.h"
+#include "mesh/RadioMode.h"
 #include "mesh/TypeConversions.h"
 #include <cstring>
 
@@ -36,6 +38,18 @@ class NodeDBTestShim : public NodeDB
         meshNodes->push_back(n);
         numMeshNodes = meshNodes->size();
     }
+};
+
+// Only configuration is exercised; production reconfigure() applies and clamps the LoRa settings.
+class ConfigurationRadio : public RadioInterface
+{
+  public:
+    ErrorCode send(meshtastic_MeshPacket *packet) override
+    {
+        packetPool.release(packet);
+        return ERRNO_DISABLED;
+    }
+    uint32_t getPacketTime(uint32_t, bool = false) override { return 1; }
 };
 
 namespace
@@ -101,6 +115,7 @@ void setUp(void)
 {
     db->clearHot();
     config.lora = savedLora;
+    RadioMode::initialize(config.lora);
     db->setLoraSlotTransient(false);
     db->refreshCommittedLoraSlot();
 }
@@ -187,6 +202,94 @@ static void test_fingerprint_customModemFieldsCountWhenNotUsingPreset(void)
     TEST_ASSERT_NOT_EQUAL_UINT16(fp(base, "LongFast"), fp(bw, "LongFast"));
     TEST_ASSERT_NOT_EQUAL_UINT16(fp(base, "LongFast"), fp(sf, "LongFast"));
     TEST_ASSERT_NOT_EQUAL_UINT16(fp(base, "LongFast"), fp(cr, "LongFast"));
+}
+
+static void test_flrc_profileIgnoresRetainedLoraTuning(void)
+{
+    auto flrc = baselineLora();
+    flrc.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+    flrc.has_radio_mode = true;
+    flrc.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_FLRC;
+    auto changed = flrc;
+    changed.channel_num = 42;
+    changed.override_frequency = 916.0f;
+    changed.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_SHORT_FAST;
+    TEST_ASSERT_EQUAL_UINT16(fp(flrc, "LongFast"), fp(changed, "MyMesh"));
+    changed.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_LORA;
+    TEST_ASSERT_NOT_EQUAL_UINT16(fp(flrc, "LongFast"), fp(changed, "MyMesh"));
+}
+
+static void test_flrc_savedSelectionDoesNotMoveActiveReachability(void)
+{
+    db->updateFrom(rxPacket(0x4444));
+    const uint16_t activeSlot = db->committedLoraSlot();
+    config.lora.has_radio_mode = true;
+    config.lora.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_FLRC;
+    db->refreshCommittedLoraSlot();
+    TEST_ASSERT_EQUAL_UINT16(activeSlot, db->committedLoraSlot());
+    TEST_ASSERT_TRUE(heard(0x4444));
+
+    RadioMode::initialize(config.lora);
+    db->refreshCommittedLoraSlot();
+    TEST_ASSERT_FALSE(heard(0x4444));
+    db->updateFrom(rxPacket(0x4444));
+    TEST_ASSERT_TRUE(heard(0x4444));
+}
+
+static void test_flrc_receiveDoesNotInventSnr(void)
+{
+    auto packet = rxPacket(0x4444);
+    packet.has_rx_rssi = true;
+    packet.rx_snr = 7.0f;
+    db->updateFrom(packet);
+    TEST_ASSERT_TRUE(nodeInfoLiteHasSnr(db->getMeshNode(packet.from)));
+
+    config.lora.has_radio_mode = true;
+    config.lora.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_FLRC;
+    RadioMode::initialize(config.lora);
+    db->refreshCommittedLoraSlot();
+    packet.rx_snr = 0;
+    packet.rx_snr_unavailable = true;
+    db->updateFrom(packet);
+    const auto *node = db->getMeshNode(packet.from);
+    TEST_ASSERT_FALSE(nodeInfoLiteHasSnr(node));
+    TEST_ASSERT_TRUE(TypeConversions::ConvertToNodeInfo(node, nullptr, nullptr).snr_unavailable);
+}
+
+static void test_flrc_pendingSelectionPreservesLatestAppliedLoraReachability(void)
+{
+    ConfigurationRadio radio;
+    config.lora = baselineLora();
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
+    config.lora.override_frequency = 915.0f;
+    RadioMode::initialize(config.lora);
+    TEST_ASSERT_TRUE(radio.reconfigure());
+    db->refreshCommittedLoraSlot();
+    const uint16_t bootSlot = db->committedLoraSlot();
+    db->updateFrom(rxPacket(0x1111));
+
+    config.lora.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_SHORT_FAST;
+    config.lora.channel_num = 10;
+    config.lora.override_frequency = 916.0f;
+    TEST_ASSERT_TRUE(radio.reconfigure());
+    db->refreshCommittedLoraSlot();
+    const uint16_t latestAppliedSlot = db->committedLoraSlot();
+    TEST_ASSERT_NOT_EQUAL_UINT16(bootSlot, latestAppliedSlot);
+    db->updateFrom(rxPacket(0x2222));
+    TEST_ASSERT_FALSE(heard(0x1111));
+    TEST_ASSERT_TRUE(heard(0x2222));
+
+    config.lora.has_radio_mode = true;
+    config.lora.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_FLRC;
+    db->refreshCommittedLoraSlot();
+    TEST_ASSERT_TRUE(RadioMode::status(config.lora).restart_pending);
+    TEST_ASSERT_FALSE(RadioMode::isFlrc());
+    TEST_ASSERT_EQUAL_UINT16(latestAppliedSlot, db->committedLoraSlot());
+    db->updateFrom(rxPacket(0x3333));
+    TEST_ASSERT_EQUAL_UINT16(latestAppliedSlot, nodeInfoLiteHeardSlot(db->getMeshNode(0x3333)));
+    TEST_ASSERT_TRUE(heard(0x2222));
+    TEST_ASSERT_TRUE(heard(0x3333));
+    TEST_ASSERT_FALSE(heard(0x1111));
 }
 
 // ---------- storing the slot on a hear -------------------------------------------------------
@@ -323,6 +426,10 @@ NDB_TEST_ENTRY void setup()
     RUN_TEST(test_fingerprint_dormantModemFieldsIgnoredWhenUsingPreset);
     RUN_TEST(test_fingerprint_dormantPresetIgnoredWhenNotUsingPreset);
     RUN_TEST(test_fingerprint_customModemFieldsCountWhenNotUsingPreset);
+    RUN_TEST(test_flrc_profileIgnoresRetainedLoraTuning);
+    RUN_TEST(test_flrc_savedSelectionDoesNotMoveActiveReachability);
+    RUN_TEST(test_flrc_receiveDoesNotInventSnr);
+    RUN_TEST(test_flrc_pendingSelectionPreservesLatestAppliedLoraReachability);
     RUN_TEST(test_hear_rfHearMarksNodeOnCurrentSlot);
     RUN_TEST(test_hear_mqttRelayDoesNotMark);
     RUN_TEST(test_hear_mqttTransportDoesNotMark);

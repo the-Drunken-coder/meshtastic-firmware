@@ -14,6 +14,7 @@
 #include "PowerFSM.h"
 #include "PowerMon.h"
 #include "RadioLibInterface.h"
+#include "RadioMode.h"
 #include "ReliableRouter.h"
 #include "TransmitHistory.h"
 #include "UptimeClock.h"
@@ -1177,6 +1178,7 @@ void setup()
 #endif
 
     auto rIf = initLoRa();
+    RadioMode::markInitialized(rIf != nullptr);
 
     lateInitVariant(); // Do board specific init (see extra_variants/README.md for documentation)
 
@@ -1236,9 +1238,9 @@ void setup()
     else {
 #ifndef ARCH_PORTDUINO_WASM
         // Log bit rate to debug output
-        LOG_DEBUG("LoRA bitrate = %f bytes / sec", (float(meshtastic_Constants_DATA_PAYLOAD_LEN) /
-                                                    (float(rIf->getPacketTime(meshtastic_Constants_DATA_PAYLOAD_LEN)))) *
-                                                       1000);
+        LOG_DEBUG("Radio bitrate = %f bytes / sec", (float(meshtastic_Constants_DATA_PAYLOAD_LEN) /
+                                                     (float(rIf->getPacketTime(meshtastic_Constants_DATA_PAYLOAD_LEN)))) *
+                                                        1000);
 #endif
 
         router->addInterface(std::move(rIf));

@@ -21,6 +21,7 @@
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "RadioInterface.h"
+#include "RadioMode.h"
 #include "airtime.h"
 #include "modules/AdminModule.h"
 #include "modules/MeshBeaconModule.h"
@@ -1478,6 +1479,55 @@ static void test_txHook_normalPacket_isSend(void)
     TEST_ASSERT_EQUAL_INT_MESSAGE(0, radio.reconfigureCalls, "normal traffic must not reconfigure the radio");
 }
 
+static void test_pendingFlrc_doesNotPreventCompletedBeaconRestoration(void)
+{
+    resetConfig();
+    ReentrantRadioInterface radio;
+    meshtastic_MeshPacket packet = meshtastic_MeshPacket_init_zero;
+    packet.id = 0x5EED0005;
+    const auto homePreset = config.lora.modem_preset;
+    const auto homeChannel = config.lora.channel_num;
+    MeshBeaconModule::setTargetRadioSettings(&packet, meshtastic_Config_LoRaConfig_ModemPreset_LONG_SLOW, 9, false,
+                                             meshtastic_Config_LoRaConfig_RegionCode_UNSET, false, nullptr);
+    TEST_ASSERT_TRUE(MeshBeaconModule::reconfigureForBeaconTX(&radio, &packet));
+
+    config.lora.has_radio_mode = true;
+    config.lora.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_FLRC;
+    MeshBeaconModule::clearTargetRadioSettings(&packet);
+    TEST_ASSERT_TRUE(MeshBeaconModule::reconfigureForBeaconTX(&radio, nullptr));
+    TEST_ASSERT_EQUAL_INT(homePreset, config.lora.modem_preset);
+    TEST_ASSERT_EQUAL_UINT16(homeChannel, config.lora.channel_num);
+    TEST_ASSERT_TRUE(RadioMode::status(config.lora).restart_pending);
+    TEST_ASSERT_FALSE(RadioMode::isFlrc());
+}
+
+static void test_flrc_beaconCannotSwitchOrQueueTransmit(void)
+{
+    resetConfig();
+    config.lora.has_radio_mode = true;
+    config.lora.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_FLRC;
+    RadioMode::initialize(config.lora);
+    const auto retainedPreset = config.lora.modem_preset;
+    moduleConfig.mesh_beacon.flags |= MESH_BEACON_FLAG_BROADCAST_ENABLED;
+    strcpy(moduleConfig.mesh_beacon.broadcast_message, "test");
+    MeshBeaconBroadcastModuleTestShim broadcaster;
+    broadcaster.sendBeacon();
+    TEST_ASSERT_TRUE(mockRouter->sentPackets.empty());
+
+    MeshBeaconTxHook hook;
+    ReentrantRadioInterface radio;
+    meshtastic_MeshPacket packet = meshtastic_MeshPacket_init_zero;
+    packet.id = 0x7A000010;
+    MeshBeaconModule::setTargetRadioSettings(&packet, meshtastic_Config_LoRaConfig_ModemPreset_LONG_SLOW, 0, false,
+                                             meshtastic_Config_LoRaConfig_RegionCode_UNSET, false, nullptr);
+    TEST_ASSERT_EQUAL_INT(RadioTxHook::PRETX_DROP, RadioTxHooks::beforeTransmit(&radio, &packet));
+    TEST_ASSERT_EQUAL_INT(0, radio.reconfigureCalls);
+    TEST_ASSERT_EQUAL_INT(retainedPreset, config.lora.modem_preset);
+    RadioTxHooks::packetReleased(&radio, &packet);
+    config.lora.radio_mode = meshtastic_Config_LoRaConfig_RadioMode_LORA;
+    RadioMode::initialize(config.lora);
+}
+
 /**
  * A beacon asks the driver for a fresh transmit delay, because the switch leaves the radio on a
  * channel the last channel scan never covered.
@@ -1740,6 +1790,8 @@ BEACON_TEST_ENTRY void setup()
     printf("\n=== MeshBeaconTxHook ===\n");
 
     RUN_TEST(test_txHook_normalPacket_isSend);
+    RUN_TEST(test_flrc_beaconCannotSwitchOrQueueTransmit);
+    RUN_TEST(test_pendingFlrc_doesNotPreventCompletedBeaconRestoration);
     RUN_TEST(test_txHook_beaconPacket_isDefer);
     RUN_TEST(test_txHook_invalidTarget_isDrop);
     RUN_TEST(test_txHook_unregistered_isNoOp);
