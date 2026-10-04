@@ -18,6 +18,10 @@ Check with the user that these seams match their expectations.
 
 3. Write the spec using the template below, then publish it to the project issue tracker. Apply the `ready-for-agent` triage label - no need for additional triage.
 
+### Artifact kind
+
+Publish the spec with `kind:spec` alongside its triage label. Create the kind label if missing on the configured tracker, then verify it on the published spec. For local Markdown, add `**Kind:** spec` near the top of the spec file.
+
 <spec-template>
 
 ## Problem Statement

@@ -60,6 +60,10 @@ The defaults are the five canonical roles, each label string equal to its name: 
 
 Offer **multi-context** (a root `GLOSSARY-MAP.md` pointing to per-context `GLOSSARY.md` files) only when exploration found monorepo signals. Then confirm which layout they want.
 
+### Artifact-kind configuration
+
+Include the artifact-kind conventions from the tracker seed template in `docs/agents/issue-tracker.md`. For an "other" tracker, include the same three kinds: `kind:spec` for specifications, `kind:ticket` for individual implementation or decision tickets, and `kind:map` for Wayfinder maps. Keep the existing triage vocabulary. Local Markdown records the equivalent `**Kind:** spec`, `**Kind:** ticket`, or `**Kind:** map` field. Include these conventions in the draft shown in step 3.
+
 ### 3. Confirm and edit
 
 Show the user a draft of:

@@ -139,6 +139,10 @@ lint:
     - gitleaks@8.30.1
     - clang-format@20.1.0
   ignore:
+    # Preserve the copied skills so package verification and refreshes stay exact.
+    - linters: [prettier, ascii-dash]
+      paths:
+        - .agents/skills/matt-*/**
     - linters: [ALL]
       paths:
         - bin/**
