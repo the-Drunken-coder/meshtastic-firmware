@@ -2,13 +2,19 @@
 
 How the engineering skills should consume this repo's domain documentation when exploring the codebase.
 
+This is a firmware adapter. Follow the [workspace domain conventions](../../../docs/agents/domain.md); in a standalone clone, read the [canonical workspace configuration](https://github.com/the-Drunken-coder/meshtastic-workspace/blob/main/docs/agents/domain.md).
+
+Paths and layout examples below refer to the workspace root. Any future `GLOSSARY.md` or `GLOSSARY-MAP.md` belongs in the workspace, not firmware. Firmware's restriction on documentation still applies.
+
+Read and publish decision records through the workspace's GitHub Issues, following [issue-tracker.md](issue-tracker.md). Skill instructions to write ADR files map to tracker records here. Read and respect any existing ADR files as prior decisions.
+
 ## Before exploring, read these
 
 - **`GLOSSARY.md`** at the repo root, or
 - **`GLOSSARY-MAP.md`** at the repo root if it exists: it points at one `GLOSSARY.md` per context. Read each one relevant to the topic.
 - **`docs/adr/`**: read ADRs that touch the area you're about to work in. In multi-context repos, also check `src/<context>/docs/adr/` for context-scoped decisions.
 
-If any of these files don't exist, **proceed silently**. Don't flag their absence; don't suggest creating them upfront. The `/matt-domain-modeling` skill (reached via `/matt-grill-with-docs` and `/matt-improve-codebase-architecture`) creates them lazily when terms or decisions actually get resolved.
+If any of these files don't exist, **proceed silently**. Don't flag their absence; don't suggest creating them upfront. The `/matt-domain-modeling` skill (reached via `/matt-grill-with-docs` and `/matt-improve-codebase-architecture`) records terms or decisions when resolved, using the workspace destinations above.
 
 ## File structure
 

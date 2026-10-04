@@ -2,6 +2,20 @@
 
 Issues and specs for this repo live as GitLab issues. Use the [`glab`](https://gitlab.com/gitlab-org/cli) CLI for all operations.
 
+## Artifact kinds
+
+Apply exactly one artifact-kind label to each new artifact:
+
+| Artifact | Label |
+| --- | --- |
+| Specification | `kind:spec` |
+| Individual implementation or decision ticket | `kind:ticket` |
+| Wayfinder planning map | `kind:map` |
+
+Keep triage, category, and `wayfinder:*` labels alongside the artifact kind. Create a missing kind label using the tracker's native tools before publishing, then verify the label on the published artifact. If label creation is unavailable, report the missing label. Creating child tickets does not change their parent's kind.
+
+For local Markdown, record `**Kind:** spec`, `**Kind:** ticket`, or `**Kind:** map` near the top of the corresponding file; retain its existing `Status:` and `Type:` fields.
+
 ## Conventions
 
 - **Create an issue**: `glab issue create --title "..." --description "..."`. Use a heredoc for multi-line descriptions. Pass `--description -` to open an editor.

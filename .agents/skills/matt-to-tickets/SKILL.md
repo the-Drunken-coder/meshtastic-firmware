@@ -66,6 +66,10 @@ Work the **frontier**: any ticket whose blockers are all done. For a purely line
 
 Do NOT close or modify any parent issue.
 
+### Artifact kind
+
+Publish each ticket with `kind:ticket` alongside its triage label. Create the kind label if missing on the configured tracker, then verify it on each published ticket. Keep the parent's existing kind and other labels. For local Markdown, use the Kind field in the ticket template below.
+
 <local-ticket-template>
 
 # <NN>: <Ticket title>
@@ -73,6 +77,8 @@ Do NOT close or modify any parent issue.
 **What to build:** the end-to-end behaviour this ticket makes work, from the user's perspective, not a layer-by-layer implementation list.
 
 **Blocked by:** the numbers/titles of the tickets that gate this one, or "None (can start immediately)".
+
+**Kind:** ticket
 
 **Status:** ready-for-agent
 

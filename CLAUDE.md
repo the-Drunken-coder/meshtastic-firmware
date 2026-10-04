@@ -31,16 +31,16 @@ This repository holds firmware code. There is no `docs/` directory - the design 
 
 ## Agent skills
 
-Fork-only section (the-Drunken-coder/meshtastic-firmware). Matt Pocock's engineering skills are vendored in `.agents/skills/` (`matt-*`). Upstream's "no docs/ and no write-ups in the tree" house rule still applies to anything proposed to meshtastic/firmware; the files below exist only for this fork's agent workflow.
+Fork-only section (the-Drunken-coder/meshtastic-firmware). Matt Pocock's engineering skills are vendored in `.agents/skills/` (`matt-*`). Their provenance is in [.agents/skills/README.md](.agents/skills/README.md). Project configuration lives in the parent Meshtastic workspace; read its [AGENTS.md](../AGENTS.md) when using these skills. Follow the user's current authorization. Open a PR only when explicitly requested, ready for review; the skills' draft-PR instructions yield to this rule.
 
 ### Issue tracker
 
-Use GitHub Issues on `the-Drunken-coder/meshtastic-workspace` for specs, tickets, decisions, and triage. Read `docs/agents/issue-tracker.md` before tracker operations.
+Use GitHub Issues on `the-Drunken-coder/meshtastic-workspace` for specs, tickets, decisions, and triage. Read the workspace's [issue-tracker.md](../docs/agents/issue-tracker.md) before tracker operations.
 
 ### Triage labels
 
-Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See the workspace's [triage-labels.md](../docs/agents/triage-labels.md).
 
 ### Domain docs
 
-Single-context. See `docs/agents/domain.md`.
+Single-context, using `GLOSSARY.md` in the workspace root when needed. See the workspace's [domain.md](../docs/agents/domain.md) for glossary and decision-record conventions. Firmware's documentation restrictions still apply; publish research, specs, and decisions to the workspace tracker.

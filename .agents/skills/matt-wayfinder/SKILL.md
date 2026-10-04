@@ -24,6 +24,12 @@ The map is an **index**, not a store. It lists the decisions made and points at 
 
 **Where the map, its child tickets, blocking, and frontier queries physically live is tracker-specific.** The issue tracker should have been provided to you. If not, tell the user to run `/matt-setup-matt-pocock-skills`. Consult the tracker doc's "Wayfinding operations" section for how _this_ repo expresses them. If no tracker has been provided, default to the local-markdown tracker.
 
+### Artifact kinds
+
+Publish the map with `kind:map` and every child decision ticket with `kind:ticket`. Retain `wayfinder:map`, `wayfinder:<type>`, and other existing labels. Create missing kind labels using the configured tracker's native tools, then verify them on each new artifact. Creating tickets does not change their parent's kind.
+
+For local Markdown, add `**Kind:** map` near the top of the map file and `**Kind:** ticket` near the top of each child file, retaining existing Type and Status fields.
+
 ### The map body
 
 The whole map at low resolution, loaded once per session. Open tickets are **not** listed: they are open child issues, found by query.
