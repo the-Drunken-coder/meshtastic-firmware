@@ -5,6 +5,7 @@
 #include "Observer.h"
 #include "PointerQueue.h"
 #include "airtime.h"
+#include "concurrency/Lock.h"
 #include "error.h"
 #include <memory>
 
@@ -115,6 +116,7 @@ class RadioInterface
 
     meshtastic_MeshPacket *sendingPacket = NULL; // The packet we are currently sending
     uint32_t lastTxStart = 0L;
+    uint32_t sendingTxGeneration = 0;
 
     uint32_t computeSlotTimeMsec();
 
@@ -126,6 +128,42 @@ class RadioInterface
      * Enqueue a received packet for the registered receiver
      */
     void deliverToReceiver(meshtastic_MeshPacket *p);
+
+  public:
+    enum class TxState { Untracked, Queued, Transmitting, Sent, Failed, Dropped, Cancelled, Rejected };
+
+    struct TxStatus {
+        TxState state = TxState::Untracked;
+        uint32_t completedAtMsec = 0;
+        uint32_t generation = 0;
+    };
+
+    // Owned by a stable router record; the radio only accesses it under txStatusLock.
+    class TxAttempt
+    {
+        friend class RadioInterface;
+        const meshtastic_MeshPacket *packet = nullptr;
+        TxAttempt *next = nullptr;
+        TxStatus status;
+
+      public:
+        TxAttempt() = default;
+        TxAttempt(const TxAttempt &) = delete;
+        TxAttempt &operator=(const TxAttempt &) = delete;
+    };
+
+    bool trackTx(TxAttempt &attempt, const meshtastic_MeshPacket *packet);
+    void stopTrackingTx(TxAttempt &attempt);
+    bool hasActiveTx(NodeNum from, PacketId id);
+    TxStatus getTxStatus(const TxAttempt &attempt);
+    uint32_t notifyTxStarted(const meshtastic_MeshPacket *packet);
+    void notifyTxFinished(const meshtastic_MeshPacket *packet, TxState result, uint32_t generation = 0);
+
+  private:
+    concurrency::Lock txStatusLock;
+    TxAttempt *txAttempts = nullptr;
+    uint32_t txGeneration = 0;
+    void unlinkTxAttempt(TxAttempt &attempt);
 
   public:
     /** pool is the pool we will alloc our rx packets from

@@ -154,6 +154,28 @@ class PhoneAPI
     virtual bool handleToRadio(const uint8_t *buf, size_t len);
 
     /**
+     * Queue a ToRadio protobuf received from a foreign transport context.
+     * The payload is copied and decoded later by MeshService::loop() on the
+     * owner thread. Direct serial and main-thread callers should continue to
+     * use handleToRadio() instead. Transport teardown must stop foreign
+     * callbacks before destroying a PhoneAPI instance.
+     */
+    bool enqueueToRadio(const uint8_t *buf, size_t len);
+
+    /**
+     * Request a disconnect reset from a foreign transport callback. The
+     * reset runs on the MeshService owner thread, after waiting writes for
+     * this API have been discarded.
+     */
+    void requestCloseFromForeign();
+
+    /// True while a foreign disconnect is waiting for owner-thread close().
+    bool hasPendingForeignClose() const;
+
+    /// Drain ToRadio packets queued by foreign transport contexts.
+    static void drainForeignToRadio();
+
+    /**
      * Send a (client)notification to the phone
      */
     virtual void sendNotification(meshtastic_LogRecord_Level level, uint32_t replyId, const char *message);

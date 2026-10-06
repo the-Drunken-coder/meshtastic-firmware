@@ -222,8 +222,11 @@ class AuthPipelineRouter : public ReliableRouter
         auto *copy = packetPool.allocCopy(p);
         TEST_ASSERT_NOT_NULL(copy);
         const GlobalPacketId key(copy);
-        pending.emplace(key, PendingPacket(copy, NUM_INTERMEDIATE_RETX));
-        pending.at(key).nextTxMsec = nextTx;
+        pending.try_emplace(key, copy, NUM_INTERMEDIATE_RETX);
+        auto &record = pending.at(key);
+        record.nextTxMsec = nextTx;
+        record.waitingForAck = true;
+        record.hasTransmitted = true;
     }
     uint32_t pendingNextTx(NodeNum from, PacketId id)
     {
@@ -247,9 +250,8 @@ class AuthPipelineRouter : public ReliableRouter
     }
     void clearPending()
     {
-        for (auto &entry : pending)
-            packetPool.release(entry.second.packet);
-        pending.clear();
+        while (!pending.empty())
+            stopRetransmission(pending.begin()->first);
     }
 };
 

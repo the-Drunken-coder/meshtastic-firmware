@@ -27,6 +27,12 @@ ErrorCode ReliableRouter::send(meshtastic_MeshPacket *p)
     const GlobalPacketId key(p);
     const bool retransmitting = p->want_ack;
 
+    // A second logical generation must not replace pending proof context or a retained MQTT RF copy.
+    if (findPendingPacket(key) || (iface && iface->hasActiveTx(key.node, key.id))) {
+        packetPool.release(p);
+        return meshtastic_Routing_Error_BAD_REQUEST;
+    }
+
     if (p->want_ack) {
         DEBUG_HEAP_BEFORE;
         auto copy = packetPool.allocCopy(*p);
@@ -34,7 +40,7 @@ ErrorCode ReliableRouter::send(meshtastic_MeshPacket *p)
 
         if (copy) {
             const uint8_t totalAttempts = isBroadcast(p->to) ? NUM_RELIABLE_RETX : NUM_RELIABLE_UNICAST_ATTEMPTS;
-            startRetransmission(copy, totalAttempts);
+            startRetransmission(copy, totalAttempts, p);
         }
     }
 
@@ -42,14 +48,12 @@ ErrorCode ReliableRouter::send(meshtastic_MeshPacket *p)
        (implicit) ACK. Otherwise, we might retransmit too early.
      */
     for (auto i = pending.begin(); i != pending.end(); i++) {
-        if (i->first.id != p->id) {
-            i->second.nextTxMsec += iface->getPacketTime(p);
-        }
+        if (!(i->first == key))
+            extendAckWait(i->second, iface->getPacketTime(p));
     }
 
     ErrorCode result = isBroadcast(p->to) ? FloodingRouter::send(p) : NextHopRouter::send(p);
-    // Duty-cycle rejections may clear before the scheduled retry.
-    if (retransmitting && result != ERRNO_OK && result != meshtastic_Routing_Error_DUTY_CYCLE_LIMIT)
+    if (retransmitting && result != ERRNO_OK)
         stopRetransmission(key);
 
     return result;
@@ -99,7 +103,7 @@ bool ReliableRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
        If we don't add this, we will likely retransmit too early.
     */
     for (auto i = pending.begin(); i != pending.end(); i++) {
-        i->second.nextTxMsec += iface->getPacketTime(p, true);
+        extendAckWait(i->second, iface->getPacketTime(p, true));
     }
 
     return isBroadcast(p->to) ? FloodingRouter::shouldFilterReceived(p) : NextHopRouter::shouldFilterReceived(p);
@@ -179,7 +183,8 @@ void ReliableRouter::sniffReceived(const meshtastic_MeshPacket *p, const meshtas
             !(isFromUs(p) && p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT)) {
             LOG_DEBUG("Received a %s for 0x%08x, stopping retransmissions", ackId ? "ACK" : "NAK", ackId);
             if (ackId) {
-                stopRetransmission(p->to, ackId);
+                stopRetransmission(p->to, ackId,
+                                   p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT);
                 // M3: an end-to-end ACK proves the directed route to the ACK's sender currently works,
                 // so clear its failure count and refresh freshness (keeps a good route pinned).
                 if (!isBroadcast(getFrom(p)))

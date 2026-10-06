@@ -113,6 +113,7 @@ void LR2021Interface::setStandby()
         LR20x0Interface::setStandby();
         return;
     }
+    checkNotification(); // Preserve a completed TX before an explicit standby request aborts it.
     if (standbyFlrc() != RADIOLIB_ERR_NONE)
         rxOffline = true;
 }

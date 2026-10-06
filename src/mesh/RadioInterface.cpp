@@ -17,6 +17,7 @@
 #include "SX1280Interface.h"
 #include "UptimeClock.h"
 #include "W12FlrcProfile.h"
+#include "concurrency/LockGuard.h"
 #include "configuration.h"
 #include "detect/LoRaRadioType.h"
 #include "main.h"
@@ -26,6 +27,84 @@
 #include <pb_decode.h>
 #include <pb_encode.h>
 #include <string.h>
+
+void RadioInterface::unlinkTxAttempt(TxAttempt &attempt)
+{
+    for (auto **entry = &txAttempts; *entry; entry = &(*entry)->next) {
+        if (*entry == &attempt) {
+            *entry = attempt.next;
+            break;
+        }
+    }
+    attempt.next = nullptr;
+    attempt.packet = nullptr;
+}
+
+bool RadioInterface::trackTx(TxAttempt &attempt, const meshtastic_MeshPacket *packet)
+{
+    concurrency::LockGuard guard(&txStatusLock);
+    if (attempt.packet)
+        return false;
+    for (auto *entry = txAttempts; entry; entry = entry->next)
+        if (entry->packet == packet)
+            return false;
+    attempt.packet = packet;
+    txGeneration = Time::skipZero(txGeneration + 1);
+    attempt.status = {TxState::Queued, 0, txGeneration};
+    attempt.next = txAttempts;
+    txAttempts = &attempt;
+    return true;
+}
+
+bool RadioInterface::hasActiveTx(NodeNum from, PacketId id)
+{
+    return (sendingPacket && getFrom(sendingPacket) == from && sendingPacket->id == id) || findInTxQueue(from, id);
+}
+
+void RadioInterface::stopTrackingTx(TxAttempt &attempt)
+{
+    concurrency::LockGuard guard(&txStatusLock);
+    unlinkTxAttempt(attempt);
+    attempt.status.state = TxState::Untracked;
+}
+
+RadioInterface::TxStatus RadioInterface::getTxStatus(const TxAttempt &attempt)
+{
+    concurrency::LockGuard guard(&txStatusLock);
+    return attempt.status;
+}
+
+uint32_t RadioInterface::notifyTxStarted(const meshtastic_MeshPacket *packet)
+{
+    concurrency::LockGuard guard(&txStatusLock);
+    for (auto *attempt = txAttempts; attempt; attempt = attempt->next) {
+        if (attempt->packet == packet) {
+            attempt->status.state = TxState::Transmitting;
+            return attempt->status.generation;
+        }
+    }
+    return 0;
+}
+
+void RadioInterface::notifyTxFinished(const meshtastic_MeshPacket *packet, TxState result, uint32_t generation)
+{
+    bool changed = false;
+    {
+        concurrency::LockGuard guard(&txStatusLock);
+        for (auto *attempt = txAttempts; attempt; attempt = attempt->next) {
+            if (attempt->packet == packet && (!generation || attempt->status.generation == generation)) {
+                attempt->status.state = result;
+                attempt->status.completedAtMsec = Time::getMillis();
+                // No registry pointer may outlive the physical packet's pool ownership.
+                unlinkTxAttempt(*attempt);
+                changed = true;
+                break;
+            }
+        }
+    }
+    if (changed && router)
+        router->setReceivedMessage();
+}
 
 #ifdef ARCH_PORTDUINO
 #include "platform/portduino/PortduinoGlue.h"
@@ -1567,5 +1646,6 @@ size_t RadioInterface::beginSending(meshtastic_MeshPacket *p)
     memcpy(radioBuffer.payload, p->encrypted.bytes, payloadLen);
 
     sendingPacket = p;
+    sendingTxGeneration = notifyTxStarted(p);
     return payloadLen + sizeof(PacketHeader);
 }

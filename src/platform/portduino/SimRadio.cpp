@@ -1,5 +1,6 @@
 #include "SimRadio.h"
 #include "MeshService.h"
+#include "RadioTxHook.h"
 #include "Router.h"
 
 SimRadio::SimRadio() : NotifiedWorkerThread("SimRadio")
@@ -14,13 +15,21 @@ ErrorCode SimRadio::send(meshtastic_MeshPacket *p)
     printPacket("enqueuing for send", p);
 
     bool dropped = false;
-    ErrorCode res = txQueue.enqueue(p, &dropped) ? ERRNO_OK : ERRNO_UNKNOWN;
+    meshtastic_MeshPacket *evicted = nullptr;
+    ErrorCode res = txQueue.enqueue(p, &dropped, &evicted) ? ERRNO_OK : ERRNO_UNKNOWN;
+    if (evicted) {
+        notifyTxFinished(evicted, TxState::Dropped);
+        RadioTxHooks::packetReleased(this, evicted);
+        packetPool.release(evicted);
+    }
 
     if (dropped) {
         txDrop++;
     }
 
     if (res != ERRNO_OK) { // we weren't able to queue it, so we must drop it to prevent leaks
+        notifyTxFinished(p, TxState::Rejected);
+        RadioTxHooks::packetReleased(this, p);
         packetPool.release(p);
         return res;
     }
@@ -84,17 +93,25 @@ void SimRadio::handleTransmitInterrupt()
         handleReceiveInterrupt();
 }
 
-void SimRadio::completeSending()
+void SimRadio::completeSending(bool success)
 {
     // We are careful to clear sending packet before calling printPacket because
     // that can take a long time
     auto p = sendingPacket;
+    const uint32_t generation = sendingTxGeneration;
     sendingPacket = NULL;
+    sendingTxGeneration = 0;
 
     if (p) {
-        txGood++;
-        if (!isFromUs(p))
-            txRelay++;
+        if (success) {
+            txGood++;
+            if (!isFromUs(p))
+                txRelay++;
+        } else {
+            txDrop++;
+        }
+        notifyTxFinished(p, success ? TxState::Sent : TxState::Failed, generation);
+        RadioTxHooks::packetReleased(this, p);
         printPacket("Completed sending", p);
 
         // We are done sending that packet, release it
@@ -135,13 +152,14 @@ bool SimRadio::isChannelActive()
 /** Attempt to cancel a previously sent packet.  Returns true if a packet was found we could cancel */
 bool SimRadio::cancelSending(NodeNum from, PacketId id)
 {
-    auto p = txQueue.remove(from, id);
-    if (p)
-        packetPool.release(p); // free the packet we just removed
-
-    bool result = (p != NULL);
-    LOG_DEBUG("cancelSending id=0x%08x, removed=%d", id, result);
-    return result;
+    bool removed = false;
+    while (auto *p = txQueue.remove(from, id)) {
+        notifyTxFinished(p, TxState::Cancelled);
+        RadioTxHooks::packetReleased(this, p);
+        packetPool.release(p);
+        removed = true;
+    }
+    return removed;
 }
 
 /** Attempt to find a packet in the TxQueue. Returns true if the packet was found. */
@@ -185,12 +203,13 @@ void SimRadio::onNotify(uint32_t notification)
                     // Send any outgoing packets we have ready
                     meshtastic_MeshPacket *txp = txQueue.dequeue();
                     assert(txp);
-                    startSend(txp);
-                    // Packet has been sent, count it toward our TX airtime utilization.
-                    uint32_t xmitMsec = RadioInterface::getPacketTime(txp);
-                    airTime->logAirtime(TX_LOG, xmitMsec);
-
-                    notifyLater(xmitMsec, ISR_TX, false); // Model the time it is busy sending
+                    const uint32_t xmitMsec = RadioInterface::getPacketTime(txp);
+                    if (startSend(txp)) {
+                        airTime->logAirtime(TX_LOG, xmitMsec);
+                        notifyLater(xmitMsec, ISR_TX, false);
+                    } else {
+                        startTransmitTimer();
+                    }
                 }
             }
         } else {
@@ -203,14 +222,18 @@ void SimRadio::onNotify(uint32_t notification)
 }
 
 /** start an immediate transmit */
-void SimRadio::startSend(meshtastic_MeshPacket *txp)
+bool SimRadio::startSend(meshtastic_MeshPacket *txp)
 {
+    notifyTxStarted(txp);
     printPacket("Start low level send", txp);
     isReceiving = false;
     size_t numbytes = beginSending(txp);
     meshtastic_MeshPacket *p = packetPool.allocCopy(*txp);
-    if (!p)
-        return;
+    if (!p) {
+        completeSending(false);
+        isReceiving = true;
+        return false;
+    }
 
     // A packet we originate that's encrypted for someone else (a PKI DM, channel == 0) can't be
     // decrypted here. Attempting it only logs a spurious "no suitable channel" miss, and the
@@ -270,6 +293,7 @@ void SimRadio::startSend(meshtastic_MeshPacket *txp)
     service->sendQueueStatusToPhone(router->getQueueStatus(), 0, p->id);
     service->sendToPhone(p); // Sending back to simulator
     service->loop();         // Process the send immediately
+    return true;
 }
 
 // Simulates device received a packet via the LoRa chip

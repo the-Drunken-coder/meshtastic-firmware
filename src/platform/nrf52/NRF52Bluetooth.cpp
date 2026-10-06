@@ -73,6 +73,7 @@ static uint8_t toRadioBytes[meshtastic_ToRadio_size];
 
 // Last ToRadio value received from the phone
 static uint8_t lastToRadio[MAX_TO_FROM_RADIO_SIZE];
+static uint16_t lastToRadioLen;
 
 static uint16_t connectionHandle;
 static bool passkeyShowing;
@@ -131,11 +132,12 @@ void onDisconnect(uint16_t conn_handle, uint8_t reason)
 {
     LOG_INFO("BLE Disconnected, reason = 0x%x", reason);
     if (bluetoothPhoneAPI) {
-        bluetoothPhoneAPI->close();
+        bluetoothPhoneAPI->requestCloseFromForeign();
     }
 
     // Clear the last ToRadio packet buffer to avoid rejecting first packet from new connection
     memset(lastToRadio, 0, sizeof(lastToRadio));
+    lastToRadioLen = 0;
 
     // Notify UI (or any other interested firmware components)
     meshtastic::BluetoothStatus newStatus(meshtastic::BluetoothStatus::ConnectionState::DISCONNECTED);
@@ -222,13 +224,21 @@ void onFromRadioAuthorize(uint16_t conn_hdl, BLECharacteristic *chr, ble_gatts_e
 void onToRadioWrite(uint16_t conn_hdl, BLECharacteristic *chr, uint8_t *data, uint16_t len)
 {
     LOG_INFO("toRadioWriteCb data %p, len %u", data, len);
-    if (memcmp(lastToRadio, data, len) != 0) {
-        LOG_DEBUG("New ToRadio packet");
-        memcpy(lastToRadio, data, len);
-        bluetoothPhoneAPI->handleToRadio(data, len);
-    } else {
-        LOG_DEBUG("Drop dup ToRadio packet we just saw");
+    if (len == 0 || len > sizeof(lastToRadio)) {
+        LOG_WARN("Reject BLE ToRadio packet: invalid length %u", len);
+        return;
     }
+    if (len == lastToRadioLen && memcmp(lastToRadio, data, len) == 0) {
+        LOG_DEBUG("Drop dup ToRadio packet we just saw");
+        return;
+    }
+    LOG_DEBUG("New ToRadio packet");
+    if (!bluetoothPhoneAPI->enqueueToRadio(data, len)) {
+        LOG_WARN("Reject BLE ToRadio packet: owner-thread queue unavailable");
+        return;
+    }
+    memcpy(lastToRadio, data, len);
+    lastToRadioLen = len;
 }
 
 void setupMeshService(void)
