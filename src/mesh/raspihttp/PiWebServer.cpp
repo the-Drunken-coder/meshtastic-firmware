@@ -273,7 +273,11 @@ int handleAPIv1ToRadio(const struct _u_request *req, struct _u_response *res, vo
     portduinoVFS->mountpoint(configWeb.rootPath);
 
     LOG_DEBUG("Received %d bytes from PUT request", s);
-    static_cast<HttpAPI *>(user_data)->handleToRadio(buffer, s);
+    if (!static_cast<HttpAPI *>(user_data)->enqueueToRadio(buffer, s)) {
+        LOG_WARN("Reject Raspberry Pi HTTP ToRadio packet: owner-thread queue unavailable");
+        ulfius_set_response_properties(res, U_OPT_STATUS, 503);
+        return U_CALLBACK_COMPLETE;
+    }
     LOG_DEBUG("end web->radio  ");
     return U_CALLBACK_COMPLETE;
 }

@@ -126,6 +126,7 @@ class TestableW12Adapter : public LR2021Interface
     void armReceive() { startReceive(); }
     bool recover() { return recoverChipStateLoss(); }
     void stop() { setStandby(); }
+    void stopViaLoRaBase() { LR20x0Interface::setStandby(); }
     bool channelActive() { return isChannelActive(); }
     bool receiveActive() { return isActivelyReceiving(); }
     bool isOffline() const { return rxOffline; }
@@ -149,8 +150,10 @@ class TestableW12Adapter : public LR2021Interface
     }
     void releaseQueuedTransmissions()
     {
-        while (auto *packet = txQueue.dequeue())
+        while (auto *packet = txQueue.dequeue()) {
+            notifyTxFinished(packet, TxState::Cancelled);
             packetPool.release(packet);
+        }
     }
 };
 
@@ -501,6 +504,112 @@ static void test_w12_adapter_failed_observation_preserves_active_reception_and_l
 }
 
 #if defined(MESHTASTIC_W12_FLRC_EXPERIMENTAL_TX) && MESHTASTIC_W12_FLRC_EXPERIMENTAL_TX
+// Exercise the production queue, scripted chip, IRQ completion and descriptor ownership together.
+static void test_w12_adapter_tx_attempt_tracks_queue_start_done_and_pool_reuse()
+{
+    makeW12Adapter();
+    // FLRC's passive channel scan needs idle RX armed before it can grant TX.
+    RadioInterface::TxAttempt attempt;
+    auto *packet = makeAdapterTransmission();
+    TEST_ASSERT_TRUE(adapter->trackTx(attempt, packet));
+    TEST_ASSERT_FALSE(adapter->trackTx(attempt, packet));
+    TEST_ASSERT_EQUAL_INT((int)RadioInterface::TxState::Queued, (int)adapter->getTxStatus(attempt).state);
+    TEST_ASSERT_TRUE(adapter->queueTransmission(packet));
+    adapter->serviceNotifications();
+    TEST_ASSERT_EQUAL_INT((int)RadioInterface::TxState::Transmitting, (int)adapter->getTxStatus(attempt).state);
+    const auto generation = adapter->getTxStatus(attempt).generation;
+    Time::advanceTestMillis(7);
+    adapterHal->irq = RADIOLIB_LR2021_IRQ_TX_DONE;
+    adapter->transmitInterrupt();
+    TEST_ASSERT_EQUAL_INT((int)RadioInterface::TxState::Sent, (int)adapter->getTxStatus(attempt).state);
+    TEST_ASSERT_EQUAL_UINT32(Time::getMillis(), adapter->getTxStatus(attempt).completedAtMsec);
+
+    packet = makeAdapterTransmission();
+    TEST_ASSERT_TRUE(adapter->trackTx(attempt, packet));
+    adapter->notifyTxFinished(packet, RadioInterface::TxState::Sent, generation);
+    TEST_ASSERT_EQUAL_INT((int)RadioInterface::TxState::Queued, (int)adapter->getTxStatus(attempt).state);
+    adapterHal->failCommand = RADIOLIB_LR2021_CMD_SET_TX;
+    TEST_ASSERT_FALSE(adapter->sendNow(packet));
+    TEST_ASSERT_EQUAL_INT((int)RadioInterface::TxState::Failed, (int)adapter->getTxStatus(attempt).state);
+    packet = makeAdapterTransmission();
+    TEST_ASSERT_TRUE(adapter->trackTx(attempt, packet));
+    adapterHal->failCommand = 0;
+    TEST_ASSERT_TRUE(adapter->sendNow(packet));
+    adapterHal->irq = RADIOLIB_LR2021_IRQ_TIMEOUT;
+    adapter->transmitInterrupt();
+    TEST_ASSERT_EQUAL_INT((int)RadioInterface::TxState::Failed, (int)adapter->getTxStatus(attempt).state);
+}
+
+static void test_w12_adapter_forced_standby_cannot_start_ack_wait()
+{
+    makeW12Adapter();
+    adapter->stop();
+    RadioInterface::TxAttempt attempt;
+    auto *packet = makeAdapterTransmission();
+    TEST_ASSERT_TRUE(adapter->trackTx(attempt, packet));
+    TEST_ASSERT_TRUE(adapter->sendNow(packet));
+    TEST_ASSERT_EQUAL_INT((int)RadioInterface::TxState::Transmitting, (int)adapter->getTxStatus(attempt).state);
+    adapter->stop();
+    TEST_ASSERT_EQUAL_INT((int)RadioInterface::TxState::Failed, (int)adapter->getTxStatus(attempt).state);
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->goodTransmits());
+
+    packet = makeAdapterTransmission();
+    TEST_ASSERT_TRUE(adapter->trackTx(attempt, packet));
+    TEST_ASSERT_TRUE(adapter->sendNow(packet));
+    adapter->stopViaLoRaBase();
+    TEST_ASSERT_EQUAL_INT((int)RadioInterface::TxState::Failed, (int)adapter->getTxStatus(attempt).state);
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->goodTransmits());
+
+    packet = makeAdapterTransmission();
+    TEST_ASSERT_TRUE(adapter->trackTx(attempt, packet));
+    adapterHal->irqOnSetTx = RADIOLIB_LR2021_IRQ_TX_DONE;
+    TEST_ASSERT_TRUE(adapter->sendNow(packet));
+    adapter->stop();
+    TEST_ASSERT_EQUAL_INT((int)RadioInterface::TxState::Sent, (int)adapter->getTxStatus(attempt).state);
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->goodTransmits());
+}
+
+static void test_w12_adapter_production_queue_eviction_reject_cancel_and_no_lora()
+{
+    makeW12Adapter();
+    adapter->stop();
+    RadioInterface::TxAttempt attempts[MAX_TX_QUEUE + 2];
+    meshtastic_MeshPacket *packets[MAX_TX_QUEUE + 2] = {};
+    for (unsigned i = 0; i < MAX_TX_QUEUE; ++i) {
+        packets[i] = makeAdapterTransmission();
+        packets[i]->id = i + 1;
+        packets[i]->priority = meshtastic_MeshPacket_Priority_BACKGROUND;
+        TEST_ASSERT_TRUE(adapter->trackTx(attempts[i], packets[i]));
+        TEST_ASSERT_EQUAL_INT(ERRNO_OK, adapter->send(packets[i]));
+    }
+    packets[MAX_TX_QUEUE] = makeAdapterTransmission();
+    packets[MAX_TX_QUEUE]->id = MAX_TX_QUEUE + 1;
+    packets[MAX_TX_QUEUE]->priority = meshtastic_MeshPacket_Priority_ACK;
+    TEST_ASSERT_TRUE(adapter->trackTx(attempts[MAX_TX_QUEUE], packets[MAX_TX_QUEUE]));
+    TEST_ASSERT_EQUAL_INT(ERRNO_OK, adapter->send(packets[MAX_TX_QUEUE]));
+    unsigned dropped = 0;
+    for (unsigned i = 0; i < MAX_TX_QUEUE; ++i)
+        dropped += adapter->getTxStatus(attempts[i]).state == RadioInterface::TxState::Dropped;
+    TEST_ASSERT_EQUAL_UINT32(1, dropped);
+    TEST_ASSERT_EQUAL_INT((int)RadioInterface::TxState::Queued, (int)adapter->getTxStatus(attempts[MAX_TX_QUEUE]).state);
+    packets[MAX_TX_QUEUE + 1] = makeAdapterTransmission();
+    packets[MAX_TX_QUEUE + 1]->id = MAX_TX_QUEUE + 2;
+    packets[MAX_TX_QUEUE + 1]->priority = meshtastic_MeshPacket_Priority_BACKGROUND;
+    TEST_ASSERT_TRUE(adapter->trackTx(attempts[MAX_TX_QUEUE + 1], packets[MAX_TX_QUEUE + 1]));
+    TEST_ASSERT_NOT_EQUAL(ERRNO_OK, adapter->send(packets[MAX_TX_QUEUE + 1]));
+    TEST_ASSERT_EQUAL_INT((int)RadioInterface::TxState::Rejected, (int)adapter->getTxStatus(attempts[MAX_TX_QUEUE + 1]).state);
+    TEST_ASSERT_TRUE(adapter->cancelSending(packets[MAX_TX_QUEUE]->from, MAX_TX_QUEUE + 1));
+    TEST_ASSERT_EQUAL_INT((int)RadioInterface::TxState::Cancelled, (int)adapter->getTxStatus(attempts[MAX_TX_QUEUE]).state);
+    adapter->releaseQueuedTransmissions();
+
+    auto *packet = makeAdapterTransmission();
+    packet->to = NODENUM_BROADCAST_NO_LORA;
+    TEST_ASSERT_TRUE(adapter->trackTx(attempts[0], packet));
+    TEST_ASSERT_EQUAL_INT(ERRNO_SHOULD_RELEASE, adapter->send(packet));
+    TEST_ASSERT_EQUAL_INT((int)RadioInterface::TxState::Rejected, (int)adapter->getTxStatus(attempts[0]).state);
+    packetPool.release(packet);
+}
+
 // A chip finishing SET_TX before its return must complete from the real queued notification,
 // without waiting for the 100ms timeout or calling a transmit handler directly.
 static void test_w12_adapter_short_send_arms_irq_before_set_tx_and_completes_immediately()
@@ -620,6 +729,9 @@ static void runW12AdapterTests()
     RUN_TEST(test_w12_adapter_failed_observation_defers_fresh_recovery_until_rx_done_is_delivered);
     RUN_TEST(test_w12_adapter_failed_observation_preserves_active_reception_and_later_completion);
 #if defined(MESHTASTIC_W12_FLRC_EXPERIMENTAL_TX) && MESHTASTIC_W12_FLRC_EXPERIMENTAL_TX
+    RUN_TEST(test_w12_adapter_tx_attempt_tracks_queue_start_done_and_pool_reuse);
+    RUN_TEST(test_w12_adapter_production_queue_eviction_reject_cancel_and_no_lora);
+    RUN_TEST(test_w12_adapter_forced_standby_cannot_start_ack_wait);
     RUN_TEST(test_w12_adapter_short_send_arms_irq_before_set_tx_and_completes_immediately);
     RUN_TEST(test_w12_adapter_send_without_tx_done_times_out_and_releases_packet_once);
     RUN_TEST(test_w12_adapter_failed_irq_status_cannot_credit_stale_tx_done);

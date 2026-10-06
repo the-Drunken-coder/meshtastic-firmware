@@ -1,5 +1,5 @@
-// Unit tests for MeshPacketQueue::replaceLowerPriorityPacket()'s late-packet branch - the one that
-// evicts an overdue packet from a full queue to make room for a new arrival.
+// Unit tests for MeshPacketQueue's late-packet replacement branch and its lifecycle-aware victim
+// ownership contract when a full queue evicts or rejects an arrival.
 //
 // tx_after is an absolute millis() deadline, so every decision here has to subtract before comparing
 // or it inverts across the 32-bit wrap. The subtlety the cases below pin is that an *elapsed* time
@@ -87,6 +87,40 @@ static void test_more_overdue_incoming_packet_evicts_the_late_back_packet(void)
     drain(q);
 }
 
+// The lifecycle-aware callers pass an out-parameter so the queue can transfer the victim before
+// it is released. A full queue with no replacement must leave the incoming packet with its caller.
+static void test_out_victim_reports_eviction_and_rejection_ownership(void)
+{
+    Time::setTestMillis(1000);
+    MeshPacketQueue q(1);
+
+    meshtastic_MeshPacket *victim = makePacket(0x2501, 900);
+    meshtastic_MeshPacket *replacement = makePacket(0x2502, 800);
+    bool dropped = false;
+    meshtastic_MeshPacket *evicted = nullptr;
+    TEST_ASSERT_TRUE(q.enqueue(victim));
+
+    TEST_ASSERT_TRUE(q.enqueue(replacement, &dropped, &evicted));
+    TEST_ASSERT_TRUE(dropped);
+    TEST_ASSERT_EQUAL_PTR(victim, evicted);
+    TEST_ASSERT_EQUAL_HEX32(replacement->id, q.getFront()->id);
+    packetPool.release(evicted);
+    drain(q);
+
+    meshtastic_MeshPacket *queued = makePacket(0x2503, 700);
+    meshtastic_MeshPacket *rejected = makePacket(0x2504, 900);
+    dropped = false;
+    evicted = nullptr;
+    TEST_ASSERT_TRUE(q.enqueue(queued));
+
+    TEST_ASSERT_FALSE(q.enqueue(rejected, &dropped, &evicted));
+    TEST_ASSERT_TRUE(dropped);
+    TEST_ASSERT_NULL(evicted);
+    TEST_ASSERT_EQUAL_HEX32(queued->id, q.getFront()->id);
+    packetPool.release(rejected);
+    drain(q);
+}
+
 // The other half of that ordering: a less overdue arrival leaves the queue alone.
 static void test_less_overdue_incoming_packet_is_rejected(void)
 {
@@ -155,6 +189,7 @@ void setup()
     UNITY_BEGIN();
     RUN_TEST(test_future_incoming_deadline_does_not_evict_an_overdue_packet);
     RUN_TEST(test_more_overdue_incoming_packet_evicts_the_late_back_packet);
+    RUN_TEST(test_out_victim_reports_eviction_and_rejection_ownership);
     RUN_TEST(test_less_overdue_incoming_packet_is_rejected);
     RUN_TEST(test_undelayed_incoming_packet_evicts_the_late_back_packet);
     RUN_TEST(test_decisions_survive_the_millis_wrap);

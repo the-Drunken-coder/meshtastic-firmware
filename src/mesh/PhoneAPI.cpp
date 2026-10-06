@@ -46,6 +46,84 @@ namespace
 constexpr uint8_t FILES_MANIFEST_LEVELS = 3;
 constexpr size_t FILES_MANIFEST_MAX_COUNT = 64;
 
+// Foreign transport callbacks (BLE, HTTP and Ethernet) can arrive on a
+// different task than the MeshService owner. Keep the handoff bounded and
+// allocation-free so those callbacks never parse protobufs or enter Router
+// state directly. The queue is intentionally small: callers get an explicit
+// rejection instead of an unbounded backlog whose retry timing would be
+// indistinguishable from radio congestion.
+constexpr size_t FOREIGN_TORADIO_DEPTH = 4;
+constexpr size_t FOREIGN_TORADIO_MAX_OWNERS = 8;
+
+struct ForeignToRadioState;
+std::atomic<ForeignToRadioState *> g_foreignToRadioState{nullptr};
+
+struct ForeignToRadioEntry {
+    PhoneAPI *owner = nullptr;
+    uint16_t length = 0;
+    uint8_t bytes[MAX_TO_FROM_RADIO_SIZE] = {};
+};
+
+struct ForeignToRadioState {
+    concurrency::Lock mutex;
+    ForeignToRadioEntry entries[FOREIGN_TORADIO_DEPTH];
+    PhoneAPI *owners[FOREIGN_TORADIO_MAX_OWNERS] = {};
+    bool closePending[FOREIGN_TORADIO_MAX_OWNERS] = {};
+    size_t count = 0;
+    size_t ownerCount = 0;
+    ~ForeignToRadioState() { g_foreignToRadioState.store(nullptr, std::memory_order_release); }
+};
+std::atomic<bool> g_foreignToRadioDraining{false};
+
+// Lazy construction avoids touching RTOS synchronization primitives while a
+// static HTTP API object is being constructed before MeshService exists.
+ForeignToRadioState &foreignToRadioState()
+{
+    static ForeignToRadioState state;
+    g_foreignToRadioState.store(&state, std::memory_order_release);
+    return state;
+}
+
+void purgeForeignToRadioOwner(PhoneAPI *owner, bool unregister)
+{
+    if (!owner)
+        return;
+
+    auto *state = g_foreignToRadioState.load(std::memory_order_acquire);
+    if (!state)
+        return;
+    concurrency::LockGuard guard(&state->mutex);
+
+    size_t kept = 0;
+    for (size_t i = 0; i < state->count; ++i) {
+        if (state->entries[i].owner != owner) {
+            if (kept != i)
+                state->entries[kept] = state->entries[i];
+            ++kept;
+        }
+    }
+    state->count = kept;
+
+    if (unregister) {
+        for (size_t i = 0; i < state->ownerCount; ++i) {
+            if (state->owners[i] == owner) {
+                for (size_t j = i + 1; j < state->ownerCount; ++j) {
+                    state->owners[j - 1] = state->owners[j];
+                    state->closePending[j - 1] = state->closePending[j];
+                }
+                state->owners[--state->ownerCount] = nullptr;
+                state->closePending[state->ownerCount] = false;
+                break;
+            }
+        }
+    }
+}
+
+void removeForeignToRadioOwner(PhoneAPI *owner)
+{
+    purgeForeignToRadioOwner(owner, true);
+}
+
 void releaseFilesManifest(std::vector<meshtastic_FileInfo> &filesManifest)
 {
     std::vector<meshtastic_FileInfo>().swap(filesManifest);
@@ -251,6 +329,10 @@ PhoneAPI::PhoneAPI()
 
 PhoneAPI::~PhoneAPI()
 {
+    // Foreign transport callbacks only enqueue copied bytes, but the queue
+    // retains this object as its dispatch target until MeshService::loop()
+    // drains them. Remove those entries before the object can disappear.
+    removeForeignToRadioOwner(this);
     close();
 #ifdef MESHTASTIC_PHONEAPI_ACCESS_CONTROL
     // Free the auth slot unconditionally, regardless of whether close()'s
@@ -263,6 +345,174 @@ PhoneAPI::~PhoneAPI()
         clearAuthSlot_LH(this);
     }
 #endif
+}
+
+bool PhoneAPI::enqueueToRadio(const uint8_t *buf, size_t bufLength)
+{
+    if (!buf || bufLength == 0 || bufLength > MAX_TO_FROM_RADIO_SIZE) {
+        LOG_WARN("Reject foreign ToRadio ingress: invalid length %u", (unsigned)bufLength);
+        return false;
+    }
+
+    auto &state = foreignToRadioState();
+    bool accepted = false;
+    bool ownerLimit = false;
+    bool queueLimit = false;
+    bool closeLimit = false;
+    {
+        concurrency::LockGuard guard(&state.mutex);
+
+        size_t ownerIndex = 0;
+        while (ownerIndex < state.ownerCount && state.owners[ownerIndex] != this)
+            ++ownerIndex;
+
+        if (state.count >= FOREIGN_TORADIO_DEPTH) {
+            queueLimit = true;
+        } else if (ownerIndex < state.ownerCount && state.closePending[ownerIndex]) {
+            closeLimit = true;
+        } else if (ownerIndex == state.ownerCount && state.ownerCount >= FOREIGN_TORADIO_MAX_OWNERS) {
+            ownerLimit = true;
+        } else {
+            if (ownerIndex == state.ownerCount)
+                state.owners[state.ownerCount++] = this;
+
+            auto &entry = state.entries[state.count++];
+            entry.owner = this;
+            entry.length = static_cast<uint16_t>(bufLength);
+            memcpy(entry.bytes, buf, bufLength);
+            accepted = true;
+        }
+    }
+
+    if (!accepted) {
+        if (queueLimit)
+            LOG_WARN("Reject foreign ToRadio ingress: queue full");
+        else if (closeLimit)
+            LOG_WARN("Reject foreign ToRadio ingress: close pending");
+        else if (ownerLimit)
+            LOG_WARN("Reject foreign ToRadio ingress: owner table full");
+        return false;
+    }
+
+    // The service loop owns Router state. Wake it after the bytes are safely
+    // copied so a foreign callback never enters the radio path itself.
+    concurrency::mainDelay.interrupt();
+    return true;
+}
+
+void PhoneAPI::requestCloseFromForeign()
+{
+    auto &state = foreignToRadioState();
+    bool accepted = false;
+    {
+        concurrency::LockGuard guard(&state.mutex);
+
+        size_t ownerIndex = 0;
+        while (ownerIndex < state.ownerCount && state.owners[ownerIndex] != this)
+            ++ownerIndex;
+
+        if (ownerIndex == state.ownerCount) {
+            if (state.ownerCount >= FOREIGN_TORADIO_MAX_OWNERS) {
+                LOG_WARN("Reject foreign PhoneAPI close: owner table full");
+            } else {
+                ownerIndex = state.ownerCount++;
+                state.owners[ownerIndex] = this;
+            }
+        }
+
+        if (ownerIndex < state.ownerCount) {
+            for (size_t i = 0; i < state.count;) {
+                if (state.entries[i].owner != this) {
+                    ++i;
+                    continue;
+                }
+                for (size_t j = i + 1; j < state.count; ++j)
+                    state.entries[j - 1] = state.entries[j];
+                --state.count;
+            }
+            state.closePending[ownerIndex] = true;
+            accepted = true;
+        }
+    }
+
+    if (!accepted)
+        return;
+
+    concurrency::mainDelay.interrupt();
+}
+
+bool PhoneAPI::hasPendingForeignClose() const
+{
+    auto *state = g_foreignToRadioState.load(std::memory_order_acquire);
+    if (!state)
+        return false;
+
+    concurrency::LockGuard guard(&state->mutex);
+    for (size_t i = 0; i < state->ownerCount; ++i) {
+        if (state->owners[i] == this)
+            return state->closePending[i];
+    }
+    return false;
+}
+
+void PhoneAPI::drainForeignToRadio()
+{
+    bool expected = false;
+    if (!g_foreignToRadioDraining.compare_exchange_strong(expected, true, std::memory_order_acquire, std::memory_order_relaxed))
+        return;
+
+    struct DrainGuard {
+        ~DrainGuard() { g_foreignToRadioDraining.store(false, std::memory_order_release); }
+    } drainGuard;
+
+    auto &state = foreignToRadioState();
+    // Bound one owner-loop pass. A handler that re-enqueues work must not be
+    // able to keep MeshService::loop() from reaching its other duties.
+    for (size_t processed = 0; processed < FOREIGN_TORADIO_DEPTH; ++processed) {
+        PhoneAPI *closingOwner = nullptr;
+        {
+            concurrency::LockGuard guard(&state.mutex);
+            for (size_t i = 0; i < state.ownerCount; ++i) {
+                if (state.closePending[i]) {
+                    closingOwner = state.owners[i];
+                    break;
+                }
+            }
+        }
+        if (closingOwner) {
+            // close() purges any writes that raced the disconnect but leaves
+            // the owner slot present until this control operation completes.
+            closingOwner->close();
+            concurrency::LockGuard guard(&state.mutex);
+            for (size_t i = 0; i < state.ownerCount; ++i) {
+                if (state.owners[i] == closingOwner) {
+                    state.closePending[i] = false;
+                    break;
+                }
+            }
+            continue;
+        }
+
+        PhoneAPI *owner = nullptr;
+        uint16_t length = 0;
+        uint8_t bytes[MAX_TO_FROM_RADIO_SIZE];
+
+        {
+            concurrency::LockGuard guard(&state.mutex);
+            if (state.count == 0)
+                return;
+
+            owner = state.entries[0].owner;
+            length = state.entries[0].length;
+            memcpy(bytes, state.entries[0].bytes, length);
+            for (size_t i = 1; i < state.count; ++i)
+                state.entries[i - 1] = state.entries[i];
+            state.entries[--state.count] = {};
+        }
+
+        if (owner)
+            (void)owner->handleToRadio(bytes, length);
+    }
 }
 
 void PhoneAPI::handleStartConfig()
@@ -358,6 +608,10 @@ void PhoneAPI::handleStartConfig()
 void PhoneAPI::close()
 {
     LOG_DEBUG("PhoneAPI::close()");
+    // A disconnect can be reported by a transport callback while copied
+    // writes are still waiting for MeshService::loop(). Do not carry those
+    // writes into a later connection using this same PhoneAPI object.
+    purgeForeignToRadioOwner(this, false);
     if (service->api_state == service->STATE_BLE && api_type == TYPE_BLE)
         service->api_state = service->STATE_DISCONNECTED;
     else if (service->api_state == service->STATE_WIFI && api_type == TYPE_WIFI)

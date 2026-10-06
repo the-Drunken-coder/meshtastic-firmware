@@ -12,9 +12,9 @@ class MeshPacketQueue
     size_t maxLen;
     std::vector<meshtastic_MeshPacket *> queue;
 
-    /** Replace a lower priority package in the queue with 'mp' (provided there are lower pri packages). Return true if replaced.
+    /** Remove a lower priority packet for 'mp'; return its ownership to the caller, or nullptr.
      */
-    bool replaceLowerPriorityPacket(meshtastic_MeshPacket *mp);
+    meshtastic_MeshPacket *removeLowerPriorityPacket(meshtastic_MeshPacket *mp);
 
   public:
     explicit MeshPacketQueue(size_t _maxLen);
@@ -22,7 +22,8 @@ class MeshPacketQueue
     /** enqueue a packet, return false if full
      * @param dropped Optional pointer to a bool that will be set to true if a packet was dropped
      */
-    bool enqueue(meshtastic_MeshPacket *p, bool *dropped = nullptr);
+    // With evicted supplied, the caller owns the victim and must finalize it before release.
+    bool enqueue(meshtastic_MeshPacket *p, bool *dropped = nullptr, meshtastic_MeshPacket **evicted = nullptr);
 
     /** return true if the queue is empty */
     bool empty();

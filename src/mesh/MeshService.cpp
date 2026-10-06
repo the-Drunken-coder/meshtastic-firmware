@@ -9,6 +9,7 @@
 #include "MeshService.h"
 #include "MessageStore.h"
 #include "NodeDB.h"
+#include "PhoneAPI.h"
 #include "Power.h"
 #include "PowerFSM.h"
 #include "TypeConversions.h"
@@ -136,6 +137,11 @@ int MeshService::handleFromRadio(const meshtastic_MeshPacket *mp)
 /// Do idle processing (mostly processing messages which have been queued from the radio)
 void MeshService::loop()
 {
+    // Foreign BLE/HTTP callbacks only copy ToRadio bytes into PhoneAPI's
+    // bounded handoff queue. Decode and route them on this owner thread so
+    // pending/retry state cannot be mutated concurrently with Router work.
+    PhoneAPI::drainForeignToRadio();
+
     if (lastQueueStatus.free == 0) { // check if there is now free space in TX queue
         meshtastic_QueueStatus qs = router->getQueueStatus();
         if (qs.free != lastQueueStatus.free)

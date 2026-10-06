@@ -167,8 +167,11 @@ class AuthPipelineRouter : public ReliableRouter
         auto *copy = packetPool.allocCopy(p);
         TEST_ASSERT_NOT_NULL(copy);
         const GlobalPacketId key(copy);
-        pending.emplace(key, PendingPacket(copy, NUM_INTERMEDIATE_RETX));
-        pending.at(key).nextTxMsec = nextTx;
+        pending.try_emplace(key, copy, NUM_INTERMEDIATE_RETX);
+        auto &record = pending.at(key);
+        record.nextTxMsec = nextTx;
+        record.waitingForAck = true;
+        record.hasTransmitted = true;
     }
     uint32_t pendingNextTx(NodeNum from, PacketId id)
     {
@@ -183,21 +186,24 @@ class AuthPipelineRouter : public ReliableRouter
     size_t pendingCount() const { return pending.size(); }
     void clearPending()
     {
-        for (auto &entry : pending)
-            packetPool.release(entry.second.packet);
-        pending.clear();
+        while (!pending.empty())
+            stopRetransmission(pending.begin()->first);
     }
 };
 
 class AuthPipelineRoutingModule : public RoutingModule
 {
   public:
-    void sendAckNak(meshtastic_Routing_Error, NodeNum, PacketId, ChannelIndex, uint8_t = 0, bool = false,
+    void sendAckNak(meshtastic_Routing_Error error, NodeNum, PacketId requestId, ChannelIndex, uint8_t = 0, bool = false,
                     const meshtastic_MeshPacket * = nullptr) override
     {
         ackCalls++;
+        lastError = error;
+        lastRequestId = requestId;
     }
     uint32_t ackCalls = 0;
+    meshtastic_Routing_Error lastError = meshtastic_Routing_Error_NONE;
+    PacketId lastRequestId = 0;
 };
 
 class AuthPipelineModule : public SinglePortModule
@@ -1658,7 +1664,7 @@ static void useDutyCycleSaturatedAirTime()
     saturated.logAirtime(TX_LOG, MS_IN_HOUR); // utilizationTXPercent() sums every bucket -> 100%
 }
 
-void test_C14_duty_cycle_limited_reliable_send_remains_pending(void)
+void test_C14_duty_cycle_limited_reliable_send_is_terminal(void)
 {
     config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_EU_868;
     config.lora.override_duty_cycle = false;
@@ -1674,8 +1680,12 @@ void test_C14_duty_cycle_limited_reliable_send_remains_pending(void)
     TEST_ASSERT_EQUAL(meshtastic_Routing_Error_DUTY_CYCLE_LIMIT, pipelineRouter->send(packet));
     TEST_ASSERT_EQUAL_UINT32_MESSAGE(1, pipelineRouting->ackCalls,
                                      "duty-cycle rejection must still notify the originating client");
-    TEST_ASSERT_EQUAL_UINT32_MESSAGE(1, pipelineRouter->pendingCount(),
-                                     "duty-cycle rejection must retain the retry for when airtime is available");
+    TEST_ASSERT_EQUAL(meshtastic_Routing_Error_DUTY_CYCLE_LIMIT, pipelineRouting->lastError);
+    TEST_ASSERT_EQUAL_HEX32(initial.id, pipelineRouting->lastRequestId);
+    TEST_ASSERT_EQUAL_UINT32(0, pipelineRadio->sendCalls);
+    // The real local NAK handler also retires this record. The mock does not dispatch that NAK;
+    // synchronous rejection must still leave no retry for an operation reported as rejected.
+    TEST_ASSERT_EQUAL_UINT32(0, pipelineRouter->pendingCount());
 
     config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_US;
     initRegion();
@@ -2505,7 +2515,7 @@ void setup()
     RUN_TEST(test_C11_malformed_pki_plaintext_has_no_pipeline_effects);
     RUN_TEST(test_C12_exact_authenticated_replay_reuses_verdict_without_collision_bypass);
     RUN_TEST(test_C13_failed_initial_reliable_send_does_not_retry);
-    RUN_TEST(test_C14_duty_cycle_limited_reliable_send_remains_pending);
+    RUN_TEST(test_C14_duty_cycle_limited_reliable_send_is_terminal);
     RUN_TEST(test_C15_reliable_unicast_tracks_five_total_attempts);
     RUN_TEST(test_C16_reliable_broadcast_keeps_three_total_attempts);
     RUN_TEST(test_C17_colliding_channel_hash_foreign_broadcast_is_relay_only);

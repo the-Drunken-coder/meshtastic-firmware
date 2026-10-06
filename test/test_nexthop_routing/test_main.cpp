@@ -101,6 +101,8 @@ class NextHopRouterTestShim : public NextHopRouter
     using NextHopRouter::relayOpaquePacket;
     using Router::shouldDecrementHopLimit; // protected in Router
 
+    size_t pendingCountForTest() const { return pending.size(); }
+
     PendingPacket *trackForTest(const meshtastic_MeshPacket &packet, uint8_t totalAttempts)
     {
         auto *copy = packetPool.allocCopy(packet);
@@ -112,7 +114,12 @@ class NextHopRouterTestShim : public NextHopRouter
     {
         auto *copy = packetPool.allocCopy(packet);
         TEST_ASSERT_NOT_NULL(copy);
-        return startRetransmission(copy);
+        auto *entry = startRetransmission(copy);
+        // The retry-count tests seed a packet whose initial TX already completed; retries begin
+        // in the ACK-waiting phase so TX completion, not queue waiting, advances the budget.
+        entry->waitingForAck = true;
+        entry->hasTransmitted = true;
+        return entry;
     }
 
     bool stopForTest(NodeNum from, PacketId id) { return stopRetransmission(from, id); }
@@ -137,6 +144,8 @@ class NextHopRouterTestShim : public NextHopRouter
         TEST_ASSERT_NOT_NULL(entry);
         TEST_ASSERT_GREATER_THAN_UINT8(0, entry->numRetransmissions);
         --entry->numRetransmissions;
+        entry->hasTransmitted = true;
+        entry->waitingForAck = true;
     }
 
     bool filterViaFlooding(const meshtastic_MeshPacket *p) { return FloodingRouter::shouldFilterReceived(p); }
@@ -160,17 +169,56 @@ class NextHopRouterTestShim : public NextHopRouter
 class MockRadioInterface : public RadioInterface
 {
   public:
+    ~MockRadioInterface() override
+    {
+        for (auto *p : queuedPackets)
+            packetPool.release(p);
+    }
+
     ErrorCode send(meshtastic_MeshPacket *p) override
     {
         sendCount++;
         lastHopLimit = p->hop_limit;
         lastHopStart = p->hop_start;
         sentNextHops.push_back(p->next_hop);
-        if (declineAll || p->to == NODENUM_BROADCAST_NO_LORA)
-            return ERRNO_SHOULD_RELEASE;
+        if (deferTransmissions) {
+            queuedPackets.push_back(p);
+            return ERRNO_OK;
+        }
 
+        const uint32_t generation = notifyTxStarted(p);
+        if (declineAll || p->to == NODENUM_BROADCAST_NO_LORA) {
+            notifyTxFinished(p, TxState::Rejected, generation);
+            return ERRNO_SHOULD_RELEASE;
+        }
+
+        notifyTxFinished(p, TxState::Sent, generation);
         packetPool.release(p);
         return ERRNO_OK;
+    }
+
+    bool findInTxQueue(NodeNum from, PacketId id) override
+    {
+        for (const auto *p : queuedPackets) {
+            if (getFrom(p) == from && p->id == id)
+                return true;
+        }
+        return false;
+    }
+
+    bool removePendingTXPacket(NodeNum from, PacketId id, uint32_t hopLimitLt) override
+    {
+        for (auto it = queuedPackets.begin(); it != queuedPackets.end(); ++it) {
+            auto *p = *it;
+            if (getFrom(p) != from || p->id != id || (hopLimitLt && p->hop_limit >= hopLimitLt))
+                continue;
+
+            queuedPackets.erase(it);
+            notifyTxFinished(p, TxState::Cancelled);
+            packetPool.release(p);
+            return true;
+        }
+        return false;
     }
 
     uint32_t getPacketTime(uint32_t totalPacketLen, bool received = false) override
@@ -189,9 +237,11 @@ class MockRadioInterface : public RadioInterface
     int sendCount = 0;
     uint32_t cancelCount = 0;
     bool declineAll = false;
+    bool deferTransmissions = false;
     uint8_t lastHopLimit = 0;
     uint8_t lastHopStart = 0;
     std::vector<uint8_t> sentNextHops;
+    std::vector<meshtastic_MeshPacket *> queuedPackets;
 };
 
 class CaptureRadioInterface : public RadioInterface
@@ -200,6 +250,8 @@ class CaptureRadioInterface : public RadioInterface
     ErrorCode send(meshtastic_MeshPacket *p) override
     {
         sentPackets.push_back(*p);
+        const uint32_t generation = notifyTxStarted(p);
+        notifyTxFinished(p, TxState::Sent, generation);
         packetPool.release(p);
         return ERRNO_OK;
     }
@@ -248,6 +300,12 @@ class ReliableRouterTestShim : public ReliableRouter
         auto *copy = packetPool.allocCopy(p);
         TEST_ASSERT_NOT_NULL(copy);
         startRetransmission(copy, attempts);
+        auto *record = findPendingPacket(p.from, p.id);
+        TEST_ASSERT_NOT_NULL(record);
+        // This helper represents a packet that already completed one physical TX; no queue
+        // reservation is part of these seeded reliability tests.
+        record->waitingForAck = true;
+        record->hasTransmitted = true;
     }
 
     void makeRetryDue(NodeNum from, PacketId id)
@@ -906,7 +964,7 @@ void test_implicit_ack_ignores_foreign_pkt(void)
     reliableShim->clearPendingForTest();
 }
 
-void test_pending_does_not_cancel_radio_queue_before_first_retry(void)
+void test_pending_cancels_radio_queue_before_first_retry(void)
 {
     MockRadioInterface *mockIface = installMockIface();
     meshtastic_MeshPacket p = makeRebroadcastCandidate(0x33333333);
@@ -914,8 +972,11 @@ void test_pending_does_not_cancel_radio_queue_before_first_retry(void)
     p.id = 0x51000001;
     shim->trackForTest(p, 5);
 
+    // startRetransmission clears any stale same-key physical copy before registering this record.
+    TEST_ASSERT_EQUAL_UINT32(1, mockIface->cancelCount);
+    mockIface->cancelCount = 0;
     TEST_ASSERT_TRUE(shim->stopForTest(kLocalNode, p.id));
-    TEST_ASSERT_EQUAL_UINT32(0, mockIface->cancelCount);
+    TEST_ASSERT_EQUAL_UINT32(1, mockIface->cancelCount);
 }
 
 void test_pending_cancels_radio_queue_after_first_retry_for_any_budget(void)
@@ -927,6 +988,8 @@ void test_pending_cancels_radio_queue_after_first_retry_for_any_budget(void)
     shim->trackForTest(p, 5);
     shim->markOneRetryFiredForTest(kLocalNode, p.id);
 
+    TEST_ASSERT_EQUAL_UINT32(1, mockIface->cancelCount);
+    mockIface->cancelCount = 0;
     TEST_ASSERT_TRUE(shim->stopForTest(kLocalNode, p.id));
     TEST_ASSERT_EQUAL_UINT32(1, mockIface->cancelCount);
 }
@@ -967,6 +1030,11 @@ void test_intermediate_three_attempts_preserve_record_and_flood_last(void)
     TEST_ASSERT_EQUAL_PTR(trackedPacket, shim->pendingPacketForTest(p.from, p.id));
 
     shim->fireNextRetryForTest(p.from, p.id);
+    // The first completed TX is observed on this pass and starts the ACK deadline. It does not
+    // consume a retry or enqueue a second physical copy until that deadline expires.
+    TEST_ASSERT_EQUAL_UINT32(1, mockIface->sentNextHops.size());
+
+    shim->fireNextRetryForTest(p.from, p.id);
     TEST_ASSERT_EQUAL_UINT32(2, mockIface->sentNextHops.size());
     TEST_ASSERT_EQUAL_HEX8(NO_NEXT_HOP_PREFERENCE, mockIface->sentNextHops[1]);
     TEST_ASSERT_TRUE(shim->stopForTest(p.from, p.id));
@@ -989,6 +1057,41 @@ void test_early_flood_preserves_fresh_verified_route(void)
     TEST_ASSERT_EQUAL_UINT32(1, mockIface->sentNextHops.size());
     TEST_ASSERT_EQUAL_HEX8(0xAB, mockIface->sentNextHops[0]);
     TEST_ASSERT_TRUE(shim->stopForTest(p.from, p.id));
+}
+
+// An authenticated higher-hop duplicate may replace the queued copy of a relayed packet. The
+// replacement is the same logical (from,id) packet, so stopping the old pending record must leave
+// the new relay free to register its own physical queue entry.
+void test_authenticated_higher_hop_replaces_queued_pending_relay(void)
+{
+    MockRadioInterface *mockIface = installMockIface();
+    mockIface->deferTransmissions = true;
+    constexpr NodeNum destination = 0x33333333;
+    mockNodeDB->addNode(destination, 2, true, 60, meshtastic_Config_DeviceConfig_Role_CLIENT, false, false, 0xAB);
+    mockNodeDB->addNode(0x000007AB, 0, true, 60);
+
+    auto lower = makeBehaviorPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kRemoteNode, destination, 1);
+    lower.id = 0x51530006;
+    lower.hop_start = 3;
+    lower.hop_limit = 2;
+    lower.relay_node = 0x44;
+    lower.next_hop = nodeDB->getLastByteOfNodeNum(kLocalNode);
+
+    TEST_ASSERT_TRUE(shim->perhapsRebroadcast(&lower));
+    TEST_ASSERT_EQUAL_UINT32(1, mockIface->sendCount);
+    TEST_ASSERT_EQUAL_UINT32(1, mockIface->queuedPackets.size());
+    TEST_ASSERT_EQUAL_UINT32(1, shim->pendingCountForTest());
+
+    auto upgraded = lower;
+    upgraded.hop_start = 3;
+    upgraded.hop_limit = 3;
+    TEST_ASSERT_EQUAL(static_cast<int>(RoutingAuthVerdict::ACCEPT), static_cast<int>(passesRoutingAuthGate(&upgraded)));
+
+    TEST_ASSERT_TRUE(shim->filterViaNextHop(&upgraded));
+    TEST_ASSERT_EQUAL_UINT32(2, mockIface->sendCount);
+    TEST_ASSERT_EQUAL_UINT32(1, mockIface->queuedPackets.size());
+    TEST_ASSERT_EQUAL_UINT32(1, shim->pendingCountForTest());
+    TEST_ASSERT_EQUAL_UINT8(2, mockIface->queuedPackets.front()->hop_limit);
 }
 
 // Control: proves the NO_LORA case below turns on the `to` field alone.
@@ -1159,11 +1262,12 @@ void setup()
     printf("\n=== pending retransmission bookkeeping ===\n");
     RUN_TEST(test_implicit_ack_for_opaque_own_packet);
     RUN_TEST(test_implicit_ack_ignores_foreign_pkt);
-    RUN_TEST(test_pending_does_not_cancel_radio_queue_before_first_retry);
+    RUN_TEST(test_pending_cancels_radio_queue_before_first_retry);
     RUN_TEST(test_pending_cancels_radio_queue_after_first_retry_for_any_budget);
     RUN_TEST(test_directed_hop_tracks_three_total_attempts);
     RUN_TEST(test_intermediate_three_attempts_preserve_record_and_flood_last);
     RUN_TEST(test_early_flood_preserves_fresh_verified_route);
+    RUN_TEST(test_authenticated_higher_hop_replaces_queued_pending_relay);
 
     printf("\n=== rebroadcast of NODENUM_BROADCAST_NO_LORA ===\n");
     RUN_TEST(test_rebroadcast_normal_broadcast_is_relayed);

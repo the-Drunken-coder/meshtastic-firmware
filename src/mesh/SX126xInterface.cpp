@@ -410,7 +410,7 @@ template <typename T> int16_t SX126xInterface<T>::trySetStandby()
     isReceiving = false; // If we were receiving, not any more
     activeReceiveStart = 0;
     disableInterrupt();
-    completeSending(); // If we were sending, not anymore
+    completeSending(false); // Forced standby aborts an incomplete transmission.
     RadioLibInterface::setStandby();
     return err;
 }

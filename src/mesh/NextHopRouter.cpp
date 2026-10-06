@@ -26,6 +26,21 @@ static void capEventRelayHops(meshtastic_MeshPacket *packet)
 
 NextHopRouter::NextHopRouter() {}
 
+NextHopRouter::~NextHopRouter()
+{
+    while (!pending.empty())
+        stopRetransmission(pending.begin()->first);
+}
+
+bool NextHopRouter::onRadioSend(meshtastic_MeshPacket *p)
+{
+    auto *entry = findPendingPacket(getFrom(p), p->id);
+    if (!entry || entry->radioCandidate != p)
+        return true;
+    entry->radioCandidate = nullptr;
+    return iface->trackTx(entry->txAttempt, p);
+}
+
 bool NextHopRouter::relayOpaquePacket(const meshtastic_MeshPacket *p)
 {
     // Opaque traffic is never admitted to PacketHistory, NodeDB, modules, phone, MQTT, or ACK
@@ -107,6 +122,12 @@ PendingPacket::PendingPacket(meshtastic_MeshPacket *p, uint8_t numRetransmission
  */
 ErrorCode NextHopRouter::send(meshtastic_MeshPacket *p)
 {
+    const GlobalPacketId key(p);
+    auto *record = findPendingPacket(key);
+    if ((record && record->radioCandidate != p) || (iface && iface->hasActiveTx(key.node, key.id))) {
+        packetPool.release(p);
+        return meshtastic_Routing_Error_BAD_REQUEST;
+    }
     return sendWithNextHop(p, true);
 }
 
@@ -124,10 +145,14 @@ ErrorCode NextHopRouter::sendWithNextHop(meshtastic_MeshPacket *p, bool trackRet
     if (trackRetransmission && (!isFromUs(p) || !p->want_ack) && p->next_hop != NO_NEXT_HOP_PREFERENCE &&
         (p->hop_limit > 0 || p->want_ack)) {
         if (auto *copy = packetPool.allocCopy(*p))
-            startRetransmission(copy); // start retransmission for relayed packet
+            startRetransmission(copy, NUM_INTERMEDIATE_RETX, p); // start retransmission for relayed packet
     }
 
-    return Router::send(p);
+    const GlobalPacketId key(p);
+    const auto result = Router::send(p);
+    if (trackRetransmission && result != ERRNO_OK)
+        stopRetransmission(key);
+    return result;
 }
 
 bool NextHopRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
@@ -389,10 +414,10 @@ PendingPacket *NextHopRouter::findPendingPacket(GlobalPacketId key)
 /**
  * Stop any retransmissions we are doing of the specified node/packet ID pair
  */
-bool NextHopRouter::stopRetransmission(NodeNum from, PacketId id)
+bool NextHopRouter::stopRetransmission(NodeNum from, PacketId id, bool preserveFirstQueued)
 {
     auto key = GlobalPacketId(from, id);
-    return stopRetransmission(key);
+    return stopRetransmission(key, preserveFirstQueued);
 }
 
 bool NextHopRouter::roleAllowsCancelingFromTxQueue(const meshtastic_MeshPacket *p)
@@ -404,20 +429,16 @@ bool NextHopRouter::roleAllowsCancelingFromTxQueue(const meshtastic_MeshPacket *
     return roleAllowsCancelingDupe(p); // same logic as FloodingRouter::roleAllowsCancelingDupe
 }
 
-bool NextHopRouter::stopRetransmission(GlobalPacketId key)
+bool NextHopRouter::stopRetransmission(GlobalPacketId key, bool preserveFirstQueued)
 {
     auto old = findPendingPacket(key);
     if (old) {
         auto p = old->packet;
-        /* Only when we already transmitted a packet via LoRa, we will cancel the packet in the Tx queue
-          to avoid canceling a transmission if it was ACKed super fast via MQTT */
-        if (old->numRetransmissions < old->initialNumRetransmissions) {
-            // We only cancel it if we are the original sender or if we're not a router(_late)
-            if (isFromUs(p) || roleAllowsCancelingFromTxQueue(p)) {
-                // remove the 'original' (identified by originator and packet->id) from the txqueue and free it
-                cancelSending(getFrom(p), p->id);
-            }
-        }
+        const auto status = iface->getTxStatus(old->txAttempt);
+        const bool transmitted = old->hasTransmitted || status.state == RadioInterface::TxState::Sent;
+        iface->stopTrackingTx(old->txAttempt);
+        if ((!preserveFirstQueued || transmitted) && (isFromUs(p) || roleAllowsCancelingFromTxQueue(p)))
+            cancelSending(getFrom(p), p->id);
 
         // Regardless of whether or not we canceled this packet from the txQueue, remove it from our pending list so it
         // doesn't get scheduled again. (This is the core of stopRetransmission.)
@@ -436,129 +457,174 @@ bool NextHopRouter::stopRetransmission(GlobalPacketId key)
 /**
  * Add p to the list of packets to retransmit occasionally.  We will free it once we stop retransmitting.
  */
-PendingPacket *NextHopRouter::startRetransmission(meshtastic_MeshPacket *p, uint8_t numReTx)
+PendingPacket *NextHopRouter::startRetransmission(meshtastic_MeshPacket *p, uint8_t numReTx,
+                                                  const meshtastic_MeshPacket *radioCandidate)
 {
     auto id = GlobalPacketId(p);
-    auto rec = PendingPacket(p, numReTx);
-
     stopRetransmission(getFrom(p), p->id);
-
-    setNextTx(&rec);
-    pending[id] = rec;
-
-    return &pending[id];
+    // An MQTT ACK may have retired a prior record while retaining its first RF copy.
+    cancelSending(getFrom(p), p->id);
+    auto [it, inserted] = pending.try_emplace(id, p, numReTx);
+    assert(inserted);
+    auto &record = it->second;
+    record.radioCandidate = radioCandidate;
+    record.queueDeadlineMsec = Time::getMillis() + TX_QUEUE_WAIT_MSEC;
+    record.nextTxMsec = Time::getMillis();
+    setReceivedMessage();
+    return &record;
 }
 
 /**
  * Do any retransmissions that are scheduled (FIXME - for the time being called from loop)
  */
-int32_t NextHopRouter::doRetransmissions()
+void NextHopRouter::failRetransmission(GlobalPacketId key, meshtastic_Routing_Error error)
 {
-    // Same clock Throttle reads, so setNextTx() deadlines and this test can't diverge under an
-    // injected test clock.
-    uint32_t now = Time::stampMillis();
-    int32_t d = INT32_MAX;
+    auto *entry = findPendingPacket(key);
+    if (!entry)
+        return;
+    if (isFromUs(entry->packet))
+        sendAckNak(error, key.node, key.id, entry->packet->channel);
+    cancelSending(key.node, key.id);
+    stopRetransmission(key);
+}
 
-    // FIXME, we should use a better datastructure rather than walking through this map.
-    // for(auto el: pending) {
-    for (auto it = pending.begin(), nextIt = it; it != pending.end(); it = nextIt) {
-        ++nextIt; // we use this odd pattern because we might be deleting it...
-        auto &p = it->second;
+void NextHopRouter::observeTxCompletion(PendingPacket &record)
+{
+    if (record.waitingForAck)
+        return;
+    const auto status = iface->getTxStatus(record.txAttempt);
+    if (status.state != RadioInterface::TxState::Sent)
+        return;
+    iface->stopTrackingTx(record.txAttempt);
+    if (record.hasTransmitted)
+        --record.numRetransmissions;
+    record.hasTransmitted = true;
+    record.waitingForAck = true;
+    record.txFailures = 0;
+    record.nextTxMsec = status.completedAtMsec + iface->getRetransmissionMsec(record.packet) + record.ackAirtimeMsec;
+    record.ackAirtimeMsec = 0;
+}
 
-        bool stillValid = true; // assume we'll keep this record around
+void NextHopRouter::extendAckWait(PendingPacket &record, uint32_t airtimeMsec)
+{
+    // RX/local dispatch can run before the next retry pass observes TX_DONE.
+    observeTxCompletion(record);
+    if (record.waitingForAck)
+        record.nextTxMsec += airtimeMsec;
+    else if (iface->getTxStatus(record.txAttempt).state == RadioInterface::TxState::Transmitting)
+        record.ackAirtimeMsec += airtimeMsec;
+}
 
-        // Judged against the snapshot above, so one pass sees one instant and the 49.7 day wrap
-        // can't stall retransmission.
-        if (Throttle::deadlinePassedAt(now, p.nextTxMsec)) {
-            if (p.numRetransmissions == 0) {
-                if (isFromUs(p.packet)) {
-                    LOG_DEBUG("Reliable send failed, return nak fr=0x%08x,to=0x%08x,id=0x%08x", p.packet->from, p.packet->to,
-                              p.packet->id);
-                    sendAckNak(meshtastic_Routing_Error_MAX_RETRANSMIT, getFrom(p.packet), p.packet->id, p.packet->channel);
-                }
-                // Note: we don't stop retransmission here, instead the Nak packet gets processed in sniffReceived
-                stopRetransmission(it->first);
-                stillValid = false; // just deleted it
-            } else {
-                LOG_DEBUG("Send retransmission fr=0x%08x,to=0x%08x,id=0x%08x, tries left=%d", p.packet->from, p.packet->to,
-                          p.packet->id, p.numRetransmissions);
-
-                if (!isBroadcast(p.packet->to)) {
-                    if (p.numRetransmissions == 1) {
-                        // Last retransmission: this directed delivery went un-ACKed. Record the failure
-                        // (M3 - accumulates across DMs to age out a flapping/dead route) and reset
-                        // next_hop so the final try falls back to FloodingRouter.
-                        noteRouteFailure(p.packet->to);
-                        p.packet->next_hop = NO_NEXT_HOP_PREFERENCE;
-                        // Also reset it in the nodeDB
-                        meshtastic_NodeInfoLite *sentTo = nodeDB->getMeshNode(p.packet->to);
-                        if (sentTo) {
-                            LOG_INFO("Reset next hop for dest 0x%08x", p.packet->to);
-                            sentTo->next_hop = NO_NEXT_HOP_PREFERENCE;
-                        }
-#if HAS_TRAFFIC_MANAGEMENT
-                        if (trafficManagementModule) {
-                            trafficManagementModule->clearNextHop(p.packet->to);
-                        }
-#endif
-                        if (auto *copy = packetPool.allocCopy(*p.packet)) {
-                            if (FloodingRouter::send(copy) == ERRNO_SHOULD_RELEASE)
-                                packetPool.release(copy);
-                        }
-                    } else {
-#if NEXTHOP_EARLY_FLOOD_ON_UNVERIFIED
-                        // M4 (gated): if the route isn't proven healthy, don't spend a second directed
-                        // attempt - start flooding one retry sooner to cut recovery latency. A verified
-                        // route (fresh, zero recent failures) keeps the unchanged directed-retry path so
-                        // the sparse-mesh happy path is untouched.
-                        RouteHealth *h = findRouteHealth(p.packet->to);
-                        bool verified = h && h->consecutiveFailures == 0 && !isRouteStale(*h, now);
-                        if (!verified) {
-                            p.packet->next_hop = NO_NEXT_HOP_PREFERENCE;
-                            meshtastic_NodeInfoLite *sentTo = nodeDB->getMeshNode(p.packet->to);
-                            if (sentTo)
-                                sentTo->next_hop = NO_NEXT_HOP_PREFERENCE;
-                            if (auto *copy = packetPool.allocCopy(*p.packet)) {
-                                if (FloodingRouter::send(copy) == ERRNO_SHOULD_RELEASE)
-                                    packetPool.release(copy);
-                            }
-                        } else {
-                            if (auto *copy = packetPool.allocCopy(*p.packet)) {
-                                if (sendWithNextHop(copy, false) == ERRNO_SHOULD_RELEASE)
-                                    packetPool.release(copy);
-                            }
-                        }
-#else
-                        if (auto *copy = packetPool.allocCopy(*p.packet)) {
-                            if (sendWithNextHop(copy, false) == ERRNO_SHOULD_RELEASE)
-                                packetPool.release(copy);
-                        }
-#endif
-                    }
-                } else {
-                    // Note: we call the superclass version because we don't want to have our version of send() add a new
-                    // retransmission record
-                    if (auto *copy = packetPool.allocCopy(*p.packet)) {
-                        if (FloodingRouter::send(copy) == ERRNO_SHOULD_RELEASE)
-                            packetPool.release(copy);
-                    }
-                }
-
-                // Queue again
-                --p.numRetransmissions;
-                setNextTx(&p);
+int32_t NextHopRouter::processRetransmission(GlobalPacketId key, uint32_t now)
+{
+    auto *entry = findPendingPacket(key);
+    if (!entry)
+        return INT32_MAX;
+    using TxState = RadioInterface::TxState;
+    observeTxCompletion(*entry);
+    auto status = iface->getTxStatus(entry->txAttempt);
+    if (!entry->waitingForAck) {
+        if (status.state == TxState::Transmitting) {
+            return 1000; // The driver owns completion/recovery; queue timeouts cannot cancel in-flight TX.
+        } else {
+            if (status.state == TxState::Cancelled) {
+                stopRetransmission(key);
+                return INT32_MAX;
             }
-        }
-
-        if (stillValid) {
-            // Update our desired sleep delay
-            int32_t t = p.nextTxMsec - now;
-
-            d = min(t, d);
+            if (status.state == TxState::Failed || status.state == TxState::Dropped || status.state == TxState::Rejected) {
+                iface->stopTrackingTx(entry->txAttempt);
+                if (status.state == TxState::Failed && ++entry->txFailures >= MAX_TX_FAILURES) {
+                    failRetransmission(key, meshtastic_Routing_Error_NO_INTERFACE);
+                    return INT32_MAX;
+                }
+                if (status.state == TxState::Failed) {
+                    // Radio failure owns this outcome even if TX ended after its old queue deadline.
+                    entry->queueDeadlineMsec = now + TX_QUEUE_WAIT_MSEC;
+                    entry->ackAirtimeMsec = 0;
+                }
+                entry->nextTxMsec = status.completedAtMsec + TX_FAILURE_BACKOFF_MSEC;
+                status.state = TxState::Untracked;
+            }
+            if (Throttle::deadlinePassedAt(now, entry->queueDeadlineMsec)) {
+                cancelSending(key.node, key.id);
+                // Honor a concurrent physical completion instead of reporting a queue timeout.
+                const auto latest = iface->getTxStatus(entry->txAttempt);
+                if (latest.state == TxState::Sent || latest.state == TxState::Transmitting || latest.state == TxState::Failed)
+                    return processRetransmission(key, now);
+                failRetransmission(key, meshtastic_Routing_Error_TIMEOUT);
+                return INT32_MAX;
+            }
+            if (status.state == TxState::Queued)
+                return entry->queueDeadlineMsec - now;
+            if (!Throttle::deadlinePassedAt(now, entry->nextTxMsec))
+                return min(entry->queueDeadlineMsec - now, entry->nextTxMsec - now);
         }
     }
 
-    return d;
+    if (entry->waitingForAck) {
+        if (!Throttle::deadlinePassedAt(now, entry->nextTxMsec))
+            return entry->nextTxMsec - now;
+        if (entry->numRetransmissions == 0) {
+            failRetransmission(key, meshtastic_Routing_Error_MAX_RETRANSMIT);
+            return INT32_MAX;
+        }
+        if (!isBroadcast(entry->packet->to) && entry->numRetransmissions == 1) {
+            noteRouteFailure(entry->packet->to);
+            entry->packet->next_hop = NO_NEXT_HOP_PREFERENCE;
+            if (auto *node = nodeDB->getMeshNode(entry->packet->to))
+                node->next_hop = NO_NEXT_HOP_PREFERENCE;
+#if HAS_TRAFFIC_MANAGEMENT
+            if (trafficManagementModule)
+                trafficManagementModule->clearNextHop(entry->packet->to);
+#endif
+        }
+        entry->waitingForAck = false;
+        entry->queueDeadlineMsec = now + TX_QUEUE_WAIT_MSEC;
+    }
+
+    auto *copy = packetPool.allocCopy(*entry->packet);
+    if (!copy) {
+        failRetransmission(key, meshtastic_Routing_Error_TIMEOUT);
+        return INT32_MAX;
+    }
+    bool flood = isBroadcast(copy->to) || entry->numRetransmissions == 1;
+#if NEXTHOP_EARLY_FLOOD_ON_UNVERIFIED
+    if (!isBroadcast(copy->to) && !flood) {
+        const auto *health = findRouteHealth(copy->to);
+        flood = !health || health->consecutiveFailures != 0 || isRouteStale(*health, now);
+        if (flood) {
+            entry->packet->next_hop = NO_NEXT_HOP_PREFERENCE;
+            copy->next_hop = NO_NEXT_HOP_PREFERENCE;
+            if (auto *node = nodeDB->getMeshNode(copy->to))
+                node->next_hop = NO_NEXT_HOP_PREFERENCE;
+        }
+    }
+#endif
+    entry->radioCandidate = copy;
+    const auto result = flood ? FloodingRouter::send(copy) : sendWithNextHop(copy, false);
+    if (result == ERRNO_SHOULD_RELEASE)
+        packetPool.release(copy);
+    // SimRadio can synchronously deliver an ACK while send() is still on the stack.
+    entry = findPendingPacket(key);
+    if (!entry)
+        return INT32_MAX;
+    if (result != ERRNO_OK && (result != ERRNO_UNKNOWN || iface->getTxStatus(entry->txAttempt).state != TxState::Rejected)) {
+        stopRetransmission(key);
+        return INT32_MAX;
+    }
+    return min(TX_FAILURE_BACKOFF_MSEC, entry->queueDeadlineMsec - now);
+}
+
+int32_t NextHopRouter::doRetransmissions()
+{
+    const uint32_t now = Time::getMillis();
+    int32_t delay = INT32_MAX;
+    for (auto it = pending.begin(); it != pending.end();) {
+        const auto key = it->first;
+        delay = min(delay, processRetransmission(key, now));
+        it = pending.upper_bound(key);
+    }
+    return delay;
 }
 
 void NextHopRouter::setNextTx(PendingPacket *pending)

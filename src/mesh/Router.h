@@ -48,6 +48,8 @@ class Router : protected concurrency::OSThread, protected PacketHistory
 
   protected:
     std::unique_ptr<RadioInterface> iface = nullptr;
+    // Reserve only radio handoffs; earlier send failures are returned synchronously to the caller.
+    virtual bool onRadioSend(meshtastic_MeshPacket *p) { return true; }
 
   public:
     /**

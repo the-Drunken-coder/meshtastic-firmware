@@ -262,7 +262,11 @@ static bool handleToRadio(IStreamReadWrite &client, const Request &req)
         return false;
     }
 
-    webAPI.handleToRadio(buf, got);
+    if (!webAPI.enqueueToRadio(buf, got)) {
+        LOG_WARN("Reject Ethernet HTTP ToRadio packet: owner-thread queue unavailable");
+        sendError(client, 503, "Service Unavailable", "ToRadio queue is full");
+        return false;
+    }
 
     // Echo the bytes back, matching mesh/http ESP32 semantics.
     writeStatusLine(client, 200, "OK");

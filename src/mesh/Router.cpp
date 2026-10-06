@@ -616,6 +616,10 @@ ErrorCode Router::send(meshtastic_MeshPacket *p)
     }
 
     assert(iface); // This should have been detected already in sendLocal (or we just received a packet from outside)
+    if (!onRadioSend(p)) {
+        packetPool.release(p);
+        return ERRNO_UNKNOWN;
+    }
     return iface->send(p);
 }
 

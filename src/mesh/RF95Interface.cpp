@@ -323,13 +323,14 @@ void RF95Interface::addReceiveMetadata(meshtastic_MeshPacket *mp)
 
 int16_t RF95Interface::trySetStandby()
 {
+    checkNotification(); // Consume a latched TX_DONE before treating remaining TX as aborted.
     int16_t err = lora->standby();
     if (err != RADIOLIB_ERR_NONE)
         LOG_ERROR("RF95 standby %s%d", radioLibErr, err);
 
     isReceiving = false; // If we were receiving, not any more
     disableInterrupt();
-    completeSending(); // If we were sending, not anymore
+    completeSending(false); // Forced standby aborts an incomplete transmission.
     RadioLibInterface::setStandby();
     return err;
 }

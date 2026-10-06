@@ -62,6 +62,7 @@ class FloodingRouter : public Router
      * @return true if we handled it (so stop processing)
      */
     bool perhapsHandleUpgradedPacket(const meshtastic_MeshPacket *p);
+    virtual void onQueuedPacketReplaced(NodeNum from, PacketId id) {}
 
     /* Call when we receive a packet that needs some reprocessing, but afterwards should be filtered */
     bool reprocessPacket(const meshtastic_MeshPacket *p);

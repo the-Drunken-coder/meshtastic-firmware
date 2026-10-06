@@ -6,12 +6,15 @@
 
 #include "MeshTypes.h" // before TestUtil.h: provides NodeNum etc.
 #include "TestUtil.h"
+#include <array>
 #include <unity.h>
 
+#include "UptimeClock.h"
 #include "airtime.h"
 #include "configuration.h"
 #include "gps/RTC.h"
 #include "mesh/Channels.h"
+#include "mesh/MeshPacketQueue.h"
 #include "mesh/NodeDB.h"
 #include "mesh/RadioInterface.h"
 #include "mesh/ReliableRouter.h"
@@ -88,13 +91,24 @@ class ReliableRouterTestShim : public ReliableRouter
     {
         auto *copy = packetPool.allocCopy(p);
         TEST_ASSERT_NOT_NULL(copy);
-        startRetransmission(copy, attempts);
+        auto *entry = startRetransmission(copy, attempts);
+        TEST_ASSERT_NOT_NULL(entry);
+        // These fixtures represent a packet that has already crossed the radio boundary. They do
+        // not enqueue a physical packet, so make the ACK-wait state explicit instead of relying on
+        // the production queue lifecycle.
+        entry->waitingForAck = true;
+        entry->hasTransmitted = true;
+        setNextTx(entry);
     }
 
     void sniffForTest(const meshtastic_MeshPacket *p, const meshtastic_Routing *routing)
     {
         ReliableRouter::sniffReceived(p, routing);
     }
+
+    int32_t runDueRetries() { return doRetransmissions(); }
+
+    bool stopForTest(NodeNum from, PacketId id) { return stopRetransmission(from, id); }
 
     bool filterForTest(const meshtastic_MeshPacket *p) { return ReliableRouter::shouldFilterReceived(p); }
 
@@ -112,6 +126,27 @@ class ReliableRouterTestShim : public ReliableRouter
         PendingPacket *entry = findPendingPacket(from, id);
         TEST_ASSERT_NOT_NULL(entry);
         return entry->packet;
+    }
+
+    uint8_t pendingRetries(NodeNum from, PacketId id)
+    {
+        PendingPacket *entry = findPendingPacket(from, id);
+        TEST_ASSERT_NOT_NULL(entry);
+        return entry->numRetransmissions;
+    }
+
+    bool pendingWaitsForAck(NodeNum from, PacketId id)
+    {
+        PendingPacket *entry = findPendingPacket(from, id);
+        TEST_ASSERT_NOT_NULL(entry);
+        return entry->waitingForAck;
+    }
+
+    bool pendingRadioCandidateIsClear(NodeNum from, PacketId id)
+    {
+        PendingPacket *entry = findPendingPacket(from, id);
+        TEST_ASSERT_NOT_NULL(entry);
+        return entry->radioCandidate == nullptr;
     }
 
     void clearPendingForTest()
@@ -134,21 +169,48 @@ class TimedCaptureRadio : public RadioInterface
   public:
     ErrorCode send(meshtastic_MeshPacket *p) override
     {
+        if (deferTransmissions) {
+            bool dropped = false;
+            meshtastic_MeshPacket *evicted = nullptr;
+            if (!txQueue.enqueue(p, &dropped, &evicted)) {
+                notifyTxFinished(p, TxState::Rejected);
+                packetPool.release(p);
+                return ERRNO_UNKNOWN;
+            }
+            if (evicted) {
+                notifyTxFinished(evicted, TxState::Dropped);
+                packetPool.release(evicted);
+            }
+            return ERRNO_OK;
+        }
+
         sentPackets.push_back(*p);
+        const uint32_t generation = notifyTxStarted(p);
+        notifyTxFinished(p, TxState::Sent, generation);
         packetPool.release(p);
         return ERRNO_OK;
     }
 
     bool cancelSending(NodeNum from, PacketId id) override
     {
-        (void)from;
-        (void)id;
+        if (deferTransmissions) {
+            auto *p = txQueue.remove(from, id);
+            if (p) {
+                notifyTxFinished(p, TxState::Cancelled);
+                packetPool.release(p);
+            }
+            return p != nullptr;
+        }
+
         cancelCount++;
         return false;
     }
 
     bool findInTxQueue(NodeNum from, PacketId id) override
     {
+        if (deferTransmissions)
+            return txQueue.find(from, id);
+
         (void)from;
         (void)id;
         return false;
@@ -163,14 +225,56 @@ class TimedCaptureRadio : public RadioInterface
 
     void reset()
     {
+        while (auto *p = txQueue.dequeue()) {
+            notifyTxFinished(p, TxState::Cancelled);
+            packetPool.release(p);
+        }
+        if (transmitting) {
+            notifyTxFinished(transmitting, TxState::Cancelled, transmitGeneration);
+            packetPool.release(transmitting);
+            transmitting = nullptr;
+            transmitGeneration = 0;
+        }
         sentPackets.clear();
         cancelCount = 0;
         packetTimeMsec = 0;
+        deferTransmissions = false;
     }
+
+    bool startTransmissionForTest()
+    {
+        if (transmitting)
+            return false;
+        transmitting = txQueue.dequeue();
+        if (!transmitting)
+            return false;
+        sentPackets.push_back(*transmitting);
+        transmitGeneration = notifyTxStarted(transmitting);
+        return true;
+    }
+
+    bool completeTransmissionForTest(TxState result = TxState::Sent)
+    {
+        if (!transmitting)
+            return false;
+        notifyTxFinished(transmitting, result, transmitGeneration);
+        packetPool.release(transmitting);
+        transmitting = nullptr;
+        transmitGeneration = 0;
+        return true;
+    }
+
+    size_t queuedCount() { return txQueue.getMaxLen() - txQueue.getFree(); }
 
     std::vector<meshtastic_MeshPacket> sentPackets;
     uint32_t cancelCount = 0;
     uint32_t packetTimeMsec = 0;
+    bool deferTransmissions = false;
+
+  private:
+    MeshPacketQueue txQueue = MeshPacketQueue(MAX_TX_QUEUE);
+    meshtastic_MeshPacket *transmitting = nullptr;
+    uint32_t transmitGeneration = 0;
 };
 
 class MockRoutingModule : public RoutingModule
@@ -319,6 +423,7 @@ static void configureChannels()
 
 void setUp(void)
 {
+    Time::useRealClock();
     myNodeInfo.my_node_num = kLocalNode;
     config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
     config.device.rebroadcast_mode = meshtastic_Config_DeviceConfig_RebroadcastMode_ALL;
@@ -338,7 +443,15 @@ void setUp(void)
     configureChannels();
 }
 
-void tearDown(void) {}
+void tearDown(void)
+{
+    reliableShim->clearPendingForTest();
+    radio->reset();
+    myNodeInfo.my_node_num = kLocalNode;
+    config.security.private_key.size = 0;
+    owner.public_key.size = 0;
+    Time::useRealClock();
+}
 
 // ===========================================================================
 // Group 1 - want_ack ACK variants (decoded packets to us)
@@ -963,6 +1076,475 @@ void test_receive_extends_all_pending_deadlines(void)
     TEST_ASSERT_EQUAL_UINT32(bBefore + 40000, reliableShim->pendingNextTx(kLocalNode, b.id));
 }
 
+// Regression seam for the real queue/hardware boundary: leave the initial packet queued and advance
+// every old retry deadline without starting or completing a transmission. Waiting for hardware must
+// not consume ACK retries, emit MAX_RETRANSMIT, or add retry copies behind the one admitted packet.
+void test_reliable_queue_wait_does_not_consume_ack_retry_budget(void)
+{
+    radio->deferTransmissions = true;
+    Time::setTestMillis(1);
+
+    auto original = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, kRemoteNode, 1, /*wantAck=*/true);
+    const uint32_t oldRetryInterval = radio->getRetransmissionMsec(&original);
+    TEST_ASSERT_LESS_THAN_UINT32(NextHopRouter::TX_QUEUE_WAIT_MSEC,
+                                 (oldRetryInterval + 1) * NextHopRouter::NUM_RELIABLE_UNICAST_ATTEMPTS);
+    auto *allocated = packetPool.allocCopy(original);
+    TEST_ASSERT_NOT_NULL(allocated);
+    TEST_ASSERT_EQUAL_INT(ERRNO_OK, reliableShim->send(allocated));
+    TEST_ASSERT_EQUAL_UINT32(1, reliableShim->pendingCount());
+    TEST_ASSERT_EQUAL_UINT32(1, radio->queuedCount());
+    TEST_ASSERT_TRUE(reliableShim->pendingRadioCandidateIsClear(kLocalNode, original.id));
+
+    for (uint8_t i = 0; i < NextHopRouter::NUM_RELIABLE_UNICAST_ATTEMPTS; ++i) {
+        // Move beyond each old ACK retry deadline while staying far below the planned queue wait
+        // timeout. A real queued packet has not reached a TX boundary during this interval.
+        Time::advanceTestMillis(oldRetryInterval + 1);
+        reliableShim->runDueRetries();
+    }
+
+    TEST_ASSERT_EQUAL_UINT32(1, reliableShim->pendingCount());
+    TEST_ASSERT_EQUAL_UINT32(0, mockRoutingModule->ackNaks.size());
+    TEST_ASSERT_EQUAL_UINT32(1, radio->queuedCount());
+    TEST_ASSERT_TRUE(radio->startTransmissionForTest());
+    TEST_ASSERT_TRUE(radio->completeTransmissionForTest());
+
+    // Completion, rather than queue admission, starts ACK waiting. The first valid ACK then
+    // retires the pending record without any retry copy having been admitted.
+    TEST_ASSERT_EQUAL_UINT32(1, reliableShim->pendingCount());
+    reliableShim->runDueRetries();
+    TEST_ASSERT_EQUAL_UINT32(1, reliableShim->pendingCount());
+    TEST_ASSERT_EQUAL_UINT32(0, radio->queuedCount());
+
+    auto ack = makeDecodedPacket(meshtastic_PortNum_ROUTING_APP, kRemoteNode, kLocalNode, 1);
+    ack.decoded.request_id = original.id;
+    meshtastic_Routing routing = meshtastic_Routing_init_zero;
+    routing.error_reason = meshtastic_Routing_Error_NONE;
+    reliableShim->sniffForTest(&ack, &routing);
+    TEST_ASSERT_EQUAL_UINT32(0, reliableShim->pendingCount());
+
+    radio->reset();
+    Time::useRealClock();
+}
+
+void test_reliable_ack_budget_starts_after_each_successful_tx(void)
+{
+    radio->deferTransmissions = true;
+    Time::setTestMillis(1);
+
+    auto original = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, kRemoteNode, 1, /*wantAck=*/true);
+    const uint32_t retryInterval = radio->getRetransmissionMsec(&original);
+    auto *allocated = packetPool.allocCopy(original);
+    TEST_ASSERT_NOT_NULL(allocated);
+    TEST_ASSERT_EQUAL_INT(ERRNO_OK, reliableShim->send(allocated));
+
+    // The initial send crosses the hardware boundary successfully, but no peer ACK arrives.
+    TEST_ASSERT_TRUE(radio->startTransmissionForTest());
+    TEST_ASSERT_TRUE(radio->completeTransmissionForTest());
+    reliableShim->runDueRetries();
+    TEST_ASSERT_TRUE(reliableShim->pendingWaitsForAck(kLocalNode, original.id));
+    TEST_ASSERT_EQUAL_UINT8(NextHopRouter::NUM_RELIABLE_UNICAST_ATTEMPTS - 1,
+                            reliableShim->pendingRetries(kLocalNode, original.id));
+
+    // Every retry allowance is earned by a completed TX. A queued retry alone must not consume it.
+    for (uint8_t attempt = 1; attempt < NextHopRouter::NUM_RELIABLE_UNICAST_ATTEMPTS; ++attempt) {
+        Time::advanceTestMillis(retryInterval + 1);
+        reliableShim->runDueRetries();
+        TEST_ASSERT_EQUAL_UINT32(1, radio->queuedCount());
+        TEST_ASSERT_TRUE(radio->startTransmissionForTest());
+        TEST_ASSERT_TRUE(radio->completeTransmissionForTest());
+        reliableShim->runDueRetries();
+        TEST_ASSERT_EQUAL_UINT8(NextHopRouter::NUM_RELIABLE_UNICAST_ATTEMPTS - 1 - attempt,
+                                reliableShim->pendingRetries(kLocalNode, original.id));
+    }
+
+    Time::advanceTestMillis(retryInterval + 1);
+    reliableShim->runDueRetries();
+    TEST_ASSERT_EQUAL_UINT32(0, reliableShim->pendingCount());
+    TEST_ASSERT_EQUAL_UINT32(1, mockRoutingModule->ackNaks.size());
+    TEST_ASSERT_EQUAL_INT(meshtastic_Routing_Error_MAX_RETRANSMIT, std::get<0>(mockRoutingModule->ackNaks.front()));
+    radio->reset();
+    Time::useRealClock();
+}
+
+void test_reliable_queue_timeout_is_distinct_from_ack_exhaustion(void)
+{
+    radio->deferTransmissions = true;
+    Time::setTestMillis(1);
+
+    auto original = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, kRemoteNode, 1, /*wantAck=*/true);
+    const uint32_t oldRetryInterval = radio->getRetransmissionMsec(&original);
+    TEST_ASSERT_LESS_THAN_UINT32(NextHopRouter::TX_QUEUE_WAIT_MSEC,
+                                 oldRetryInterval * NextHopRouter::NUM_RELIABLE_UNICAST_ATTEMPTS);
+    auto *allocated = packetPool.allocCopy(original);
+    TEST_ASSERT_NOT_NULL(allocated);
+    TEST_ASSERT_EQUAL_INT(ERRNO_OK, reliableShim->send(allocated));
+
+    // Several old retry intervals pass, then the distinct bounded queue wait expires while the
+    // first physical copy is still queued.
+    Time::advanceTestMillis(oldRetryInterval * 5);
+    reliableShim->runDueRetries();
+    TEST_ASSERT_EQUAL_UINT32(1, reliableShim->pendingCount());
+    TEST_ASSERT_EQUAL_UINT32(0, mockRoutingModule->ackNaks.size());
+
+    Time::advanceTestMillis(NextHopRouter::TX_QUEUE_WAIT_MSEC + 1);
+    reliableShim->runDueRetries();
+    TEST_ASSERT_EQUAL_UINT32(0, reliableShim->pendingCount());
+    TEST_ASSERT_EQUAL_UINT32(1, mockRoutingModule->ackNaks.size());
+    TEST_ASSERT_EQUAL_INT(meshtastic_Routing_Error_TIMEOUT, std::get<0>(mockRoutingModule->ackNaks.front()));
+    radio->reset();
+    Time::useRealClock();
+}
+
+void test_reliable_tx_failures_have_separate_bounded_retry_budget(void)
+{
+    radio->deferTransmissions = true;
+    Time::setTestMillis(1);
+
+    auto original = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, kRemoteNode, 1, /*wantAck=*/true);
+    auto *allocated = packetPool.allocCopy(original);
+    TEST_ASSERT_NOT_NULL(allocated);
+    TEST_ASSERT_EQUAL_INT(ERRNO_OK, reliableShim->send(allocated));
+    const uint8_t ackRetries = reliableShim->pendingRetries(kLocalNode, original.id);
+
+    // A failed physical attempt gets its own bounded retry budget. It must not spend the ACK
+    // allowance, and the third physical failure reports NO_INTERFACE rather than MAX_RETRANSMIT.
+    for (uint8_t failure = 0; failure < NextHopRouter::MAX_TX_FAILURES; ++failure) {
+        TEST_ASSERT_TRUE(radio->startTransmissionForTest());
+        TEST_ASSERT_TRUE(radio->completeTransmissionForTest(RadioInterface::TxState::Failed));
+        reliableShim->runDueRetries();
+
+        if (failure + 1 < NextHopRouter::MAX_TX_FAILURES) {
+            TEST_ASSERT_EQUAL_UINT32(1, reliableShim->pendingCount());
+            TEST_ASSERT_EQUAL_UINT8(ackRetries, reliableShim->pendingRetries(kLocalNode, original.id));
+            Time::advanceTestMillis(NextHopRouter::TX_FAILURE_BACKOFF_MSEC);
+            reliableShim->runDueRetries();
+            TEST_ASSERT_EQUAL_UINT32(1, radio->queuedCount());
+        }
+    }
+
+    TEST_ASSERT_EQUAL_UINT32(0, reliableShim->pendingCount());
+    TEST_ASSERT_EQUAL_UINT32(1, mockRoutingModule->ackNaks.size());
+    TEST_ASSERT_EQUAL_INT(meshtastic_Routing_Error_NO_INTERFACE, std::get<0>(mockRoutingModule->ackNaks.front()));
+    radio->reset();
+    Time::useRealClock();
+}
+
+void test_failed_tx_after_queue_deadline_uses_failure_budget(void)
+{
+    radio->deferTransmissions = true;
+    Time::setTestMillis(1);
+
+    auto original = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, kRemoteNode, 1, /*wantAck=*/true);
+    auto *allocated = packetPool.allocCopy(original);
+    TEST_ASSERT_NOT_NULL(allocated);
+    TEST_ASSERT_EQUAL_INT(ERRNO_OK, reliableShim->send(allocated));
+
+    // A driver may begin a packet after its queue deadline has elapsed. Once TX has actually
+    // started, a failed attempt belongs to the physical-failure budget, not the queue-timeout path.
+    Time::advanceTestMillis(NextHopRouter::TX_QUEUE_WAIT_MSEC + 1);
+    TEST_ASSERT_TRUE(radio->startTransmissionForTest());
+    TEST_ASSERT_TRUE(radio->completeTransmissionForTest(RadioInterface::TxState::Failed));
+    reliableShim->runDueRetries();
+
+    TEST_ASSERT_EQUAL_UINT32(1, reliableShim->pendingCount());
+    TEST_ASSERT_EQUAL_UINT32(0, mockRoutingModule->ackNaks.size());
+    TEST_ASSERT_EQUAL_UINT8(NextHopRouter::NUM_RELIABLE_UNICAST_ATTEMPTS - 1,
+                            reliableShim->pendingRetries(kLocalNode, original.id));
+
+    reliableShim->clearPendingForTest();
+    radio->reset();
+    Time::useRealClock();
+}
+
+void test_rx_airtime_extends_deadline_after_tx_completion_is_observed(void)
+{
+    radio->deferTransmissions = true;
+    radio->packetTimeMsec = 40000;
+    Time::setTestMillis(1);
+
+    auto original = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, kRemoteNode, 1, /*wantAck=*/true);
+    auto *allocated = packetPool.allocCopy(original);
+    TEST_ASSERT_NOT_NULL(allocated);
+    TEST_ASSERT_EQUAL_INT(ERRNO_OK, reliableShim->send(allocated));
+    TEST_ASSERT_TRUE(radio->startTransmissionForTest());
+    TEST_ASSERT_TRUE(radio->completeTransmissionForTest());
+    const uint32_t completion = Time::getMillis();
+    const uint32_t retryInterval = radio->getRetransmissionMsec(reliableShim->pendingPacket(kLocalNode, original.id));
+
+    // RX can arrive after TX_DONE but before the retry task observes that completion. The airtime
+    // extension must still be attached to the new ACK deadline in that ordering.
+    auto inbound = makeDecodedPacket(meshtastic_PortNum_TELEMETRY_APP, kRemoteNode, kLocalNode, 1);
+    reliableShim->filterForTest(&inbound);
+    TEST_ASSERT_EQUAL_UINT32(completion + retryInterval + radio->packetTimeMsec,
+                             reliableShim->pendingNextTx(kLocalNode, original.id));
+    reliableShim->runDueRetries();
+    TEST_ASSERT_EQUAL_UINT32(completion + retryInterval + radio->packetTimeMsec,
+                             reliableShim->pendingNextTx(kLocalNode, original.id));
+
+    reliableShim->clearPendingForTest();
+    radio->reset();
+    Time::useRealClock();
+}
+
+void test_unpaced_reliable_burst_waits_in_queue_without_spending_budgets(void)
+{
+    radio->deferTransmissions = true;
+    Time::setTestMillis(1);
+
+    std::vector<meshtastic_MeshPacket> originals;
+    originals.reserve(MAX_TX_QUEUE);
+    uint32_t oldRetryInterval = 0;
+    for (size_t i = 0; i < MAX_TX_QUEUE; ++i) {
+        auto packet = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, kRemoteNode, 1, /*wantAck=*/true);
+        packet.decoded.payload.size = 100;
+        memset(packet.decoded.payload.bytes, 'A' + (int)(i % 26), packet.decoded.payload.size);
+        oldRetryInterval = radio->getRetransmissionMsec(&packet);
+        originals.push_back(packet);
+
+        auto *allocated = packetPool.allocCopy(packet);
+        TEST_ASSERT_NOT_NULL(allocated);
+        TEST_ASSERT_EQUAL_INT(ERRNO_OK, reliableShim->send(allocated));
+    }
+
+    TEST_ASSERT_EQUAL_UINT32(MAX_TX_QUEUE, reliableShim->pendingCount());
+    TEST_ASSERT_EQUAL_UINT32(MAX_TX_QUEUE, radio->queuedCount());
+    for (const auto &packet : originals)
+        TEST_ASSERT_TRUE(reliableShim->pendingRadioCandidateIsClear(kLocalNode, packet.id));
+
+    TEST_ASSERT_LESS_THAN_UINT32(NextHopRouter::TX_QUEUE_WAIT_MSEC,
+                                 oldRetryInterval * NextHopRouter::NUM_RELIABLE_UNICAST_ATTEMPTS);
+    Time::advanceTestMillis(oldRetryInterval * 5);
+    reliableShim->runDueRetries();
+    TEST_ASSERT_EQUAL_UINT32(MAX_TX_QUEUE, reliableShim->pendingCount());
+    TEST_ASSERT_EQUAL_UINT32(MAX_TX_QUEUE, radio->queuedCount());
+    TEST_ASSERT_EQUAL_UINT32(0, mockRoutingModule->ackNaks.size());
+    for (const auto &packet : originals)
+        TEST_ASSERT_EQUAL_UINT8(NextHopRouter::NUM_RELIABLE_UNICAST_ATTEMPTS - 1,
+                                reliableShim->pendingRetries(kLocalNode, packet.id));
+
+    // Now let every admitted packet cross the controlled hardware boundary once. Each completion
+    // starts its ACK wait; no retry is due because virtual time stays fixed while draining.
+    for (size_t i = 0; i < MAX_TX_QUEUE; ++i) {
+        TEST_ASSERT_TRUE(radio->startTransmissionForTest());
+        const PacketId id = radio->sentPackets.back().id;
+        TEST_ASSERT_TRUE(radio->completeTransmissionForTest());
+        reliableShim->runDueRetries();
+        TEST_ASSERT_TRUE(reliableShim->hasPending(kLocalNode, id));
+        TEST_ASSERT_TRUE(reliableShim->pendingWaitsForAck(kLocalNode, id));
+    }
+    TEST_ASSERT_EQUAL_UINT32(0, radio->queuedCount());
+    TEST_ASSERT_EQUAL_UINT32(MAX_TX_QUEUE, reliableShim->pendingCount());
+    TEST_ASSERT_EQUAL_UINT32(0, mockRoutingModule->ackNaks.size());
+
+    reliableShim->clearPendingForTest();
+    radio->reset();
+    Time::useRealClock();
+}
+
+#if !(MESHTASTIC_EXCLUDE_PKI)
+// Keep the burst regression tied to the real proof verifier as well as the queue lifecycle. This
+// is still a router test: the proof is minted by the configured peer identity, not by a hardware
+// receive/decode path, so it does not claim two-node RF delivery.
+void test_unpaced_reliable_burst_accepts_authenticated_acks(void)
+{
+    const TestIdentity local = makeTestIdentity();
+    const TestIdentity remote = makeTestIdentity();
+    mockNodeDB->addNodeWithKey(kRemoteNode, remote.pub);
+    mockNodeDB->addNodeWithKey(kLocalNode, local.pub);
+
+    config.security.private_key.size = sizeof(local.priv);
+    memcpy(config.security.private_key.bytes, local.priv, sizeof(local.priv));
+    owner.public_key.size = sizeof(local.pub);
+    memcpy(owner.public_key.bytes, local.pub, sizeof(local.pub));
+    actAs(local);
+    radio->deferTransmissions = true;
+    Time::setTestMillis(1);
+
+    std::array<meshtastic_MeshPacket, MAX_TX_QUEUE> originals;
+    uint32_t oldRetryInterval = 0;
+    for (size_t i = 0; i < MAX_TX_QUEUE; ++i) {
+        auto packet = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, kRemoteNode, 0, /*wantAck=*/true);
+        packet.decoded.payload.size = 100;
+        memset(packet.decoded.payload.bytes, 'a' + (int)(i % 26), packet.decoded.payload.size);
+        oldRetryInterval = radio->getRetransmissionMsec(&packet);
+        originals[i] = packet;
+
+        auto *allocated = packetPool.allocCopy(packet);
+        TEST_ASSERT_NOT_NULL(allocated);
+        TEST_ASSERT_EQUAL_INT(ERRNO_OK, reliableShim->send(allocated));
+    }
+
+    TEST_ASSERT_EQUAL_UINT32(MAX_TX_QUEUE, reliableShim->pendingCount());
+    TEST_ASSERT_EQUAL_UINT32(MAX_TX_QUEUE, radio->queuedCount());
+
+    TEST_ASSERT_LESS_THAN_UINT32(NextHopRouter::TX_QUEUE_WAIT_MSEC,
+                                 oldRetryInterval * NextHopRouter::NUM_RELIABLE_UNICAST_ATTEMPTS);
+    Time::advanceTestMillis(oldRetryInterval * 5);
+    reliableShim->runDueRetries();
+    TEST_ASSERT_EQUAL_UINT32(MAX_TX_QUEUE, reliableShim->pendingCount());
+    TEST_ASSERT_EQUAL_UINT32(MAX_TX_QUEUE, radio->queuedCount());
+    TEST_ASSERT_EQUAL_UINT32(0, mockRoutingModule->ackNaks.size());
+
+    for (const auto &original : originals) {
+        TEST_ASSERT_TRUE(radio->startTransmissionForTest());
+        TEST_ASSERT_EQUAL_HEX32(original.id, radio->sentPackets.back().id);
+        TEST_ASSERT_TRUE(radio->completeTransmissionForTest());
+        reliableShim->runDueRetries();
+
+        // Exercise the actual PKI ciphertext as the receiving node before evaluating its
+        // authenticated receipt. The queue test's sender packet remains a captured wire frame.
+        auto receipt = radio->sentPackets.back();
+        const NodeNum sender = myNodeInfo.my_node_num;
+        myNodeInfo.my_node_num = kRemoteNode;
+        actAs(remote);
+        TEST_ASSERT_EQUAL(DecodeState::DECODE_SUCCESS, perhapsDecode(&receipt));
+        TEST_ASSERT_TRUE(receipt.pki_encrypted);
+        TEST_ASSERT_EQUAL_UINT32(original.id, receipt.id);
+        TEST_ASSERT_EQUAL_HEX32(kLocalNode, receipt.from);
+        TEST_ASSERT_EQUAL_HEX32(kRemoteNode, receipt.to);
+        TEST_ASSERT_EQUAL(meshtastic_PortNum_TEXT_MESSAGE_APP, receipt.decoded.portnum);
+        TEST_ASSERT_EQUAL_UINT32(original.decoded.payload.size, receipt.decoded.payload.size);
+        TEST_ASSERT_EQUAL_MEMORY(original.decoded.payload.bytes, receipt.decoded.payload.bytes, original.decoded.payload.size);
+        myNodeInfo.my_node_num = sender;
+        actAs(local);
+
+        auto ack = makeProvenAck(kRemoteNode, original.id, remote, local.pub);
+        TEST_ASSERT_EQUAL(meshtastic_MeshPacket_AckProofStatus_ACK_PROOF_VALID, sniffAck(ack, local));
+    }
+
+    TEST_ASSERT_EQUAL_UINT32(0, reliableShim->pendingCount());
+    TEST_ASSERT_EQUAL_UINT32(0, radio->queuedCount());
+    TEST_ASSERT_EQUAL_UINT32(0, mockRoutingModule->ackNaks.size());
+    radio->reset();
+    Time::useRealClock();
+}
+#endif
+
+static meshtastic_MeshPacket makeQueueFiller(PacketId id)
+{
+    auto filler = makeDecodedPacket(meshtastic_PortNum_TELEMETRY_APP, kLocalNode, kRemoteNode, 1, /*wantAck=*/false);
+    filler.id = id;
+    filler.priority = meshtastic_MeshPacket_Priority_HIGH;
+    return filler;
+}
+
+void test_queue_eviction_and_rejection_do_not_spend_ack_budget(void)
+{
+    radio->deferTransmissions = true;
+    Time::setTestMillis(1);
+
+    auto original = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, kRemoteNode, 1, /*wantAck=*/true);
+    original.priority = meshtastic_MeshPacket_Priority_DEFAULT;
+    auto *allocated = packetPool.allocCopy(original);
+    TEST_ASSERT_NOT_NULL(allocated);
+    TEST_ASSERT_EQUAL_INT(ERRNO_OK, reliableShim->send(allocated));
+    const uint8_t ackRetries = reliableShim->pendingRetries(kLocalNode, original.id);
+
+    // Fill the real queue with higher-priority traffic, leaving the reliable packet as the victim
+    // when a routing ACK packet arrives. The victim is then followed by an explicit rejection when
+    // its lower-priority retry cannot displace the full queue.
+    for (uint8_t i = 0; i < MAX_TX_QUEUE - 1; ++i) {
+        auto filler = makeQueueFiller(0x61000000u + i);
+        auto *copy = packetPool.allocCopy(filler);
+        TEST_ASSERT_NOT_NULL(copy);
+        TEST_ASSERT_EQUAL_INT(ERRNO_OK, radio->send(copy));
+    }
+    TEST_ASSERT_EQUAL_UINT32(MAX_TX_QUEUE, radio->queuedCount());
+
+    auto queueAck = makeDecodedPacket(meshtastic_PortNum_ROUTING_APP, kLocalNode, kRemoteNode, 1, /*wantAck=*/false);
+    auto *ackCopy = packetPool.allocCopy(queueAck);
+    TEST_ASSERT_NOT_NULL(ackCopy);
+    TEST_ASSERT_EQUAL_INT(ERRNO_OK, reliableShim->send(ackCopy));
+    TEST_ASSERT_EQUAL_UINT32(MAX_TX_QUEUE, radio->queuedCount());
+    TEST_ASSERT_EQUAL_UINT32(1, reliableShim->pendingCount());
+    TEST_ASSERT_EQUAL_UINT8(ackRetries, reliableShim->pendingRetries(kLocalNode, original.id));
+    TEST_ASSERT_EQUAL_UINT32(0, mockRoutingModule->ackNaks.size());
+
+    reliableShim->runDueRetries();
+    TEST_ASSERT_EQUAL_UINT32(1, reliableShim->pendingCount());
+    TEST_ASSERT_EQUAL_UINT8(ackRetries, reliableShim->pendingRetries(kLocalNode, original.id));
+    TEST_ASSERT_EQUAL_UINT32(0, mockRoutingModule->ackNaks.size());
+    TEST_ASSERT_EQUAL_UINT32(MAX_TX_QUEUE, radio->queuedCount());
+
+    // The retry copy is now due, but the full queue contains only higher-priority packets. The
+    // attempted re-admission is an explicit rejection and still must not spend an ACK retry.
+    Time::advanceTestMillis(NextHopRouter::TX_FAILURE_BACKOFF_MSEC);
+    reliableShim->runDueRetries();
+    TEST_ASSERT_EQUAL_UINT32(1, reliableShim->pendingCount());
+    TEST_ASSERT_EQUAL_UINT8(ackRetries, reliableShim->pendingRetries(kLocalNode, original.id));
+    TEST_ASSERT_EQUAL_UINT32(0, mockRoutingModule->ackNaks.size());
+    TEST_ASSERT_EQUAL_UINT32(MAX_TX_QUEUE, radio->queuedCount());
+
+    reliableShim->clearPendingForTest();
+    radio->reset();
+    Time::useRealClock();
+}
+
+void test_same_id_routing_packet_cannot_replace_reliable_pending_packet(void)
+{
+    radio->deferTransmissions = true;
+    auto original = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, kRemoteNode, 1, /*wantAck=*/true);
+    auto *allocated = packetPool.allocCopy(original);
+    TEST_ASSERT_NOT_NULL(allocated);
+    TEST_ASSERT_EQUAL_INT(ERRNO_OK, reliableShim->send(allocated));
+
+    auto collision = makeDecodedPacket(meshtastic_PortNum_ROUTING_APP, kLocalNode, kRemoteNode, 1, /*wantAck=*/false);
+    collision.id = original.id;
+    auto *collisionCopy = packetPool.allocCopy(collision);
+    TEST_ASSERT_NOT_NULL(collisionCopy);
+    TEST_ASSERT_EQUAL_INT(meshtastic_Routing_Error_BAD_REQUEST, reliableShim->send(collisionCopy));
+    TEST_ASSERT_EQUAL_UINT32(1, reliableShim->pendingCount());
+    TEST_ASSERT_EQUAL_UINT32(1, radio->queuedCount());
+
+    reliableShim->clearPendingForTest();
+    radio->reset();
+}
+
+void test_mqtt_ack_retains_first_queued_copy_and_blocks_new_generation(void)
+{
+    radio->deferTransmissions = true;
+    auto original = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, kRemoteNode, 1, /*wantAck=*/true);
+    auto *allocated = packetPool.allocCopy(original);
+    TEST_ASSERT_NOT_NULL(allocated);
+    TEST_ASSERT_EQUAL_INT(ERRNO_OK, reliableShim->send(allocated));
+
+    auto mqttAck = makeDecodedPacket(meshtastic_PortNum_ROUTING_APP, kRemoteNode, kLocalNode, 1);
+    mqttAck.decoded.request_id = original.id;
+    mqttAck.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT;
+    meshtastic_Routing routing = meshtastic_Routing_init_zero;
+    routing.error_reason = meshtastic_Routing_Error_NONE;
+    reliableShim->sniffForTest(&mqttAck, &routing);
+
+    TEST_ASSERT_EQUAL_UINT32(0, reliableShim->pendingCount());
+    TEST_ASSERT_EQUAL_UINT32(1, radio->queuedCount());
+
+    auto replacement = original;
+    replacement.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    auto *replacementCopy = packetPool.allocCopy(replacement);
+    TEST_ASSERT_NOT_NULL(replacementCopy);
+    TEST_ASSERT_EQUAL_INT(meshtastic_Routing_Error_BAD_REQUEST, reliableShim->send(replacementCopy));
+    TEST_ASSERT_EQUAL_UINT32(1, radio->queuedCount());
+
+    TEST_ASSERT_TRUE(radio->startTransmissionForTest());
+    TEST_ASSERT_TRUE(radio->completeTransmissionForTest());
+    radio->reset();
+}
+
+void test_explicit_queue_cancel_retires_without_delivery_nak(void)
+{
+    radio->deferTransmissions = true;
+    auto original = makeDecodedPacket(meshtastic_PortNum_TEXT_MESSAGE_APP, kLocalNode, kRemoteNode, 1, /*wantAck=*/true);
+    auto *allocated = packetPool.allocCopy(original);
+    TEST_ASSERT_NOT_NULL(allocated);
+    TEST_ASSERT_EQUAL_INT(ERRNO_OK, reliableShim->send(allocated));
+
+    TEST_ASSERT_TRUE(reliableShim->stopForTest(kLocalNode, original.id));
+    TEST_ASSERT_EQUAL_UINT32(0, reliableShim->pendingCount());
+    TEST_ASSERT_EQUAL_UINT32(0, radio->queuedCount());
+    TEST_ASSERT_EQUAL_UINT32(0, mockRoutingModule->ackNaks.size());
+    radio->reset();
+}
+
 // ===========================================================================
 
 void setup()
@@ -1031,6 +1613,22 @@ void setup()
     printf("\n=== pending-timer airtime extension ===\n");
     RUN_TEST(test_send_extends_other_pending_deadlines_not_own);
     RUN_TEST(test_receive_extends_all_pending_deadlines);
+
+    printf("\n=== queued reliable send lifecycle ===\n");
+    RUN_TEST(test_reliable_queue_wait_does_not_consume_ack_retry_budget);
+    RUN_TEST(test_reliable_ack_budget_starts_after_each_successful_tx);
+    RUN_TEST(test_reliable_queue_timeout_is_distinct_from_ack_exhaustion);
+    RUN_TEST(test_reliable_tx_failures_have_separate_bounded_retry_budget);
+    RUN_TEST(test_failed_tx_after_queue_deadline_uses_failure_budget);
+    RUN_TEST(test_rx_airtime_extends_deadline_after_tx_completion_is_observed);
+    RUN_TEST(test_unpaced_reliable_burst_waits_in_queue_without_spending_budgets);
+#if !(MESHTASTIC_EXCLUDE_PKI)
+    RUN_TEST(test_unpaced_reliable_burst_accepts_authenticated_acks);
+#endif
+    RUN_TEST(test_queue_eviction_and_rejection_do_not_spend_ack_budget);
+    RUN_TEST(test_same_id_routing_packet_cannot_replace_reliable_pending_packet);
+    RUN_TEST(test_mqtt_ack_retains_first_queued_copy_and_blocks_new_generation);
+    RUN_TEST(test_explicit_queue_cancel_retires_without_delivery_nak);
 
     int result = UNITY_END();
     airTimeFixture.reset();

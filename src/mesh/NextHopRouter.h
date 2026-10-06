@@ -33,6 +33,13 @@ struct GlobalPacketId {
  */
 struct PendingPacket {
     meshtastic_MeshPacket *packet;
+    RadioInterface::TxAttempt txAttempt;
+    const meshtastic_MeshPacket *radioCandidate = nullptr;
+    bool waitingForAck = false;
+    bool hasTransmitted = false;
+    uint8_t txFailures = 0;
+    uint32_t ackAirtimeMsec = 0;
+    uint32_t queueDeadlineMsec = 0;
 
     /** The next time we should try to retransmit this packet */
     uint32_t nextTxMsec = 0;
@@ -87,6 +94,7 @@ class NextHopRouter : public FloodingRouter
      *
      */
     NextHopRouter();
+    ~NextHopRouter() override;
 
     /**
      * Send a packet
@@ -113,6 +121,9 @@ class NextHopRouter : public FloodingRouter
     constexpr static uint8_t NUM_RELIABLE_RETX = 3;
     // Total attempts for acknowledged unicast from the originating node.
     constexpr static uint8_t NUM_RELIABLE_UNICAST_ATTEMPTS = 5;
+    constexpr static uint32_t TX_QUEUE_WAIT_MSEC = 300000;
+    constexpr static uint32_t TX_FAILURE_BACKOFF_MSEC = 1000;
+    constexpr static uint8_t MAX_TX_FAILURES = 3;
 
     // M3: bounded RAM route-health table (reuse-oldest eviction, like PacketHistory)
     constexpr static uint8_t ROUTE_HEALTH_MAX = 32;              // ~12B/slot -> ~384B
@@ -126,6 +137,10 @@ class NextHopRouter : public FloodingRouter
      * Pending retransmissions
      */
     std::map<GlobalPacketId, PendingPacket> pending; // std::map keeps the libstdc++ hashtable out of small images
+    bool onRadioSend(meshtastic_MeshPacket *p) override;
+    void observeTxCompletion(PendingPacket &record);
+    void extendAckWait(PendingPacket &record, uint32_t airtimeMsec);
+    void onQueuedPacketReplaced(NodeNum from, PacketId id) override { stopRetransmission(from, id); }
 
     /**
      * Per-destination route health (M3). Bounded array, reuse-oldest eviction. RAM-only.
@@ -173,7 +188,8 @@ class NextHopRouter : public FloodingRouter
     /**
      * Add p to the list of packets to retransmit occasionally.  We will free it once we stop retransmitting.
      */
-    PendingPacket *startRetransmission(meshtastic_MeshPacket *p, uint8_t numReTx = NUM_INTERMEDIATE_RETX);
+    PendingPacket *startRetransmission(meshtastic_MeshPacket *p, uint8_t numReTx = NUM_INTERMEDIATE_RETX,
+                                       const meshtastic_MeshPacket *radioCandidate = nullptr);
 
     ErrorCode sendWithNextHop(meshtastic_MeshPacket *p, bool trackRetransmission);
 
@@ -185,8 +201,8 @@ class NextHopRouter : public FloodingRouter
      *
      * @return true if we found and removed a transmission with this ID
      */
-    bool stopRetransmission(NodeNum from, PacketId id);
-    bool stopRetransmission(GlobalPacketId p);
+    bool stopRetransmission(NodeNum from, PacketId id, bool preserveFirstQueued = false);
+    bool stopRetransmission(GlobalPacketId p, bool preserveFirstQueued = false);
 
     /**
      * Do any retransmissions that are scheduled (FIXME - for the time being called from loop)
@@ -194,6 +210,8 @@ class NextHopRouter : public FloodingRouter
      * @return the number of msecs until our next retransmission or MAXINT if none scheduled
      */
     int32_t doRetransmissions();
+    int32_t processRetransmission(GlobalPacketId key, uint32_t now);
+    void failRetransmission(GlobalPacketId key, meshtastic_Routing_Error error);
 
     void setNextTx(PendingPacket *pending);
 

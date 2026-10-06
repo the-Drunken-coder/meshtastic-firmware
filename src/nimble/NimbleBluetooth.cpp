@@ -360,7 +360,7 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
         }
     }
 
-    bool runOnceHasWorkFromPhone() { return fromPhoneQueueSize > 0; }
+    bool runOnceHasWorkFromPhone() { return fromPhoneQueueSize > 0 && !hasPendingForeignClose(); }
 
     void runOnceHandleFromPhoneQueue()
     {
@@ -375,6 +375,12 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
             BLEValue val;
             { // scope for fromPhoneMutex mutex
                 std::lock_guard<std::mutex> guard(fromPhoneMutex);
+                // A foreign disconnect requests owner-thread close through
+                // PhoneAPI. Leave this queue untouched until MeshService has
+                // completed that close; the disconnect callback may clear it
+                // under the same mutex in the meantime.
+                if (fromPhoneQueueSize == 0 || hasPendingForeignClose())
+                    return;
                 val = fromPhoneQueue[0];
 
                 // Shift the rest of the queue down
@@ -712,10 +718,13 @@ class NimbleBluetoothSecurityCallback : public BLESecurityCallbacks
 // Reset per-session PhoneAPI and transport state. Runs from onDisconnect, and again from
 // setupService() on BLE re-enable because deinit()'s bounded disconnect wait can expire
 // before the disconnect event delivers this cleanup (leaving stale queues/state behind).
-static void resetBleSessionState()
+static void resetBleSessionState(bool fromForeignCallback = false)
 {
     if (bluetoothPhoneAPI) {
-        bluetoothPhoneAPI->close();
+        if (fromForeignCallback)
+            bluetoothPhoneAPI->requestCloseFromForeign();
+        else
+            bluetoothPhoneAPI->close();
 
         { // scope for fromPhoneMutex mutex
             std::lock_guard<std::mutex> guard(bluetoothPhoneAPI->fromPhoneMutex);
@@ -780,7 +789,7 @@ class NimbleBluetoothServerCallback : public BLEServerCallbacks
         bluetoothStatus->updateStatus(&newStatus);
         clearPairingDisplay();
 
-        resetBleSessionState();
+        resetBleSessionState(true);
 
         // Defer the advertising restart to runOnce (see pendingStartAdvertising): calling
         // startAdvertising() here would crash if this disconnect was a host reset.

@@ -203,7 +203,12 @@ void handleAPIv1ToRadio(HTTPRequest *req, HTTPResponse *res)
     size_t s = req->readBytes(buffer, MAX_TO_FROM_RADIO_SIZE);
 
     LOG_DEBUG("Received %d bytes from PUT request", s);
-    webAPI.handleToRadio(buffer, s);
+    if (!webAPI.enqueueToRadio(buffer, s)) {
+        LOG_WARN("Reject HTTP ToRadio packet: owner-thread queue unavailable");
+        res->setStatusCode(503);
+        res->print("");
+        return;
+    }
 
     res->write(buffer, s);
     LOG_DEBUG("webAPI handleAPIv1ToRadio");
