@@ -156,7 +156,10 @@ bool renameFile(const char *pathFrom, const char *pathTo)
 bool fsFormat()
 {
 #ifdef FSCom
-#if defined(ARCH_PORTDUINO)
+#if defined(ARCH_ESP32) && MESHTASTIC_W12_BENCHMARK
+    LOG_ERROR("Filesystem format refused by diagnostic preservation policy");
+    return false;
+#elif defined(ARCH_PORTDUINO)
     rmDir("/prefs");
     return FSBegin();
 #else
@@ -408,7 +411,13 @@ void fsInit()
     preFSBegin();
     if (!FSBegin()) {
         LOG_ERROR("Filesystem mount failed");
-        // assert(0); This auto-formats the partition, so no need to fail here.
+#if defined(ARCH_ESP32) && MESHTASTIC_W12_BENCHMARK
+        // Never continue into default identity creation after an inaccessible saved filesystem.
+        // Remain available to the hardware bootloader for an application-only restoration.
+        for (;;)
+            delay(1000);
+#endif
+        // Other targets retain their existing filesystem recovery behavior.
     }
 #if defined(ARCH_ESP32)
     LOG_DEBUG("Filesystem files (%d/%d Bytes):", FSCom.usedBytes(), FSCom.totalBytes());

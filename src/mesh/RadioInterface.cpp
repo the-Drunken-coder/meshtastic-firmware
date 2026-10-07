@@ -22,6 +22,9 @@
 #include "detect/LoRaRadioType.h"
 #include "main.h"
 #include "meshUtils.h" // for pow_of_2
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+#include "modules/W12BenchmarkModule.h"
+#endif
 #include "sleep.h"
 #include <assert.h>
 #include <pb_decode.h>
@@ -76,6 +79,10 @@ RadioInterface::TxStatus RadioInterface::getTxStatus(const TxAttempt &attempt)
 
 uint32_t RadioInterface::notifyTxStarted(const meshtastic_MeshPacket *packet)
 {
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    if (w12BenchmarkModule)
+        w12BenchmarkModule->onTxStarted(packet);
+#endif
     concurrency::LockGuard guard(&txStatusLock);
     for (auto *attempt = txAttempts; attempt; attempt = attempt->next) {
         if (attempt->packet == packet) {
@@ -88,6 +95,10 @@ uint32_t RadioInterface::notifyTxStarted(const meshtastic_MeshPacket *packet)
 
 void RadioInterface::notifyTxFinished(const meshtastic_MeshPacket *packet, TxState result, uint32_t generation)
 {
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    if (w12BenchmarkModule)
+        w12BenchmarkModule->onTxFinished(packet, result);
+#endif
     bool changed = false;
     {
         concurrency::LockGuard guard(&txStatusLock);

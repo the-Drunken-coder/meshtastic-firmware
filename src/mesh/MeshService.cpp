@@ -18,6 +18,9 @@
 #include "gps/RTC.h"
 #include "graphics/draw/MessageRenderer.h"
 #include "main.h"
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+#include "modules/W12BenchmarkModule.h"
+#endif
 #include "mesh-pb-constants.h"
 #include "meshUtils.h"
 #include "modules/AdminModule.h"
@@ -92,6 +95,11 @@ int MeshService::handleFromRadio(const meshtastic_MeshPacket *mp)
     powerFSM.trigger(EVENT_PACKET_FOR_PHONE); // Possibly keep the node from sleeping
 
     nodeDB->updateFrom(*mp); // update our DB state based off sniffing every RX packet from the radio
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    if (w12BenchmarkModule && mp->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA &&
+        mp->pki_encrypted && !mp->via_mqtt && w12BenchmarkModule->isBenchmarkData(*mp))
+        return 0;
+#endif
     bool isPreferredRebroadcaster =
         IS_ONE_OF(config.device.role, meshtastic_Config_DeviceConfig_Role_ROUTER, meshtastic_Config_DeviceConfig_Role_ROUTER_LATE,
                   meshtastic_Config_DeviceConfig_Role_CLIENT_BASE);
@@ -392,6 +400,22 @@ ErrorCode MeshService::sendQueueStatusToPhone(const meshtastic_QueueStatus &qs, 
 ErrorCode MeshService::sendToMesh(meshtastic_MeshPacket *p, RxSource src, bool ccToPhone)
 {
     uint32_t mesh_packet_id = p->id;
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    if (w12BenchmarkModule && w12BenchmarkModule->ownsDataIdentity(*p) &&
+        (src != RX_SRC_LOCAL || p->via_mqtt ||
+         p->transport_mechanism != meshtastic_MeshPacket_TransportMechanism_TRANSPORT_INTERNAL ||
+         !w12BenchmarkModule->ownsTx(p))) {
+        // Local API callers cannot inject uncounted DATA into the active producer's run.
+        sendQueueStatusToPhone(router->getQueueStatus(), ERRNO_UNKNOWN, mesh_packet_id);
+        packetPool.release(p);
+        return ERRNO_UNKNOWN;
+    }
+    const bool benchmarkData = src == RX_SRC_LOCAL && w12BenchmarkModule && !p->via_mqtt &&
+                               p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_INTERNAL &&
+                               w12BenchmarkModule->isBenchmarkData(*p);
+#else
+    constexpr bool benchmarkData = false;
+#endif
     nodeDB->updateFrom(*p); // update our local DB for this packet (because phone might have sent position packets etc...)
 
     // callModules' loopback gate keeps RX_SRC_LOCAL packets from RoutingModule, the only module
@@ -407,7 +431,9 @@ ErrorCode MeshService::sendToMesh(meshtastic_MeshPacket *p, RxSource src, bool c
      * high-priority message. */
     meshtastic_QueueStatus qs = router->getQueueStatus();
     // SHOULD_RELEASE means "caller frees", not a send failure, so don't report it as one.
-    ErrorCode r = sendQueueStatusToPhone(qs, (res == ERRNO_SHOULD_RELEASE && localDelivery) ? ERRNO_OK : res, mesh_packet_id);
+    ErrorCode r = benchmarkData ? ERRNO_OK
+                                : sendQueueStatusToPhone(qs, (res == ERRNO_SHOULD_RELEASE && localDelivery) ? ERRNO_OK : res,
+                                                         mesh_packet_id);
     if (r != ERRNO_OK) {
         LOG_DEBUG("Can't send status to phone");
     }
