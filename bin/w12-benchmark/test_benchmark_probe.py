@@ -65,6 +65,110 @@ def report(run, **changes):
     return benchmark.FirmwareReport(**values)
 
 
+def diagnostic_payload(run, **changes):
+    """Build a kind-4 fixture using the frozen little-endian offsets."""
+
+    values = {
+        "status": 0x0D,
+        "pending_tx_count": 0,
+        "tx_delay_scheduled_attempts": 11,
+        "pre_can_send_deferred": 12,
+        "cca_decisions": 13,
+        "cca_rssi_sample_count": 8,
+        "cca_rssi_min_dbm": -120,
+        "cca_rssi_max_dbm": -79,
+        "queue_start_duration_count": 14,
+        "queue_start_duration_sum_ms": 15,
+        "queue_start_duration_max_ms": 16,
+        "tx_duration_count": 17,
+        "tx_duration_sum_ms": 18,
+        "tx_duration_max_ms": 19,
+        "tx_started": 20,
+        "tx_terminal": 21,
+        "producer_blocked_total": 22,
+        "producer_queue_free_zero": 23,
+        "producer_queue_window": 24,
+        "producer_tx_capacity": 25,
+        "rx_irq_done": 26,
+        "rx_crc_errors": 27,
+        "rx_len_errors": 28,
+        "rx_header_crc_errors": 29,
+        "rx_timeouts": 30,
+        "rx_other_errors": 31,
+        "rx_read_success": 32,
+        "rx_read_failure": 33,
+        "rx_queue_enqueued": 34,
+        "rx_queue_drop": 35,
+        "rx_decode_success": 36,
+        "rx_decode_reject": 37,
+        "rx_decode_opaque": 38,
+        "rx_auth_accepted": 39,
+        "module_receive_handler_count": 40,
+        "module_receive_handler_sum_ms": 41,
+        "module_receive_handler_max_ms": 42,
+        "tx_delay_fired": 43,
+        "tx_delay_schedule_accepted": 44,
+        "tx_delay_schedule_rejected": 45,
+    }
+    values.update(changes)
+    payload = bytearray(benchmark.DIAGNOSTIC_REPORT_BYTES)
+    payload[0:2] = benchmark.MAGIC.to_bytes(2, "little")
+    payload[2:4] = bytes((benchmark.VERSION, benchmark.DIAGNOSTIC_KIND))
+    payload[4:8] = run.run_id.to_bytes(4, "little")
+    payload[8:12] = run.source.to_bytes(4, "little")
+    payload[12:16] = run.destination.to_bytes(4, "little")
+    payload[16:20] = (run.duration_ms).to_bytes(4, "little")
+    payload[20] = values["status"]
+    payload[21] = values["pending_tx_count"]
+    payload[24:28] = values["tx_delay_scheduled_attempts"].to_bytes(4, "little")
+    payload[28:32] = values["pre_can_send_deferred"].to_bytes(4, "little")
+    payload[32:36] = values["cca_decisions"].to_bytes(4, "little")
+    for index in range(7):
+        payload[36 + index * 4 : 40 + index * 4] = (index + 1).to_bytes(4, "little")
+    payload[64:68] = values["cca_rssi_sample_count"].to_bytes(4, "little")
+    payload[68:70] = values["cca_rssi_min_dbm"].to_bytes(2, "little", signed=True)
+    payload[70:72] = values["cca_rssi_max_dbm"].to_bytes(2, "little", signed=True)
+    for index in range(8):
+        payload[72 + index * 4 : 76 + index * 4] = (index + 10).to_bytes(4, "little")
+    offsets = {
+        104: "queue_start_duration_count",
+        108: "queue_start_duration_sum_ms",
+        112: "queue_start_duration_max_ms",
+        116: "tx_duration_count",
+        120: "tx_duration_sum_ms",
+        124: "tx_duration_max_ms",
+        128: "tx_started",
+        132: "tx_terminal",
+        136: "producer_blocked_total",
+        140: "producer_queue_free_zero",
+        144: "producer_queue_window",
+        148: "producer_tx_capacity",
+        152: "rx_irq_done",
+        156: "rx_crc_errors",
+        160: "rx_len_errors",
+        164: "rx_header_crc_errors",
+        168: "rx_timeouts",
+        172: "rx_other_errors",
+        176: "rx_read_success",
+        180: "rx_read_failure",
+        184: "rx_queue_enqueued",
+        188: "rx_queue_drop",
+        192: "rx_decode_success",
+        196: "rx_decode_reject",
+        200: "rx_decode_opaque",
+        204: "rx_auth_accepted",
+        208: "module_receive_handler_count",
+        212: "module_receive_handler_sum_ms",
+        216: "module_receive_handler_max_ms",
+        220: "tx_delay_fired",
+        224: "tx_delay_schedule_accepted",
+        228: "tx_delay_schedule_rejected",
+    }
+    for offset, name in offsets.items():
+        payload[offset : offset + 4] = values[name].to_bytes(4, "little")
+    return bytes(payload)
+
+
 class ProtocolTests(unittest.TestCase):
     def test_control_frame_is_exact_little_endian_contract(self):
         run = config()
@@ -90,6 +194,108 @@ class ProtocolTests(unittest.TestCase):
         decoded = benchmark.decode_report(encoded)
         self.assertEqual(decoded, original)
         self.assertEqual(decoded.tx_succeeded, 991)
+
+    def test_diagnostic_control_uses_unchanged_32_byte_shape(self):
+        run = config()
+        encoded = benchmark.encode_control(
+            run, benchmark.CONTROL_SNAPSHOT_DIAGNOSTICS
+        )
+        self.assertEqual(len(encoded), benchmark.CONTROL_BYTES)
+        self.assertEqual(
+            benchmark.decode_control(encoded),
+            (benchmark.CONTROL_SNAPSHOT_DIAGNOSTICS, run),
+        )
+
+    def test_diagnostic_report_round_trips_all_counter_groups(self):
+        run = config()
+        decoded = benchmark.decode_diagnostics(diagnostic_payload(run))
+        self.assertEqual(decoded.run_id, run.run_id)
+        self.assertEqual(decoded.cca_reasons, tuple(range(1, 8)))
+        self.assertEqual(decoded.cca_rssi_histogram, tuple(range(10, 18)))
+        self.assertEqual(decoded.cca_rssi_min_dbm, -120)
+        self.assertEqual(decoded.cca_rssi_max_dbm, -79)
+        self.assertEqual(decoded.tx_terminal, 21)
+        serialized = benchmark._diagnostic_dict(decoded)
+        self.assertEqual(serialized["scope"], "board_local_aggregate")
+        self.assertEqual(serialized["status"], "complete")
+        self.assertTrue(serialized["coverage_complete"])
+
+    def test_protocol_manifest_records_frozen_diagnostic_operation_and_offsets(self):
+        manifest = json.loads(
+            (MODULE_PATH.with_name("benchmark-protocol.json")).read_text()
+        )
+        operation = next(
+            field for field in manifest["control"]["fields"] if field[2] == "op"
+        )
+        self.assertEqual(operation[4]["SNAPSHOT_DIAGNOSTICS"], 5)
+        self.assertEqual(manifest["diagnostics"]["response_kind"], 4)
+        self.assertEqual(manifest["diagnostics"]["response_bytes"], 233)
+        fields = {field[2]: field for field in manifest["diagnostic_report"]["fields"]}
+        self.assertEqual(fields["tx_delay_schedule_accepted"][:2], [224, 4])
+        self.assertEqual(fields["tx_delay_schedule_rejected"][:2], [228, 4])
+        self.assertEqual(manifest["host_clock"]["continuity_tolerance_seconds"], 2.0)
+        self.assertEqual(manifest["host_clock"]["failure_reason"], "host_clock_discontinuity")
+
+    def test_diagnostic_pending_snapshot_is_explicitly_as_of(self):
+        run = config()
+        payload = diagnostic_payload(run, status=0x3F, pending_tx_count=2)
+        decoded = benchmark.decode_diagnostics(payload)
+        serialized = benchmark._diagnostic_dict(decoded)
+        self.assertTrue(decoded.as_of_incomplete)
+        self.assertFalse(decoded.coverage_complete)
+        self.assertEqual(serialized["status"], "as_of_incomplete")
+        self.assertTrue(serialized["pending_tx"])
+
+    def test_terminal_diagnostic_requires_exact_fixed_window_for_coverage(self):
+        run = config()
+        for elapsed_ms in (0, 1, 59_999):
+            with self.subTest(elapsed_ms=elapsed_ms):
+                payload = bytearray(diagnostic_payload(run))
+                payload[16:20] = elapsed_ms.to_bytes(4, "little")
+                decoded = benchmark.decode_diagnostics(bytes(payload))
+                serialized = benchmark._diagnostic_dict(decoded)
+                self.assertTrue(decoded.snapshot_terminal)
+                self.assertFalse(decoded.coverage_complete)
+                self.assertEqual(serialized["status"], "snapshot_terminal")
+
+    def test_running_diagnostic_is_not_terminal_or_full_window(self):
+        run = config()
+        decoded = benchmark.decode_diagnostics(
+            diagnostic_payload(run, status=0x2B)
+        )
+        self.assertTrue(decoded.running)
+        self.assertTrue(decoded.as_of_incomplete)
+        self.assertFalse(decoded.snapshot_terminal)
+        self.assertFalse(decoded.coverage_complete)
+
+    def test_diagnostic_parser_rejects_header_length_reserved_and_status_errors(self):
+        run = config()
+        valid = diagnostic_payload(run)
+        adverse = {
+            "short": valid[:-1],
+            "long": valid + b"\x00",
+            "kind": bytes(valid[:3] + b"\x03" + valid[4:]),
+            "reserved": bytes(valid[:22] + b"\x01" + valid[23:]),
+            "unknown_status": bytes(valid[:20] + b"\x40" + valid[21:]),
+            "unprepared": bytes(valid[:20] + b"\x00" + valid[21:]),
+            "rssi_status_mismatch": bytes(valid[:20] + b"\x05" + valid[21:]),
+            "pending_status_mismatch": bytes(valid[:20] + b"\x0D\x01" + valid[22:]),
+            "tail": bytes(valid[:232] + b"\x01"),
+        }
+        for name, payload in adverse.items():
+            with self.subTest(name=name), self.assertRaises(benchmark.BenchmarkError):
+                benchmark.decode_diagnostics(payload)
+
+    def test_host_clock_continuity_guard_rejects_positive_and_negative_gaps(self):
+        normal = benchmark.assess_host_clock_continuity(10.0, 100.0, 70.0, 160.5)
+        positive = benchmark.assess_host_clock_continuity(10.0, 100.0, 70.0, 175.0)
+        negative = benchmark.assess_host_clock_continuity(10.0, 100.0, 70.0, 145.0)
+        self.assertFalse(normal["discontinuous"])
+        self.assertTrue(positive["discontinuous"])
+        self.assertTrue(negative["discontinuous"])
+        self.assertEqual(positive["monotonic_elapsed_seconds"], 60.0)
+        self.assertEqual(positive["wall_elapsed_seconds"], 75.0)
+        self.assertEqual(negative["wall_elapsed_seconds"], 45.0)
 
     def test_old_short_report_is_rejected(self):
         with self.assertRaises(benchmark.BenchmarkError):
@@ -583,9 +789,13 @@ class HardwareHarnessTests(unittest.TestCase):
         class FakeClock:
             def __init__(self):
                 self.now = 0.0
+                self.wall_start = 1_000.0
 
             def monotonic(self):
                 return self.now
+
+            def time(self):
+                return self.wall_start + self.now
 
             def sleep(self, duration):
                 self.now += duration
@@ -683,6 +893,19 @@ class HardwareHarnessTests(unittest.TestCase):
                 )
                 return benchmark.FirmwareReport(**values)
 
+            def snapshot_diagnostics(self, run, _timeout):
+                packet_id = self.control(
+                    benchmark.CONTROL_SNAPSHOT_DIAGNOSTICS,
+                    run,
+                    want_response=True,
+                )
+                parsed = benchmark.decode_diagnostics(diagnostic_payload(run))
+                diagnostics = benchmark._diagnostic_dict(parsed)
+                self.capture.record(
+                    "packet", request_id=packet_id, diagnostics=diagnostics
+                )
+                return diagnostics
+
             def snapshot_config(self, _output, _label):
                 return dict(self.config_snapshot)
 
@@ -720,6 +943,7 @@ class HardwareHarnessTests(unittest.TestCase):
                     "305419896",
                     "--image",
                     str(image),
+                    "--diagnostics",
                 ]
             )
             with mock.patch.object(
@@ -729,6 +953,8 @@ class HardwareHarnessTests(unittest.TestCase):
             ), mock.patch.object(
                 benchmark.time, "monotonic", clock.monotonic
             ), mock.patch.object(
+                benchmark.time, "time", clock.time
+            ), mock.patch.object(
                 benchmark.time, "sleep", clock.sleep
             ):
                 result = benchmark.run_hardware(args)
@@ -737,6 +963,19 @@ class HardwareHarnessTests(unittest.TestCase):
             self.assertTrue(result["configuration_preserved"])
             self.assertEqual(result["report"]["status"], "measurement_valid")
             self.assertEqual(result["firmware_reports"]["sender"]["enqueued"], 1000)
+            self.assertEqual(result["diagnostics"]["status"], "valid_identity")
+            self.assertEqual(
+                result["diagnostics"]["validity"], "parsed_identity_match_only"
+            )
+            self.assertEqual(
+                set(result["diagnostics"]["boards"]), {"base", "walker"}
+            )
+            self.assertTrue(
+                all(
+                    board["scope"] == "board_local_aggregate"
+                    for board in result["diagnostics"]["boards"].values()
+                )
+            )
             self.assertTrue(all(session.closed for session in FakeSession.instances))
             self.assertGreaterEqual(len(FakeSession.instances), 4)
             saved = json.loads((output / "results.json").read_text())
@@ -746,14 +985,34 @@ class HardwareHarnessTests(unittest.TestCase):
                 self.assertTrue(
                     any(event["kind"] == "control_attempt" for event in events)
                 )
+                diagnostic_controls = [
+                    event
+                    for event in events
+                    if event.get("kind") == "control_attempt"
+                    and event.get("operation")
+                    == benchmark.CONTROL_SNAPSHOT_DIAGNOSTICS
+                ]
+                self.assertEqual(len(diagnostic_controls), 1)
+                self.assertTrue(
+                    any(
+                        event.get("kind") == "packet"
+                        and event.get("diagnostics", {}).get("scope")
+                        == "board_local_aggregate"
+                        for event in events
+                    )
+                )
 
     def test_run_hardware_receiver_timeout_stops_and_preserves_lifecycle(self):
         class FakeClock:
             def __init__(self):
                 self.now = 0.0
+                self.wall_start = 2_000.0
 
             def monotonic(self):
                 return self.now
+
+            def time(self):
+                return self.wall_start + self.now
 
             def sleep(self, duration):
                 self.now += duration
@@ -904,6 +1163,8 @@ class HardwareHarnessTests(unittest.TestCase):
                 benchmark, "_fresh_config_snapshots", fresh_snapshots
             ), mock.patch.object(
                 benchmark.time, "monotonic", clock.monotonic
+            ), mock.patch.object(
+                benchmark.time, "time", clock.time
             ), mock.patch.object(
                 benchmark.time, "sleep", clock.sleep
             ):

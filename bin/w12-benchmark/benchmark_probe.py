@@ -33,6 +33,7 @@ VERSION = 1
 CONTROL_BYTES = 32
 DATA_HEADER_BYTES = 24
 REPORT_BYTES = 86
+DIAGNOSTIC_REPORT_BYTES = 233
 DEFAULT_SIZE = 219
 MAX_SIZE = 219
 MAX_COUNT = 8192
@@ -44,13 +45,17 @@ DEFAULT_DRAIN_SECONDS = 10.0
 DEFAULT_COMMAND_GAP_SECONDS = 0.20
 DEFAULT_CONTROL_TIMEOUT_SECONDS = 15.0
 DEFAULT_COMPLETION_TIMEOUT_SECONDS = 60.0
+HOST_CLOCK_DISCONTINUITY_TOLERANCE_SECONDS = 2.0
 CONTROL_RESET = 1
 CONTROL_START = 2
 CONTROL_STOP = 3
 CONTROL_SNAPSHOT = 4
+CONTROL_SNAPSHOT_DIAGNOSTICS = 5
 DATA_KIND = 2
 REPORT_KIND = 3
+DIAGNOSTIC_KIND = 4
 FLAG_NONE = 0
+DIAGNOSTIC_STATUS_MASK = 0x3F
 
 BOARD_IDENTITIES: dict[str, tuple[str, int]] = {
     "base": ("44:B1:76:AE:19:14", 2686237816),
@@ -108,6 +113,101 @@ class FirmwareReport:
 
 
 @dataclasses.dataclass(frozen=True)
+class DiagnosticReport:
+    """Strictly decoded kind-4 board-local aggregate diagnostics."""
+
+    run_id: int
+    source: int
+    destination: int
+    elapsed_ms: int
+    status: int
+    pending_tx_count: int
+    tx_delay_scheduled_attempts: int
+    pre_can_send_deferred: int
+    cca_decisions: int
+    cca_reasons: tuple[int, ...]
+    cca_rssi_sample_count: int
+    cca_rssi_min_dbm: int
+    cca_rssi_max_dbm: int
+    cca_rssi_histogram: tuple[int, ...]
+    queue_start_duration_count: int
+    queue_start_duration_sum_ms: int
+    queue_start_duration_max_ms: int
+    tx_duration_count: int
+    tx_duration_sum_ms: int
+    tx_duration_max_ms: int
+    tx_started: int
+    tx_terminal: int
+    producer_blocked_total: int
+    producer_queue_free_zero: int
+    producer_queue_window: int
+    producer_tx_capacity: int
+    rx_irq_done: int
+    rx_crc_errors: int
+    rx_len_errors: int
+    rx_header_crc_errors: int
+    rx_timeouts: int
+    rx_other_errors: int
+    rx_read_success: int
+    rx_read_failure: int
+    rx_queue_enqueued: int
+    rx_queue_drop: int
+    rx_decode_success: int
+    rx_decode_reject: int
+    rx_decode_opaque: int
+    rx_auth_accepted: int
+    module_receive_handler_count: int
+    module_receive_handler_sum_ms: int
+    module_receive_handler_max_ms: int
+    tx_delay_fired: int
+    tx_delay_schedule_accepted: int
+    tx_delay_schedule_rejected: int
+    raw: bytes = dataclasses.field(repr=False, compare=False, default=b"")
+
+    @property
+    def prepared(self) -> bool:
+        return bool(self.status & 0x01)
+
+    @property
+    def running(self) -> bool:
+        return bool(self.status & 0x02)
+
+    @property
+    def complete(self) -> bool:
+        return bool(self.status & 0x04)
+
+    @property
+    def cca_rssi_observed(self) -> bool:
+        return bool(self.status & 0x08)
+
+    @property
+    def pending_tx(self) -> bool:
+        return bool(self.status & 0x10)
+
+    @property
+    def as_of_incomplete(self) -> bool:
+        return bool(self.status & 0x20)
+
+    @property
+    def snapshot_terminal(self) -> bool:
+        """Whether the board reports a terminal, non-pending snapshot."""
+
+        return (
+            self.prepared
+            and self.complete
+            and not self.running
+            and self.pending_tx_count == 0
+            and not self.as_of_incomplete
+        )
+
+    @property
+    def coverage_complete(self) -> bool:
+        """Whether counters cover the complete fixed 60-second window."""
+
+        return self.snapshot_terminal and self.elapsed_ms == int(DEFAULT_WALL_SECONDS * 1000)
+
+
+@dataclasses.dataclass(frozen=True)
 class CompletionResult:
     report: FirmwareReport | None
     polls: int
@@ -162,7 +262,13 @@ def encode_control(config: RunConfig, operation: int) -> bytes:
     """Encode the firmware's exact 32-byte local control frame."""
 
     validate_config(config)
-    if operation not in (CONTROL_RESET, CONTROL_START, CONTROL_STOP, CONTROL_SNAPSHOT):
+    if operation not in (
+        CONTROL_RESET,
+        CONTROL_START,
+        CONTROL_STOP,
+        CONTROL_SNAPSHOT,
+        CONTROL_SNAPSHOT_DIAGNOSTICS,
+    ):
         raise BenchmarkError(f"unsupported control operation {operation}")
     payload = bytearray(CONTROL_BYTES)
     payload[0:2] = _u16(MAGIC)
@@ -195,7 +301,13 @@ def decode_control(payload: bytes) -> tuple[int, RunConfig]:
         window=_read16(payload, 26),
         flags=payload[28],
     )
-    if operation not in (CONTROL_RESET, CONTROL_START, CONTROL_STOP, CONTROL_SNAPSHOT):
+    if operation not in (
+        CONTROL_RESET,
+        CONTROL_START,
+        CONTROL_STOP,
+        CONTROL_SNAPSHOT,
+        CONTROL_SNAPSHOT_DIAGNOSTICS,
+    ):
         raise BenchmarkError("invalid control operation")
     validate_config(config)
     return operation, config
@@ -315,6 +427,182 @@ def decode_report(payload: bytes) -> FirmwareReport:
     )
 
 
+def _diagnostic_u32(payload: bytes, offset: int) -> int:
+    return _read32(payload, offset)
+
+
+def _diagnostic_u16_signed(payload: bytes, offset: int) -> int:
+    return int.from_bytes(payload[offset : offset + 2], "little", signed=True)
+
+
+def decode_diagnostics(payload: bytes) -> DiagnosticReport:
+    """Decode the frozen 233-byte kind-4 aggregate report strictly.
+
+    The status flags are checked against the fields they summarize. This keeps
+    a running or pending as-of snapshot from being presented as complete host
+    coverage, while still accepting the firmware's intentionally permitted
+    pending-TX and running snapshots.
+    """
+
+    if len(payload) != DIAGNOSTIC_REPORT_BYTES:
+        raise BenchmarkError(
+            f"diagnostic payload must be exactly {DIAGNOSTIC_REPORT_BYTES} bytes"
+        )
+    if (
+        _read16(payload, 0) != MAGIC
+        or payload[2] != VERSION
+        or payload[3] != DIAGNOSTIC_KIND
+    ):
+        raise BenchmarkError("invalid diagnostic magic, version, or kind")
+    if payload[22:24] != b"\x00\x00" or payload[232] != 0:
+        raise BenchmarkError("diagnostic reserved bytes are not zero")
+    status = payload[20]
+    pending_tx_count = payload[21]
+    if status & ~DIAGNOSTIC_STATUS_MASK:
+        raise BenchmarkError("diagnostic contains unknown status bits")
+    prepared = bool(status & 0x01)
+    running = bool(status & 0x02)
+    complete = bool(status & 0x04)
+    if not prepared:
+        raise BenchmarkError("diagnostic report is not prepared")
+    rssi_samples = _diagnostic_u32(payload, 64)
+    if bool(status & 0x08) != bool(rssi_samples):
+        raise BenchmarkError("diagnostic RSSI status does not match sample count")
+    if bool(status & 0x10) != bool(pending_tx_count):
+        raise BenchmarkError("diagnostic pending status does not match count")
+    if bool(status & 0x20) != (running or bool(pending_tx_count)):
+        raise BenchmarkError("diagnostic as-of status does not match state")
+    if (running or complete or pending_tx_count) and not prepared:
+        raise BenchmarkError("diagnostic state is active without prepared status")
+    reasons = tuple(_diagnostic_u32(payload, 36 + index * 4) for index in range(7))
+    histogram = tuple(_diagnostic_u32(payload, 72 + index * 4) for index in range(8))
+    return DiagnosticReport(
+        run_id=_diagnostic_u32(payload, 4),
+        source=_diagnostic_u32(payload, 8),
+        destination=_diagnostic_u32(payload, 12),
+        elapsed_ms=_diagnostic_u32(payload, 16),
+        status=status,
+        pending_tx_count=pending_tx_count,
+        tx_delay_scheduled_attempts=_diagnostic_u32(payload, 24),
+        pre_can_send_deferred=_diagnostic_u32(payload, 28),
+        cca_decisions=_diagnostic_u32(payload, 32),
+        cca_reasons=reasons,
+        cca_rssi_sample_count=rssi_samples,
+        cca_rssi_min_dbm=_diagnostic_u16_signed(payload, 68),
+        cca_rssi_max_dbm=_diagnostic_u16_signed(payload, 70),
+        cca_rssi_histogram=histogram,
+        queue_start_duration_count=_diagnostic_u32(payload, 104),
+        queue_start_duration_sum_ms=_diagnostic_u32(payload, 108),
+        queue_start_duration_max_ms=_diagnostic_u32(payload, 112),
+        tx_duration_count=_diagnostic_u32(payload, 116),
+        tx_duration_sum_ms=_diagnostic_u32(payload, 120),
+        tx_duration_max_ms=_diagnostic_u32(payload, 124),
+        tx_started=_diagnostic_u32(payload, 128),
+        tx_terminal=_diagnostic_u32(payload, 132),
+        producer_blocked_total=_diagnostic_u32(payload, 136),
+        producer_queue_free_zero=_diagnostic_u32(payload, 140),
+        producer_queue_window=_diagnostic_u32(payload, 144),
+        producer_tx_capacity=_diagnostic_u32(payload, 148),
+        rx_irq_done=_diagnostic_u32(payload, 152),
+        rx_crc_errors=_diagnostic_u32(payload, 156),
+        rx_len_errors=_diagnostic_u32(payload, 160),
+        rx_header_crc_errors=_diagnostic_u32(payload, 164),
+        rx_timeouts=_diagnostic_u32(payload, 168),
+        rx_other_errors=_diagnostic_u32(payload, 172),
+        rx_read_success=_diagnostic_u32(payload, 176),
+        rx_read_failure=_diagnostic_u32(payload, 180),
+        rx_queue_enqueued=_diagnostic_u32(payload, 184),
+        rx_queue_drop=_diagnostic_u32(payload, 188),
+        rx_decode_success=_diagnostic_u32(payload, 192),
+        rx_decode_reject=_diagnostic_u32(payload, 196),
+        rx_decode_opaque=_diagnostic_u32(payload, 200),
+        rx_auth_accepted=_diagnostic_u32(payload, 204),
+        module_receive_handler_count=_diagnostic_u32(payload, 208),
+        module_receive_handler_sum_ms=_diagnostic_u32(payload, 212),
+        module_receive_handler_max_ms=_diagnostic_u32(payload, 216),
+        tx_delay_fired=_diagnostic_u32(payload, 220),
+        tx_delay_schedule_accepted=_diagnostic_u32(payload, 224),
+        tx_delay_schedule_rejected=_diagnostic_u32(payload, 228),
+        raw=bytes(payload),
+    )
+
+
+def _diagnostic_dict(report: DiagnosticReport) -> dict[str, Any]:
+    """Serialize diagnostics without carrying binary payloads or secrets."""
+
+    values: dict[str, Any] = {
+        "scope": "board_local_aggregate",
+        "run_id": report.run_id,
+        "source": report.source,
+        "destination": report.destination,
+        "elapsed_ms": report.elapsed_ms,
+        "status_bits": report.status,
+        "prepared": report.prepared,
+        "running": report.running,
+        "complete": report.complete,
+        "cca_rssi_observed": report.cca_rssi_observed,
+        "pending_tx": report.pending_tx,
+        "as_of_incomplete": report.as_of_incomplete,
+        "snapshot_terminal": report.snapshot_terminal,
+        "coverage_complete": report.coverage_complete,
+        "rf_coverage_authoritative": False,
+        "coverage_note": "board-local diagnostic counters do not establish RF delivery coverage",
+        "pending_tx_count": report.pending_tx_count,
+        "tx_delay_scheduled_attempts": report.tx_delay_scheduled_attempts,
+        "pre_can_send_deferred": report.pre_can_send_deferred,
+        "cca_decisions": report.cca_decisions,
+        "cca_reasons": list(report.cca_reasons),
+        "cca_rssi_sample_count": report.cca_rssi_sample_count,
+        "cca_rssi_min_dbm": report.cca_rssi_min_dbm,
+        "cca_rssi_max_dbm": report.cca_rssi_max_dbm,
+        "cca_rssi_histogram": list(report.cca_rssi_histogram),
+        "queue_start_duration_count": report.queue_start_duration_count,
+        "queue_start_duration_sum_ms": report.queue_start_duration_sum_ms,
+        "queue_start_duration_max_ms": report.queue_start_duration_max_ms,
+        "tx_duration_count": report.tx_duration_count,
+        "tx_duration_sum_ms": report.tx_duration_sum_ms,
+        "tx_duration_max_ms": report.tx_duration_max_ms,
+        "tx_started": report.tx_started,
+        "tx_terminal": report.tx_terminal,
+        "producer_blocked_total": report.producer_blocked_total,
+        "producer_queue_free_zero": report.producer_queue_free_zero,
+        "producer_queue_window": report.producer_queue_window,
+        "producer_tx_capacity": report.producer_tx_capacity,
+        "rx_irq_done": report.rx_irq_done,
+        "rx_crc_errors": report.rx_crc_errors,
+        "rx_len_errors": report.rx_len_errors,
+        "rx_header_crc_errors": report.rx_header_crc_errors,
+        "rx_timeouts": report.rx_timeouts,
+        "rx_other_errors": report.rx_other_errors,
+        "rx_read_success": report.rx_read_success,
+        "rx_read_failure": report.rx_read_failure,
+        "rx_queue_enqueued": report.rx_queue_enqueued,
+        "rx_queue_drop": report.rx_queue_drop,
+        "rx_decode_success": report.rx_decode_success,
+        "rx_decode_reject": report.rx_decode_reject,
+        "rx_decode_opaque": report.rx_decode_opaque,
+        "rx_auth_accepted": report.rx_auth_accepted,
+        "module_receive_handler_count": report.module_receive_handler_count,
+        "module_receive_handler_sum_ms": report.module_receive_handler_sum_ms,
+        "module_receive_handler_max_ms": report.module_receive_handler_max_ms,
+        "tx_delay_fired": report.tx_delay_fired,
+        "tx_delay_schedule_accepted": report.tx_delay_schedule_accepted,
+        "tx_delay_schedule_rejected": report.tx_delay_schedule_rejected,
+    }
+    values["status"] = (
+        "complete"
+        if report.coverage_complete
+        else "as_of_incomplete"
+        if report.as_of_incomplete
+        else "snapshot_terminal"
+        if report.snapshot_terminal
+        else "prepared"
+        if report.prepared
+        else "unprepared"
+    )
+    return values
+
+
 def report_from_mapping(value: Mapping[str, Any]) -> FirmwareReport:
     """Accept firmware-style camelCase and Python-style snake_case fixtures."""
 
@@ -402,6 +690,29 @@ def fixed_wall_goodput_bytes_per_second(
     if received < 0 or size <= 0:
         raise BenchmarkError("received and size must be nonnegative/positive")
     return (received * size) / wall_seconds
+
+
+def assess_host_clock_continuity(
+    start_monotonic: float,
+    start_wall: float,
+    current_monotonic: float,
+    current_wall: float,
+    *,
+    tolerance_seconds: float = HOST_CLOCK_DISCONTINUITY_TOLERANCE_SECONDS,
+) -> dict[str, float | bool]:
+    """Compare elapsed wall and monotonic clocks without guessing the cause."""
+
+    if tolerance_seconds <= 0:
+        raise BenchmarkError("clock discontinuity tolerance must be positive")
+    monotonic_elapsed = current_monotonic - start_monotonic
+    wall_elapsed = current_wall - start_wall
+    discrepancy = wall_elapsed - monotonic_elapsed
+    return {
+        "monotonic_elapsed_seconds": monotonic_elapsed,
+        "wall_elapsed_seconds": wall_elapsed,
+        "discrepancy_seconds": discrepancy,
+        "discontinuous": abs(discrepancy) > tolerance_seconds,
+    }
 
 
 def _same_config(left: RunConfig, right: RunConfig) -> bool:
@@ -674,6 +985,7 @@ def evaluate_reports(
 encode_control_frame = encode_control
 decode_control_frame = decode_control
 decode_report_frame = decode_report
+decode_diagnostics_frame = decode_diagnostics
 evaluate_report = evaluate_reports
 
 
@@ -910,10 +1222,15 @@ def _make_capture_serial_classes() -> tuple[Any, Any, Any, Any]:
                         event["report"] = _report_dict(decode_report(payload))
                     except BenchmarkError:
                         try:
-                            identity, _ = decode_data(payload)
-                            event["data_identity"] = dataclasses.asdict(identity)
+                            event["diagnostics"] = _diagnostic_dict(
+                                decode_diagnostics(payload)
+                            )
                         except BenchmarkError:
-                            pass
+                            try:
+                                identity, _ = decode_data(payload)
+                                event["data_identity"] = dataclasses.asdict(identity)
+                            except BenchmarkError:
+                                pass
                 self.capture.record("packet", **event)
             elif incoming.HasField("queueStatus"):
                 self.capture.record(
@@ -1044,6 +1361,22 @@ class BoardSession:
         if event is None:
             raise BenchmarkError(f"{self.role}: snapshot response timed out")
         return report_from_mapping(event["report"])
+
+    def snapshot_diagnostics(
+        self, config: RunConfig, timeout: float
+    ) -> dict[str, Any]:
+        packet_id = self.control(
+            CONTROL_SNAPSHOT_DIAGNOSTICS, config, want_response=True
+        )
+        event = self.capture.wait_for(
+            lambda item: item["kind"] == "packet"
+            and item.get("request_id") == packet_id
+            and item.get("diagnostics") is not None,
+            timeout,
+        )
+        if event is None:
+            raise BenchmarkError(f"{self.role}: diagnostic response timed out")
+        return dict(event["diagnostics"])
 
     def snapshot_config(self, output: Path, label: str) -> dict[str, Any]:
         node = self._interface.localNode
@@ -1374,6 +1707,7 @@ def run_hardware(args: argparse.Namespace) -> dict[str, Any]:
         raise BenchmarkError(
             "at least one --image is required for a verifiable hardware run"
         )
+    diagnostics_requested = bool(getattr(args, "diagnostics", False))
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(output, 0o700)
@@ -1427,6 +1761,7 @@ def run_hardware(args: argparse.Namespace) -> dict[str, Any]:
             "receiver": receiver_role,
             "fixed_wall_seconds": args.wall_seconds,
             "drain_seconds": args.drain_seconds,
+            "diagnostics_requested": diagnostics_requested,
             "window_anchors": {
                 "sender": "sender_START_return",
                 "receiver": "first_authenticated_rf_data",
@@ -1434,10 +1769,27 @@ def run_hardware(args: argparse.Namespace) -> dict[str, Any]:
         },
         "provenance": provenance,
         "file_digests": file_digests,
+        "diagnostics": {
+            "requested": diagnostics_requested,
+            "scope": "per_board_local_aggregate",
+            "status": "not_requested" if not diagnostics_requested else "pending",
+            "validity": "not_requested" if not diagnostics_requested else "pending",
+            "rf_coverage_authoritative": False,
+        },
+        "host_clock": {
+            "tolerance_seconds": HOST_CLOCK_DISCONTINUITY_TOLERANCE_SECONDS,
+            "start": None,
+            "checkpoints": [],
+            "discontinuity": False,
+        },
     }
     sessions: dict[str, BoardSession] = {}
     capture_events: dict[str, list[dict[str, Any]]] = {}
     reports_captured = False
+    diagnostics_captured = False
+    run_controls_started = False
+    start_monotonic: float | None = None
+    start_wall: float | None = None
 
     def checkpoint(stage: str) -> None:
         result["phase"] = stage
@@ -1471,6 +1823,96 @@ def run_hardware(args: argparse.Namespace) -> dict[str, Any]:
         report["measurement_valid"] = False
         result["status"] = "measurement_invalid"
 
+    def observe_host_clock(stage: str) -> bool:
+        if start_monotonic is None or start_wall is None:
+            return False
+        sample = assess_host_clock_continuity(
+            start_monotonic,
+            start_wall,
+            time.monotonic(),
+            time.time(),
+        )
+        sample["stage"] = stage
+        result["host_clock"]["checkpoints"].append(sample)
+        if not sample["discontinuous"]:
+            return False
+        result["host_clock"]["discontinuity"] = True
+        result["host_clock"]["reason"] = "host_clock_discontinuity"
+        failure_reasons = result.setdefault("failure_reasons", [])
+        if "host_clock_discontinuity" not in failure_reasons:
+            failure_reasons.append("host_clock_discontinuity")
+        invalidate_report("host_clock_discontinuity")
+        return True
+
+    def capture_diagnostics() -> None:
+        """Capture one paced, local diagnostic snapshot from each board."""
+
+        nonlocal diagnostics_captured
+        if diagnostics_captured or not diagnostics_requested or not sessions:
+            return
+        diagnostics_captured = True
+        summary: dict[str, Any] = {
+            "requested": True,
+            "scope": "per_board_local_aggregate",
+            "operation": CONTROL_SNAPSHOT_DIAGNOSTICS,
+            "response_kind": DIAGNOSTIC_KIND,
+            "response_bytes": DIAGNOSTIC_REPORT_BYTES,
+            "status": "pending",
+            "validity": "parsed_identity_match_only",
+            "rf_coverage_authoritative": False,
+            "coverage_note": "diagnostic counters are board-local aggregates; this result does not establish RF delivery",
+            "boards": {},
+        }
+        for role in (sender_role, receiver_role):
+            session = sessions.get(role)
+            if session is None:
+                summary["boards"][role] = {
+                    "status": "invalid",
+                    "error": "session_unavailable",
+                }
+                checkpoint(f"diagnostics_{role}_unavailable")
+                continue
+            try:
+                diagnostic = session.snapshot_diagnostics(
+                    config, args.control_timeout
+                )
+                if any(
+                    int(diagnostic.get(field, 0)) != getattr(config, field)
+                    for field in ("run_id", "source", "destination")
+                ):
+                    raise BenchmarkError(f"{role}: diagnostic identity mismatch")
+                diagnostic["board_role"] = role
+                diagnostic["status"] = diagnostic.get("status", "unknown")
+                summary["boards"][role] = diagnostic
+                checkpoint(f"diagnostics_{role}_captured")
+            except Exception as error:
+                summary["boards"][role] = {
+                    "status": "invalid",
+                    "error": str(error),
+                }
+                checkpoint(f"diagnostics_{role}_failed")
+        board_values = summary["boards"].values()
+        summary["status"] = (
+            "valid_identity"
+            if len(summary["boards"]) == 2
+            and all(item.get("status") != "invalid" for item in board_values)
+            else "invalid"
+        )
+        summary["full_window_coverage"] = {
+            role: item.get("coverage_complete") is True
+            for role, item in summary["boards"].items()
+            if isinstance(item, Mapping)
+        }
+        summary["pending_or_running"] = {
+            role: bool(item.get("as_of_incomplete", False))
+            for role, item in summary["boards"].items()
+            if isinstance(item, Mapping)
+        }
+        result["diagnostics"] = summary
+        if summary["status"] != "valid_identity":
+            invalidate_report("diagnostic_snapshot_invalid")
+        checkpoint("diagnostics_captured_before_close")
+
     def wait_with_checkpoints(duration: float, stage: str) -> None:
         deadline = time.monotonic() + duration
         next_checkpoint = time.monotonic()
@@ -1479,9 +1921,13 @@ def run_hardware(args: argparse.Namespace) -> dict[str, Any]:
             if now >= deadline:
                 break
             if now >= next_checkpoint:
+                if observe_host_clock(stage):
+                    checkpoint(f"{stage}_clock_discontinuity")
+                    return
                 checkpoint(stage)
                 next_checkpoint = now + 1.0
             time.sleep(min(0.25, max(0.01, deadline - now)))
+        observe_host_clock(f"{stage}_complete")
         checkpoint(f"{stage}_complete")
 
     checkpoint("intent_initialized")
@@ -1514,6 +1960,7 @@ def run_hardware(args: argparse.Namespace) -> dict[str, Any]:
         checkpoint("receiver_start_attempt")
         sessions[receiver_role].control(CONTROL_START, config)
         checkpoint("receiver_start_sent")
+        run_controls_started = True
         time.sleep(args.command_gap)
         checkpoint("sender_reset_attempt")
         sessions[sender_role].control(CONTROL_RESET, config)
@@ -1524,11 +1971,19 @@ def run_hardware(args: argparse.Namespace) -> dict[str, Any]:
         # accepted by the local client. The firmware report remains the
         # authoritative duration check and must equal config.duration_ms.
         start = time.monotonic()
+        start_wall = time.time()
+        start_monotonic = start
         result["burst_started_monotonic"] = start
+        result["burst_started_wall"] = start_wall
+        result["host_clock"]["start"] = {
+            "monotonic": start,
+            "wall": start_wall,
+        }
         wait_with_checkpoints(args.wall_seconds, "burst_running")
         wall_end = time.monotonic()
         wait_with_checkpoints(args.drain_seconds, "drain_running")
         drain_end = time.monotonic()
+        observe_host_clock("before_sender_snapshot")
         sender_report = sessions[sender_role].snapshot(config, args.control_timeout)
         completion = _snapshot_until_complete(
             sessions[receiver_role],
@@ -1562,13 +2017,21 @@ def run_hardware(args: argparse.Namespace) -> dict[str, Any]:
             observed_drain_seconds=drain_end - wall_end,
             peer_bitmap=peer_bitmap,
             extra_failure_reasons=(
-                (completion.timeout_reason,)
-                if completion.timeout_reason is not None
-                else ()
+                tuple(
+                    reason
+                    for reason in (
+                        completion.timeout_reason,
+                        "host_clock_discontinuity"
+                        if result["host_clock"]["discontinuity"]
+                        else None,
+                    )
+                    if reason is not None
+                )
             ),
         )
         result["status"] = result["report"]["status"]
         reports_captured = True
+        capture_diagnostics()
         # DATA forwarding is intentionally suppressed by the firmware, so
         # retain the original reader events before closing these sessions.
         checkpoint("reports_captured_before_close")
@@ -1605,6 +2068,33 @@ def run_hardware(args: argparse.Namespace) -> dict[str, Any]:
                 invalidate_report("configuration_changed")
             checkpoint("configuration_after_saved")
     finally:
+        if diagnostics_requested and run_controls_started and not diagnostics_captured:
+            try:
+                capture_diagnostics()
+            except Exception as error:
+                diagnostics_captured = True
+                result["diagnostics"] = {
+                    "requested": True,
+                    "scope": "per_board_local_aggregate",
+                    "operation": CONTROL_SNAPSHOT_DIAGNOSTICS,
+                    "response_kind": DIAGNOSTIC_KIND,
+                    "response_bytes": DIAGNOSTIC_REPORT_BYTES,
+                    "status": "invalid",
+                    "validity": "invalid",
+                    "rf_coverage_authoritative": False,
+                    "error": str(error),
+                }
+                invalidate_report("diagnostic_snapshot_invalid")
+        if diagnostics_requested and not diagnostics_captured:
+            diagnostics_captured = True
+            result["diagnostics"] = {
+                "requested": True,
+                "scope": "per_board_local_aggregate",
+                "status": "invalid",
+                "validity": "invalid",
+                "rf_coverage_authoritative": False,
+                "error": "benchmark_controls_not_started",
+            }
         if reports_captured and "configuration_preserved" not in result:
             invalidate_report("run_interrupted_after_reports")
         with contextlib.suppress(Exception):
@@ -1653,6 +2143,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="firmware image to hash into provenance",
+    )
+    parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="request frozen kind-4 aggregate diagnostics after the burst",
     )
     return parser
 

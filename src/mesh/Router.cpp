@@ -12,6 +12,9 @@
 #include "main.h"
 #include "mesh-pb-constants.h"
 #include "meshUtils.h"
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+#include "modules/W12BenchmarkModule.h"
+#endif
 #include "modules/RoutingModule.h"
 #include <ErriezCRC32.h>
 #include <pb_decode.h>
@@ -323,10 +326,18 @@ void Router::enqueueReceivedMessage(meshtastic_MeshPacket *p)
         meshtastic_MeshPacket *old_p;
         old_p = fromRadioQueue.dequeuePtr(0); // Dequeue and discard the oldest packet
         if (old_p) {
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+            if (w12BenchmarkModule)
+                w12BenchmarkModule->onRxQueueDrop();
+#endif
             printPacket("fromRadioQ full, drop oldest!", old_p);
             packetPool.release(old_p);
         }
     }
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    if (w12BenchmarkModule)
+        w12BenchmarkModule->onRxQueueEnqueued();
+#endif
     // Nasty hack because our threading is primitive.  interfaces shouldn't need to know about routers FIXME
     setReceivedMessage();
 }
@@ -1559,6 +1570,14 @@ void Router::dispatchReceived(meshtastic_MeshPacket *p, RxSource src)
 
     // Take those raw bytes and convert them back into a well structured protobuf we can understand
     auto decodedState = perhapsDecode(p);
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    if (w12BenchmarkModule) {
+        const auto result = decodedState == DecodeState::DECODE_SUCCESS  ? W12BenchmarkModule::RxDecodeResult::Success
+                            : decodedState == DecodeState::DECODE_OPAQUE ? W12BenchmarkModule::RxDecodeResult::Opaque
+                                                                         : W12BenchmarkModule::RxDecodeResult::Reject;
+        w12BenchmarkModule->onRxDecode(result);
+    }
+#endif
     if (decodedState == DecodeState::DECODE_FATAL || decodedState == DecodeState::DECODE_POLICY_REJECT ||
         decodedState == DecodeState::DECODE_FAILURE) {
         // Fatal decoding error, we can't do anything with this packet

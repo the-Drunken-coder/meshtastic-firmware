@@ -9,6 +9,9 @@
 #include "W12FlrcProfile.h"
 #include "error.h"
 #include "mesh/NodeDB.h"
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+#include "modules/W12BenchmarkModule.h"
+#endif
 #include <cmath>
 
 namespace
@@ -149,29 +152,81 @@ bool LR2021Interface::isChannelActive()
     if (!RadioMode::isFlrc())
         return LR20x0Interface::isChannelActive();
     // Observe energy while continuous RX remains armed. Failed observations defer transmission.
-    if (rxOffline || !isReceiving)
+    if (rxOffline || !isReceiving) {
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+        if (w12BenchmarkModule)
+            w12BenchmarkModule->onCcaDecision(W12BenchmarkModule::CcaReason::NOT_READY);
+#endif
         return true;
+    }
     for (unsigned i = 0; i < 3; ++i) {
         float rssi = 0;
         if (W12FlrcProfile::readRssi(module, false, rssi) != RADIOLIB_ERR_NONE) {
             uint32_t flags = 0;
             if (W12FlrcProfile::readIrqFlags(module, flags) == RADIOLIB_ERR_NONE) {
                 if (flags & W12FlrcProfile::RECEIVE_IRQS) {
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+                    if (w12BenchmarkModule)
+                        w12BenchmarkModule->onCcaDecision(W12BenchmarkModule::CcaReason::RX_IRQ_PENDING);
+#endif
                     // A failed energy sample must not reset the chip before a completed RX is consumed.
                     notify(ISR_RX, true);
                     return true;
                 }
-                if (isFlrcReceptionActive(flags, activeReceiveStart))
+                if (isFlrcReceptionActive(flags, activeReceiveStart)) {
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+                    if (w12BenchmarkModule)
+                        w12BenchmarkModule->onCcaDecision(W12BenchmarkModule::CcaReason::RX_ACTIVE);
+#endif
                     return true;
+                }
             }
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+            if (w12BenchmarkModule)
+                w12BenchmarkModule->onCcaDecision(W12BenchmarkModule::CcaReason::RSSI_READ_ERROR);
+#endif
             maybeRecoverChipStateLoss();
             return true;
         }
-        if (!std::isfinite(rssi) || rssi >= W12FlrcProfile::BUSY_THRESHOLD_DBM || isActivelyReceiving() || receiveIrqPending())
+        if (!std::isfinite(rssi)) {
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+            if (w12BenchmarkModule)
+                w12BenchmarkModule->onCcaDecision(W12BenchmarkModule::CcaReason::RSSI_INVALID);
+#endif
             return true;
+        }
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+        if (w12BenchmarkModule)
+            w12BenchmarkModule->onCcaRssiSample(static_cast<int16_t>(lround(rssi)));
+#endif
+        if (rssi >= W12FlrcProfile::BUSY_THRESHOLD_DBM) {
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+            if (w12BenchmarkModule)
+                w12BenchmarkModule->onCcaDecision(W12BenchmarkModule::CcaReason::ENERGY_BUSY);
+#endif
+            return true;
+        }
+        if (isActivelyReceiving()) {
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+            if (w12BenchmarkModule)
+                w12BenchmarkModule->onCcaDecision(W12BenchmarkModule::CcaReason::RX_ACTIVE);
+#endif
+            return true;
+        }
+        if (receiveIrqPending()) {
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+            if (w12BenchmarkModule)
+                w12BenchmarkModule->onCcaDecision(W12BenchmarkModule::CcaReason::RX_IRQ_PENDING);
+#endif
+            return true;
+        }
         if (i != 2)
             delayMicroseconds(W12FlrcProfile::OBSERVATION_US);
     }
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    if (w12BenchmarkModule)
+        w12BenchmarkModule->onCcaDecision(W12BenchmarkModule::CcaReason::FREE);
+#endif
     setStandby();
     return rxOffline;
 }
@@ -227,6 +282,13 @@ bool LR2021Interface::validReceiveIrq()
         return true;
     uint32_t flags = 0;
     int16_t result = W12FlrcProfile::readIrqFlags(module, flags);
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    if (w12BenchmarkModule)
+        w12BenchmarkModule->onRxIrq(result == RADIOLIB_ERR_NONE, flags & RADIOLIB_LR2021_IRQ_RX_DONE,
+                                    flags & RADIOLIB_LR2021_IRQ_CRC_ERROR, flags & RADIOLIB_LR2021_IRQ_LEN_ERROR,
+                                    flags & RADIOLIB_LR2021_IRQ_LORA_HDR_CRC_ERROR, flags & RADIOLIB_LR2021_IRQ_TIMEOUT,
+                                    flags & (RADIOLIB_LR2021_IRQ_ERROR | RADIOLIB_LR2021_IRQ_CMD_ERROR));
+#endif
     if (result == RADIOLIB_ERR_NONE && W12FlrcProfile::acceptsIrq(flags))
         return true;
     LOG_WARN("Reject FLRC RX status=%d IRQ=0x%x", result, flags);

@@ -36,6 +36,12 @@ W12BenchmarkModule::RunConfig runConfig()
     return c;
 }
 
+uint32_t read32(const uint8_t *bytes, size_t offset)
+{
+    return static_cast<uint32_t>(bytes[offset]) | static_cast<uint32_t>(bytes[offset + 1]) << 8 |
+           static_cast<uint32_t>(bytes[offset + 2]) << 16 | static_cast<uint32_t>(bytes[offset + 3]) << 24;
+}
+
 class BenchmarkNodeDB : public NodeDB
 {
   public:
@@ -429,6 +435,150 @@ void test_report_has_fixed_offsets_for_all_diagnostic_counters()
     TEST_ASSERT_EQUAL_UINT32(stats.goodputBps, static_cast<uint32_t>(wire[82] | wire[83] << 8 | wire[84] << 16 | wire[85] << 24));
 }
 
+void test_diagnostic_snapshot_is_local_asof_and_keeps_existing_wire_formats()
+{
+    auto run = runConfig();
+    myNodeInfo.my_node_num = run.source;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.source)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::START, run.source)));
+    TEST_ASSERT_EQUAL_INT(0, testModule->runOnce());
+    TEST_ASSERT_EQUAL_UINT(1, testRadio->pendingCount());
+
+    testModule->onTxDelayScheduled(testRadio->pendingAt(0), true);
+    testModule->onTxDelayScheduled(testRadio->pendingAt(0), false);
+    testModule->onTxDelayFired(testRadio->pendingAt(0));
+    testModule->onPreCanSendDeferred(testRadio->pendingAt(0));
+    testModule->onCcaDecision(W12BenchmarkModule::CcaReason::ENERGY_BUSY);
+    testModule->onCcaRssiSample(-90);
+    testModule->onCcaDecision(W12BenchmarkModule::CcaReason::FREE);
+    testModule->onCcaRssiSample(-100);
+    testModule->onRxIrq(true, true, false, false, false, false, false);
+    testModule->onRxRead(true);
+    testModule->onRxQueueEnqueued();
+    testModule->onRxDecode(W12BenchmarkModule::RxDecodeResult::Success);
+    testModule->onRxAuthenticated();
+    testModule->onModuleReceiveHandlerDuration(3);
+
+    auto wrongRun = run;
+    wrongRun.runId++;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(wrongRun, W12BenchmarkModule::Op::SNAPSHOT_DIAGNOSTICS, run.source)));
+    TEST_ASSERT_NULL(testModule->allocReply());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::SNAPSHOT_DIAGNOSTICS, run.source,
+                                                       meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA, run.source)));
+    TEST_ASSERT_NULL(testModule->allocReply());
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::SNAPSHOT_DIAGNOSTICS, run.source)));
+    meshtastic_MeshPacket *reply = testModule->allocReply();
+    TEST_ASSERT_NOT_NULL(reply);
+    TEST_ASSERT_EQUAL_UINT(W12BenchmarkModule::DIAGNOSTIC_REPORT_BYTES, reply->decoded.payload.size);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(W12BenchmarkModule::Kind::DIAGNOSTICS), reply->decoded.payload.bytes[3]);
+    TEST_ASSERT_EQUAL_UINT8(1 | 2 | 8 | 16 | 32, reply->decoded.payload.bytes[20]);
+    TEST_ASSERT_EQUAL_UINT8(1, reply->decoded.payload.bytes[21]);
+    TEST_ASSERT_EQUAL_UINT32(2, read32(reply->decoded.payload.bytes, 24));
+    TEST_ASSERT_EQUAL_UINT32(1, read32(reply->decoded.payload.bytes, 28));
+    TEST_ASSERT_EQUAL_UINT32(1, read32(reply->decoded.payload.bytes, 56));
+    TEST_ASSERT_EQUAL_UINT32(1, read32(reply->decoded.payload.bytes, 220));
+    TEST_ASSERT_EQUAL_UINT32(1, read32(reply->decoded.payload.bytes, 224));
+    TEST_ASSERT_EQUAL_UINT32(1, read32(reply->decoded.payload.bytes, 228));
+    packetPool.release(reply);
+
+    testRadio->finishAt(0, RadioInterface::TxState::Sent);
+    TEST_ASSERT_EQUAL_UINT(0, testRadio->pendingCount());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::SNAPSHOT_DIAGNOSTICS, run.source)));
+    reply = testModule->allocReply();
+    TEST_ASSERT_NOT_NULL(reply);
+    TEST_ASSERT_EQUAL_UINT8(1 | 2 | 8 | 32, reply->decoded.payload.bytes[20]);
+    TEST_ASSERT_EQUAL_UINT8(0, reply->decoded.payload.bytes[21]);
+    packetPool.release(reply);
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::STOP, run.source)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.source)));
+    const auto diagnostics = testModule->getDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(0, diagnostics.txDelayScheduledAttempts);
+    TEST_ASSERT_EQUAL_UINT32(0, diagnostics.ccaDecisions);
+    TEST_ASSERT_EQUAL_UINT32(0, diagnostics.rxReadSuccess);
+    TEST_ASSERT_EQUAL_INT16(127, diagnostics.ccaRssiMinDbm);
+    TEST_ASSERT_EQUAL_INT16(-127, diagnostics.ccaRssiMaxDbm);
+}
+
+void test_diagnostic_cca_events_are_aggregated_once_and_timing_uses_existing_slots()
+{
+    const auto run = runConfig();
+    myNodeInfo.my_node_num = run.source;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.source)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::START, run.source)));
+    TEST_ASSERT_EQUAL_INT(0, testModule->runOnce());
+    TEST_ASSERT_EQUAL_UINT(1, testRadio->pendingCount());
+    const auto *packet = testRadio->pendingAt(0);
+    testModule->onCcaDecision(W12BenchmarkModule::CcaReason::NOT_READY);
+    testModule->onCcaDecision(W12BenchmarkModule::CcaReason::RSSI_READ_ERROR);
+    testModule->onCcaDecision(W12BenchmarkModule::CcaReason::RX_IRQ_PENDING);
+    testModule->onCcaDecision(W12BenchmarkModule::CcaReason::RX_ACTIVE);
+    testModule->onCcaDecision(W12BenchmarkModule::CcaReason::RSSI_INVALID);
+    testModule->onCcaDecision(W12BenchmarkModule::CcaReason::ENERGY_BUSY);
+    testModule->onCcaDecision(W12BenchmarkModule::CcaReason::FREE);
+    testModule->onCcaRssiSample(-121);
+    testModule->onCcaRssiSample(-115);
+    testModule->onCcaRssiSample(-105);
+    testModule->onCcaRssiSample(-97);
+    testModule->onCcaRssiSample(-92);
+    testModule->onCcaRssiSample(-87);
+    testModule->onCcaRssiSample(-82);
+    testModule->onCcaRssiSample(-70);
+    Time::advanceTestMillis(7);
+    testModule->onTxFinished(packet, RadioInterface::TxState::Sent);
+    const auto diagnostics = testModule->getDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(7, diagnostics.ccaDecisions);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.ccaReasons[0]);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.ccaReasons[6]);
+    TEST_ASSERT_EQUAL_UINT32(8, diagnostics.ccaRssiSampleCount);
+    TEST_ASSERT_EQUAL_INT16(-121, diagnostics.ccaRssiMinDbm);
+    TEST_ASSERT_EQUAL_INT16(-70, diagnostics.ccaRssiMaxDbm);
+    for (auto count : diagnostics.ccaRssiHistogram)
+        TEST_ASSERT_EQUAL_UINT32(1, count);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.txDurationCount);
+    TEST_ASSERT_EQUAL_UINT32(7, diagnostics.txDurationSumMs);
+    TEST_ASSERT_EQUAL_UINT32(7, diagnostics.txDurationMaxMs);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.txTerminal);
+    testRadio->releaseAt(0);
+}
+
+void test_diagnostic_snapshot_accepts_zero_first_receiver_window()
+{
+    const auto run = runConfig();
+    myNodeInfo.my_node_num = run.destination;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.destination)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::START, run.destination)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::SNAPSHOT_DIAGNOSTICS, run.destination)));
+
+    meshtastic_MeshPacket *reply = testModule->allocReply();
+    TEST_ASSERT_NOT_NULL(reply);
+    TEST_ASSERT_EQUAL_UINT8(1 | 2 | 32, reply->decoded.payload.bytes[20]);
+    TEST_ASSERT_EQUAL_UINT8(0, reply->decoded.payload.bytes[21]);
+    TEST_ASSERT_EQUAL_UINT32(0, read32(reply->decoded.payload.bytes, 16));
+    packetPool.release(reply);
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.destination)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::STOP, run.destination)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.destination)));
+}
+
 void test_behavior_control_is_local_authorized_and_reset_is_not_mid_run()
 {
     const auto run = runConfig();
@@ -495,6 +645,8 @@ void test_behavior_producer_uses_real_service_and_terminal_slots()
     // The physical window blocks a third candidate until a terminal callback frees a slot.
     TEST_ASSERT_EQUAL_INT(5, testModule->runOnce());
     TEST_ASSERT_EQUAL_UINT(2, testModule->getStats().enqueued);
+    TEST_ASSERT_EQUAL_UINT32(1, testModule->getDiagnostics().producerBlockedTotal);
+    TEST_ASSERT_EQUAL_UINT32(1, testModule->getDiagnostics().producerQueueWindow);
 
     // A duplicate start callback is harmless, and an unrelated packet cannot affect counters.
     testModule->onTxStarted(first);
@@ -646,6 +798,9 @@ void setup()
     RUN_TEST(test_data_rejects_size_mismatch);
     RUN_TEST(test_data_decode_keeps_out_of_range_sequence_visible_to_admission);
     RUN_TEST(test_report_has_fixed_offsets_for_all_diagnostic_counters);
+    RUN_TEST(test_diagnostic_snapshot_is_local_asof_and_keeps_existing_wire_formats);
+    RUN_TEST(test_diagnostic_cca_events_are_aggregated_once_and_timing_uses_existing_slots);
+    RUN_TEST(test_diagnostic_snapshot_accepts_zero_first_receiver_window);
     RUN_TEST(test_behavior_control_is_local_authorized_and_reset_is_not_mid_run);
     RUN_TEST(test_behavior_producer_uses_real_service_and_terminal_slots);
     RUN_TEST(test_behavior_receiver_requires_direct_authenticated_rf_and_validates_pattern);
