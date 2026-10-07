@@ -7,6 +7,15 @@
 #include <RadioLib.h>
 #include <cstdint>
 #include <sys/types.h>
+
+#ifndef MESHTASTIC_W12_BENCHMARK_TX_BURST
+#define MESHTASTIC_W12_BENCHMARK_TX_BURST 0
+#endif
+
+#ifndef MESHTASTIC_W12_BENCHMARK_TX_BURST_GUARD_MS
+#define MESHTASTIC_W12_BENCHMARK_TX_BURST_GUARD_MS 6
+#endif
+
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
 #include <atomic>
 static_assert(std::atomic<uint32_t>::is_always_lock_free, "W12 radio diagnostic state requires lock-free 32-bit atomics");
@@ -121,14 +130,23 @@ class STM32WLx_ModuleWrapper : public STM32WLx_Module
 
 class RadioLibInterface : public RadioInterface, protected concurrency::NotifiedWorkerThread
 {
-#ifdef PIO_UNIT_TESTING
+#if defined(PIO_UNIT_TESTING) || (MESHTASTIC_W12_BENCHMARK && MESHTASTIC_W12_BENCHMARK_TX_BURST)
     friend class TestableW12Adapter;
 #endif
     MeshPacketQueue txQueue = MeshPacketQueue(MAX_TX_QUEUE);
 
   protected:
     /// Used as our notification from the ISR
-    enum PendingISR { ISR_NONE = 0, ISR_RX, ISR_TX, TRANSMIT_DELAY_COMPLETED, ISR_POLL_TICK };
+    enum PendingISR {
+        ISR_NONE = 0,
+        ISR_RX,
+        ISR_TX,
+        TRANSMIT_DELAY_COMPLETED,
+        ISR_POLL_TICK,
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+        W12_BURST_DELAY_COMPLETED,
+#endif
+    };
 
     /**
      * Raw ISR handler that just calls our polymorphic method
@@ -357,6 +375,21 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
 
     uint8_t packetsInTxQueue() { return txQueue.getMaxLen() - txQueue.getFree(); }
 
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+    /** Cancel a pending diagnostic burst without rearming RX. Callers that own the radio lifecycle do the rearm. */
+    void cancelW12Burst();
+    /** Abort a diagnostic burst and return through the ordinary full-RX and delay path. */
+    void abortW12BurstToNormal();
+    /** Suppress a new burst while standby drains a possibly pending TX_DONE notification. */
+    void beginW12StandbyDrain();
+    void endW12StandbyDrain();
+    bool isW12StandbyDrainActive() const { return w12BurstArmSuppressed; }
+    bool w12BurstEventPendingForReconfigure() const { return w12Burst.timerPending || w12BurstResumeAfterStale; }
+    void scheduleW12NormalTxAfterReconfigure() { setTransmitDelay(); }
+    /** Mark that a stale guarded event may reschedule ordinary TX after reconfigure has armed RX. */
+    void markW12BurstNormalResumeAfterStale();
+#endif
+
     /**
      * Update the noise floor measurement by sampling RSSI from a slow path.
      * This should not be called from radio interrupt or TX/RX critical paths.
@@ -405,7 +438,7 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
      */
     void startTransmitTimerRebroadcast(meshtastic_MeshPacket *p);
 
-    void handleTransmitInterrupt();
+    bool handleTransmitInterrupt();
     void handleReceiveInterrupt();
 
     static void timerCallback(void *p1, uint32_t p2);
@@ -418,7 +451,35 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
      */
     virtual bool startSend(meshtastic_MeshPacket *txp);
 
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+    /** Put the driver in its documented pre-SET_TX state without rearming full RX. */
+    virtual bool prepareW12BurstSend() { return true; }
+#endif
+
     meshtastic_QueueStatus getQueueStatus();
+
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+    static constexpr uint8_t W12_BURST_MAX_FRAMES = 4;
+    static_assert(MESHTASTIC_W12_BENCHMARK_TX_BURST_GUARD_MS >= 0 && MESHTASTIC_W12_BENCHMARK_TX_BURST_GUARD_MS <= 6,
+                  "W12 burst guard must stay within the diagnostic 0..6 ms bound");
+    static constexpr uint32_t W12_BURST_GUARD_MS = MESHTASTIC_W12_BENCHMARK_TX_BURST_GUARD_MS;
+
+    struct W12BurstState {
+        bool active = false;
+        bool timerPending = false;
+        uint8_t completedFrames = 0;
+        const meshtastic_MeshPacket *nextPacket = nullptr;
+        PacketId nextPacketId = 0;
+    } w12Burst;
+    bool w12BurstArmSuppressed = false;
+    uint8_t w12BurstSuppressionDepth = 0;
+    bool w12BurstResumeAfterStale = false;
+
+    bool isW12BurstPacket(const meshtastic_MeshPacket *packet) const;
+    bool armW12BurstAfterSuccess(bool currentPacketEligible);
+    void finishW12BurstToNormal();
+    void clearW12BurstState();
+#endif
 
   protected:
     uint32_t activeReceiveStart = 0;

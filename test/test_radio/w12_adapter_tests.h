@@ -10,12 +10,18 @@
 
 #include "../test_radiolib_drivers/RecordingHal.h"
 #include "LR2021Interface.h"
+#include "MeshService.h"
 #include "NodeDB.h"
 #include "PowerMon.h"
+#include "RadioTxHook.h"
 #include "Router.h"
 #include "UptimeClock.h"
 #include "airtime.h"
 #include "modules/W12BenchmarkModule.h"
+
+#include <cstring>
+#include <memory>
+#include <vector>
 
 class W12AdapterHal : public LockingArduinoHal
 {
@@ -232,6 +238,25 @@ class TestableW12Adapter : public LR2021Interface
     size_t takeTransmission(meshtastic_MeshPacket *packet) { return beginSending(packet); }
     bool sendNow(meshtastic_MeshPacket *packet) { return startSend(packet); }
     void serviceNotifications() { checkNotification(); }
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+    static constexpr uint32_t burstGuardMsForTest() { return W12_BURST_GUARD_MS; }
+    bool queueBurstNotificationForTest(uint32_t delay = burstGuardMsForTest())
+    {
+        return notifyLater(delay, W12_BURST_DELAY_COMPLETED, false);
+    }
+    bool queueOrdinaryNotificationForTest() { return notify(TRANSMIT_DELAY_COMPLETED, false); }
+    bool queueTxNotificationForTest() { return notify(ISR_TX, true); }
+    bool queueOnlyForTest(meshtastic_MeshPacket *packet)
+    {
+        bool dropped = false;
+        return txQueue.enqueue(packet, &dropped) && !dropped;
+    }
+    void armOrdinaryTimerForTest() { setTransmitDelay(); }
+    bool reconfigureForTest() { return reconfigure(); }
+    bool burstTimerPendingForTest() const { return w12Burst.timerPending; }
+    bool notifyForTest(uint32_t notification, bool overwrite) { return notify(notification, overwrite); }
+    meshtastic_MeshPacket *frontForTest() { return txQueue.getFront(); }
+#endif
     bool queueTransmission(meshtastic_MeshPacket *packet)
     {
         bool dropped = false;
@@ -250,7 +275,27 @@ class TestableW12Adapter : public LR2021Interface
 
 static W12AdapterHal *adapterHal;
 static TestableW12Adapter *adapter;
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+// Unity assertions longjmp out of a test, so stack-registered RadioTxHooks can
+// outlive their object. Keep test hooks fixture-owned and unregister them before
+// releasing the adapter or any queued packets.
+static RadioTxHook *adapterOwnedTxHook;
+#endif
 static void makeW12Adapter();
+
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+// The production four-frame case temporarily lets Router own the real adapter,
+// so MeshService admission reserves the same W12 owner slots that the radio
+// gate checks. The ordinary adapter tests keep their original ownership path.
+static Router *adapterBurstOwnedRouter;
+static MeshService *adapterBurstOwnedService;
+class AdapterBurstNodeDB;
+static AdapterBurstNodeDB *adapterBurstOwnedNodeDB;
+static Router *adapterBurstSavedRouter;
+static MeshService *adapterBurstSavedService;
+static NodeDB *adapterBurstSavedNodeDB;
+static meshtastic_MyNodeInfo adapterBurstSavedNodeInfo;
+#endif
 
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
 #if defined(MESHTASTIC_W12_BENCHMARK_SINGLE_RX) && MESHTASTIC_W12_BENCHMARK_SINGLE_RX
@@ -301,11 +346,110 @@ class TestableW12AdapterDiagnostics : public W12BenchmarkModule
   public:
     using W12BenchmarkModule::allocReply;
     using W12BenchmarkModule::handleReceived;
+    using W12BenchmarkModule::runOnce;
 };
+static TestableW12AdapterDiagnostics *adapterDiagnostics;
+
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+class AdapterBurstNodeDB : public NodeDB
+{
+  public:
+    void clearTestNodes()
+    {
+        testNodes.clear();
+        meshNodes = &testNodes;
+        numMeshNodes = 0;
+    }
+
+    void addPublicKey(NodeNum num, const uint8_t *key)
+    {
+        meshtastic_NodeInfoLite node = meshtastic_NodeInfoLite_init_zero;
+        node.num = num;
+        node.public_key.size = 32;
+        memcpy(node.public_key.bytes, key, 32);
+        testNodes.push_back(node);
+        meshNodes = &testNodes;
+        numMeshNodes = testNodes.size();
+    }
+
+  private:
+    std::vector<meshtastic_NodeInfoLite> testNodes;
+};
+
+static constexpr NodeNum adapterBurstSource = 0x31313131;
+static constexpr NodeNum adapterBurstDestination = 0x42424242;
+
+static W12BenchmarkModule::RunConfig adapterBurstRun()
+{
+    W12BenchmarkModule::RunConfig run;
+    run.runId = 0x55667788;
+    run.source = adapterBurstSource;
+    run.destination = adapterBurstDestination;
+    run.count = W12BenchmarkModule::MIN_COUNT;
+    run.size = W12BenchmarkModule::DEFAULT_SIZE;
+    run.durationMs = 60000;
+    run.window = 4;
+    return run;
+}
+
+static ProcessMessage sendAdapterBurstControl(W12BenchmarkModule::Op op)
+{
+    meshtastic_MeshPacket control = meshtastic_MeshPacket_init_zero;
+    control.from = 0;
+    control.to = adapterBurstSource;
+    control.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_INTERNAL;
+    control.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    const auto run = adapterBurstRun();
+    control.decoded.portnum = meshtastic_PortNum_PRIVATE_APP;
+    control.decoded.payload.size =
+        W12BenchmarkModule::encodeControl(control.decoded.payload.bytes, sizeof(control.decoded.payload.bytes), op, run);
+    return adapterDiagnostics->handleReceived(control);
+}
+
+static void makeW12BurstOwnerFixture()
+{
+    adapterBurstSavedRouter = router;
+    adapterBurstSavedService = service;
+    adapterBurstSavedNodeDB = nodeDB;
+    adapterBurstSavedNodeInfo = myNodeInfo;
+
+    adapterBurstOwnedNodeDB = new AdapterBurstNodeDB();
+    adapterBurstOwnedNodeDB->clearTestNodes();
+    nodeDB = adapterBurstOwnedNodeDB;
+    myNodeInfo = meshtastic_MyNodeInfo_init_zero;
+    myNodeInfo.my_node_num = adapterBurstSource;
+    config.security.private_key.size = 32;
+    config.security.public_key.size = 32;
+    uint8_t localPublic[32] = {};
+    uint8_t localPrivate[32] = {};
+    uint8_t destinationPublic[32] = {};
+    uint8_t destinationPrivate[32] = {};
+    crypto->generateKeyPair(localPublic, localPrivate);
+    crypto->generateKeyPair(destinationPublic, destinationPrivate);
+    memcpy(config.security.private_key.bytes, localPrivate, sizeof(localPrivate));
+    memcpy(config.security.public_key.bytes, localPublic, sizeof(localPublic));
+    crypto->setDHPrivateKey(localPrivate);
+    adapterBurstOwnedNodeDB->addPublicKey(adapterBurstDestination, destinationPublic);
+
+    makeW12Adapter();
+    initRegion();
+    adapterBurstOwnedRouter = new Router();
+    adapterBurstOwnedRouter->addInterface(std::unique_ptr<RadioInterface>(adapter));
+    router = adapterBurstOwnedRouter;
+    adapterBurstOwnedService = new MeshService();
+    service = adapterBurstOwnedService;
+    adapterDiagnostics = new TestableW12AdapterDiagnostics();
+    channels.initDefaults();
+    channels.onConfigChanged();
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterBurstControl(W12BenchmarkModule::Op::RESET)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterBurstControl(W12BenchmarkModule::Op::START)));
+}
+#endif
 
 static constexpr NodeNum adapterDiagnosticSource = 0x11111111;
 static constexpr NodeNum adapterDiagnosticDestination = 0x22222222;
-static TestableW12AdapterDiagnostics *adapterDiagnostics;
 static NodeDB *adapterDiagnosticsNodeDB;
 static NodeDB *savedAdapterNodeDB;
 static meshtastic_MyNodeInfo savedAdapterNodeInfo;
@@ -507,6 +651,40 @@ static void makeW12Adapter()
 
 static void deleteW12Adapter()
 {
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+    delete adapterOwnedTxHook;
+    adapterOwnedTxHook = nullptr;
+#endif
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+    if (adapterBurstOwnedRouter) {
+        if (adapterDiagnostics) {
+            delete adapterDiagnostics;
+            adapterDiagnostics = nullptr;
+            w12BenchmarkModule = nullptr;
+        }
+        MeshService *ownedService = adapterBurstOwnedService;
+        Router *ownedRouter = adapterBurstOwnedRouter;
+        router = adapterBurstSavedRouter;
+        service = adapterBurstSavedService;
+        nodeDB = adapterBurstSavedNodeDB;
+        myNodeInfo = adapterBurstSavedNodeInfo;
+        adapterBurstOwnedService = nullptr;
+        adapterBurstOwnedRouter = nullptr;
+        delete ownedService;
+        delete ownedRouter; // owns and destroys the production adapter
+        adapter = nullptr;
+        delete adapterHal;
+        adapterHal = nullptr;
+        delete airTime;
+        airTime = savedAdapterAirTime;
+        delete powerMon;
+        powerMon = savedAdapterPowerMon;
+        delete adapterBurstOwnedNodeDB;
+        adapterBurstOwnedNodeDB = nullptr;
+        Time::useRealClock();
+        return;
+    }
+#endif
     if (adapter) {
         adapter->releaseQueuedTransmissions();
         delete adapter;
@@ -1549,6 +1727,506 @@ static void test_w12_adapter_terminal_send_error_and_start_failure_release_witho
     TEST_ASSERT_GREATER_THAN_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
     assertAdapterSetRxTimeout();
 }
+
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+// Drive four packets from the real W12 owner loop through Router/MeshService,
+// then deliver the production RadioLib ISR_TX and guarded notifications. This
+// is intentionally separate from the counter wire seam: ownsTx(pointer, id),
+// queue dequeue, TX_DONE validation, and pool release all participate here.
+static void test_w12_burst_production_four_frame_sequence_counts_and_rearms()
+{
+    makeW12BurstOwnerFixture();
+    const auto liveBefore = packetPoolLiveBytes();
+    for (unsigned i = 0; i < 4; ++i)
+        TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+    TEST_ASSERT_EQUAL_UINT32(4, adapter->packetsInTxQueue());
+    TEST_ASSERT_EQUAL_UINT32(4, adapterDiagnostics->getStats().enqueued);
+    const auto *first = adapter->frontForTest();
+    TEST_ASSERT_NOT_NULL(first);
+    TEST_ASSERT_TRUE(adapterDiagnostics->ownsTx(first));
+
+    adapterHal->irqOnSetTx = RADIOLIB_LR2021_IRQ_TX_DONE;
+    const auto rxBeforeFirst = adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX));
+    adapter->serviceNotifications(); // ordinary timer, CCA, and first SET_TX
+    TEST_ASSERT_TRUE(adapter->isSending());
+
+    for (unsigned frame = 1; frame <= 4; ++frame) {
+        adapter->serviceNotifications(); // confirmed TX_DONE through ISR_TX
+        if (frame < 4) {
+            TEST_ASSERT_TRUE(adapter->burstTimerPendingForTest());
+            const auto rxBeforeGuard = adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX));
+            adapter->serviceNotifications(); // dedicated guarded event starts the next frame
+            TEST_ASSERT_TRUE(adapter->isSending());
+            TEST_ASSERT_EQUAL_UINT32(rxBeforeGuard, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+        } else {
+            TEST_ASSERT_FALSE(adapter->burstTimerPendingForTest());
+        }
+    }
+
+    const auto diagnostics = adapterDiagnostics->getPreSendAttributionDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.burstCount);
+    TEST_ASSERT_EQUAL_UINT32(3, diagnostics.burstArmed);
+    TEST_ASSERT_EQUAL_UINT32(4, diagnostics.burstFrames);
+    TEST_ASSERT_EQUAL_UINT32(0, diagnostics.burstAborted);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterBurstControl(W12BenchmarkModule::Op::SNAPSHOT_PRE_SEND_ATTRIBUTION)));
+    const auto wire = takeAdapterPreSendAttributionReply();
+    TEST_ASSERT_EQUAL_UINT32(3, adapterPreSendU32(wire, 114));
+    TEST_ASSERT_EQUAL_UINT32(4, adapterPreSendU32(wire, 118));
+    TEST_ASSERT_EQUAL_UINT32(0, adapterPreSendU32(wire, 122));
+    TEST_ASSERT_EQUAL_UINT32(1, adapterPreSendU32(wire, 126));
+    TEST_ASSERT_EQUAL_UINT32(4, adapterDiagnostics->getStats().txSucceeded);
+    TEST_ASSERT_EQUAL_UINT32(4, adapterDiagnostics->getDiagnostics().txTerminal);
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->packetsInTxQueue());
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_GREATER_THAN_UINT32(rxBeforeFirst, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+    TEST_ASSERT_EQUAL_INT32(liveBefore, packetPoolLiveBytes());
+}
+
+// Use a real W12 owner slot while TX_DONE is already pending, then enter the
+// LR2021 standby path. The drain must complete the packet under the
+// suppression guard and must leave the second owner packet queued.
+static void test_w12_burst_production_pending_tx_done_standby_does_not_arm()
+{
+    makeW12BurstOwnerFixture();
+    const auto liveBefore = packetPoolLiveBytes();
+    for (unsigned i = 0; i < 2; ++i)
+        TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+    TEST_ASSERT_EQUAL_UINT32(2, adapter->packetsInTxQueue());
+    // Let the production software poll discover TX_DONE after SET_TX. The poll
+    // notification is the one standby must drain under burst suppression.
+    adapterHal->irqOnSetTx = 0;
+    adapter->serviceNotifications(); // ordinary timer starts TX and queues ISR_POLL_TICK
+    TEST_ASSERT_TRUE(adapter->isSending());
+    adapterHal->irq = RADIOLIB_LR2021_IRQ_TX_DONE;
+
+    adapter->stop(); // production standby drains poll -> ISR_TX
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_FALSE(adapter->receiving());
+    TEST_ASSERT_FALSE(adapter->burstTimerPendingForTest());
+    TEST_ASSERT_EQUAL_UINT32(1, adapterDiagnostics->getStats().txSucceeded);
+    TEST_ASSERT_EQUAL_UINT32(0, adapterDiagnostics->getStats().txFailures);
+    TEST_ASSERT_EQUAL_UINT32(1, adapterDiagnostics->getDiagnostics().txTerminal);
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+    const auto burstDiagnostics = adapterDiagnostics->getPreSendAttributionDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(0, burstDiagnostics.burstArmed);
+    TEST_ASSERT_EQUAL_UINT32(0, burstDiagnostics.burstFrames);
+
+    // A completion latched after standby is also stale. It must be consumed
+    // without reconstructing RX or an ordinary TX timer around a null packet.
+    TEST_ASSERT_TRUE(adapter->queueTxNotificationForTest());
+    adapter->serviceNotifications();
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_FALSE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+
+    // No guarded event or ordinary replacement timer may wake standby and
+    // transmit the second owner packet. Release it through the normal queue
+    // cancellation path so the owner slot and pool are both accounted for.
+    adapter->serviceNotifications();
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_FALSE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+    adapter->releaseQueuedTransmissions();
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->packetsInTxQueue());
+    TEST_ASSERT_EQUAL_INT32(liveBefore, packetPoolLiveBytes());
+}
+
+// Reconfigure while frame two is physically in flight. Its guard has already
+// been consumed, so there is no stale dedicated event available to restart the
+// queue. Reconfigure must therefore schedule the ordinary timer after RX is
+// armed, and the failed in-flight owner must not strand frames three and four.
+static void test_w12_burst_production_reconfigure_inflight_frame_resumes_ordinary_queue()
+{
+    makeW12BurstOwnerFixture();
+    for (unsigned i = 0; i < 4; ++i)
+        TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+
+    adapterHal->irqOnSetTx = RADIOLIB_LR2021_IRQ_TX_DONE;
+    adapter->serviceNotifications(); // ordinary timer starts frame one
+    adapter->serviceNotifications(); // ISR_TX arms the first guard
+    TEST_ASSERT_TRUE(adapter->burstTimerPendingForTest());
+
+    // Consume the guard and start frame two without TX_DONE. Reconfigure now
+    // sees active=true and timerPending=false, with an ISR_POLL_TICK pending.
+    adapterHal->irqOnSetTx = 0;
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->isSending());
+    TEST_ASSERT_FALSE(adapter->burstTimerPendingForTest());
+    TEST_ASSERT_TRUE(adapter->reconfigureForTest());
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(1, adapterDiagnostics->getStats().txFailures);
+    TEST_ASSERT_EQUAL_UINT32(2, adapter->packetsInTxQueue());
+
+    // The ordinary timer created after RX rearm must drive frame three. Its
+    // completion may start a fresh bounded sequence for frame four, which is
+    // still checked through the production guarded notification path.
+    adapterHal->irqOnSetTx = RADIOLIB_LR2021_IRQ_TX_DONE;
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->isSending());
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->burstTimerPendingForTest());
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->isSending());
+    adapter->serviceNotifications();
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_FALSE(adapter->burstTimerPendingForTest());
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->packetsInTxQueue());
+    TEST_ASSERT_EQUAL_UINT32(3, adapterDiagnostics->getStats().txSucceeded);
+    TEST_ASSERT_EQUAL_UINT32(4, adapterDiagnostics->getDiagnostics().txTerminal);
+}
+
+// An ISR_TX notification can overwrite the single guarded notification slot
+// after the previous frame has already released sendingPacket. The null-packet
+// path must recover the ordinary handoff when that displaced event represented
+// a live burst, including the reconfigure and STOP stale-event markers. An
+// explicit standby case remains inert.
+static void test_w12_burst_null_tx_overwrite_restores_live_handoffs()
+{
+    makeW12BurstOwnerFixture();
+    for (unsigned i = 0; i < 2; ++i)
+        TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+    adapterHal->irqOnSetTx = RADIOLIB_LR2021_IRQ_TX_DONE;
+    adapter->serviceNotifications();
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->burstTimerPendingForTest());
+    TEST_ASSERT_TRUE(adapter->queueTxNotificationForTest());
+    adapter->serviceNotifications();
+    TEST_ASSERT_FALSE(adapter->burstTimerPendingForTest());
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+    adapter->serviceNotifications();
+    adapter->serviceNotifications();
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->packetsInTxQueue());
+    TEST_ASSERT_EQUAL_UINT32(2, adapterDiagnostics->getStats().txSucceeded);
+    deleteW12Adapter();
+
+    makeW12BurstOwnerFixture();
+    for (unsigned i = 0; i < 2; ++i)
+        TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+    adapterHal->irqOnSetTx = RADIOLIB_LR2021_IRQ_TX_DONE;
+    adapter->serviceNotifications();
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->burstTimerPendingForTest());
+    TEST_ASSERT_TRUE(adapter->reconfigureForTest());
+    TEST_ASSERT_FALSE(adapter->burstTimerPendingForTest());
+    TEST_ASSERT_TRUE(adapter->queueTxNotificationForTest());
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+    adapter->serviceNotifications();
+    adapter->serviceNotifications();
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->packetsInTxQueue());
+    TEST_ASSERT_EQUAL_UINT32(2, adapterDiagnostics->getStats().txSucceeded);
+    deleteW12Adapter();
+
+    makeW12BurstOwnerFixture();
+    for (unsigned i = 0; i < 2; ++i)
+        TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+    adapterHal->irqOnSetTx = RADIOLIB_LR2021_IRQ_TX_DONE;
+    adapter->serviceNotifications();
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->burstTimerPendingForTest());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterBurstControl(W12BenchmarkModule::Op::STOP)));
+    TEST_ASSERT_TRUE(adapter->queueTxNotificationForTest());
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+    adapter->serviceNotifications();
+    adapter->serviceNotifications();
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->packetsInTxQueue());
+    TEST_ASSERT_EQUAL_UINT32(2, adapterDiagnostics->getStats().txSucceeded);
+}
+
+// A late ISR_TX can also overwrite an ordinary timer with no burst state at
+// all. The real unowned queue must retain its normal timer and complete the
+// second packet through the ordinary path.
+static void test_w12_burst_null_tx_overwrite_restores_ordinary_timer()
+{
+    makeW12Adapter();
+    adapter->stop();
+    adapter->armReceive();
+    adapterHal->irqOnSetTx = RADIOLIB_LR2021_IRQ_TX_DONE;
+    TEST_ASSERT_TRUE(adapter->queueTransmission(makeAdapterTransmission()));
+    TEST_ASSERT_TRUE(adapter->queueOnlyForTest(makeAdapterTransmission()));
+
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->isSending());
+    adapter->serviceNotifications();
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+
+    TEST_ASSERT_TRUE(adapter->queueTxNotificationForTest());
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->isSending());
+    adapter->serviceNotifications();
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->packetsInTxQueue());
+    TEST_ASSERT_EQUAL_UINT32(2, adapter->goodTransmits());
+}
+
+// STOP/deadline aborts clear the in-memory burst state before the one-slot
+// guarded event can be cancelled. Its stale dispatch must repair the ordinary
+// timer, while explicit standby must consume the same stale event without
+// waking the radio.
+static void test_w12_burst_stop_and_standby_stale_events_preserve_normal_send()
+{
+    makeW12BurstOwnerFixture();
+    for (unsigned i = 0; i < 2; ++i)
+        TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+    adapterHal->irqOnSetTx = RADIOLIB_LR2021_IRQ_TX_DONE;
+    adapter->serviceNotifications(); // ordinary timer starts frame one
+    adapter->serviceNotifications(); // ISR_TX arms the guarded event
+    TEST_ASSERT_TRUE(adapter->burstTimerPendingForTest());
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterBurstControl(W12BenchmarkModule::Op::STOP)));
+    TEST_ASSERT_FALSE(adapter->burstTimerPendingForTest());
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+
+    // The abort-owned stale event restores the ordinary timer and sends the
+    // queued packet through the normal lifecycle.
+    adapter->serviceNotifications();
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->isSending());
+    adapter->serviceNotifications();
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_EQUAL_UINT32(2, adapterDiagnostics->getStats().txSucceeded);
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->packetsInTxQueue());
+
+    // Recreate a pending guarded event with a fresh run, then finish it by
+    // deadline. The stale event must restore the ordinary timer so the queued
+    // packet is not stranded.
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterBurstControl(W12BenchmarkModule::Op::RESET)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterBurstControl(W12BenchmarkModule::Op::START)));
+    for (unsigned i = 0; i < 2; ++i)
+        TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+    adapter->serviceNotifications();
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->burstTimerPendingForTest());
+    Time::advanceTestMillis(adapterBurstRun().durationMs + TestableW12Adapter::burstGuardMsForTest() + 1);
+    adapterDiagnostics->runOnce();
+    TEST_ASSERT_FALSE(adapter->burstTimerPendingForTest());
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+    adapter->serviceNotifications(); // consume stale event and restore normal timer
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->isSending());
+    adapter->serviceNotifications();
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_EQUAL_UINT32(2, adapterDiagnostics->getStats().txSucceeded);
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->packetsInTxQueue());
+
+    // A third run takes explicit standby with a pending guard. The stale event
+    // must not wake the radio or dequeue the packet; a later explicit RX arm
+    // and ordinary timer remain usable.
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterBurstControl(W12BenchmarkModule::Op::RESET)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterBurstControl(W12BenchmarkModule::Op::START)));
+    for (unsigned i = 0; i < 2; ++i)
+        TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+    adapter->serviceNotifications();
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->burstTimerPendingForTest());
+    adapter->stop();
+    TEST_ASSERT_FALSE(adapter->burstTimerPendingForTest());
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+    adapter->serviceNotifications(); // consume stale event; standby remains inert
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_FALSE(adapter->receiving());
+
+    adapter->armReceive();
+    adapter->armOrdinaryTimerForTest();
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->isSending());
+    adapter->serviceNotifications();
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_EQUAL_UINT32(2, adapterDiagnostics->getStats().txSucceeded);
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->packetsInTxQueue());
+}
+
+class BurstDraftTxHook : public RadioTxHook
+{
+  public:
+    explicit BurstDraftTxHook(PreTxAction result) : result(result) {}
+
+    PreTxAction beforeTransmit(RadioInterface *, meshtastic_MeshPacket *) override { return result; }
+    void packetReleased(RadioInterface *, const meshtastic_MeshPacket *) override { released++; }
+
+    PreTxAction result;
+    unsigned released = 0;
+};
+
+class StandbyReconfigureTxHook : public RadioTxHook
+{
+  public:
+    PreTxAction beforeTransmit(RadioInterface *, meshtastic_MeshPacket *) override { return RadioTxHook::PRETX_SEND; }
+    void packetReleased(RadioInterface *, const meshtastic_MeshPacket *) override
+    {
+        ++released;
+        if (!reconfigured && adapter)
+            reconfigured = adapter->reconfigureForTest();
+    }
+
+    bool reconfigured = false;
+    unsigned released = 0;
+};
+
+// A release hook may reconfigure the radio while explicit standby is still
+// unwinding. The nested reconfigure must apply config without rearming RX or
+// scheduling ordinary TX, and the caller must remain in standby until an
+// explicit RX restart.
+static void test_w12_burst_standby_release_hook_reconfigure_stays_standby()
+{
+    makeW12BurstOwnerFixture();
+    const auto liveBefore = packetPoolLiveBytes();
+    for (unsigned i = 0; i < 2; ++i)
+        TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+    adapterHal->irqOnSetTx = 0;
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->isSending());
+
+    auto *hook = new StandbyReconfigureTxHook();
+    adapterOwnedTxHook = hook;
+    adapter->stop();
+    TEST_ASSERT_TRUE(hook->reconfigured);
+    TEST_ASSERT_EQUAL_UINT32(1, hook->released);
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_FALSE(adapter->receiving());
+    TEST_ASSERT_FALSE(adapter->burstTimerPendingForTest());
+    TEST_ASSERT_EQUAL_UINT32(1, adapterDiagnostics->getStats().txFailures);
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+
+    adapter->serviceNotifications();
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_FALSE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+
+    adapter->armReceive();
+    adapter->armOrdinaryTimerForTest();
+    adapterHal->irqOnSetTx = RADIOLIB_LR2021_IRQ_TX_DONE;
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->isSending());
+    adapter->serviceNotifications();
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->packetsInTxQueue());
+    TEST_ASSERT_EQUAL_UINT32(1, adapterDiagnostics->getStats().txSucceeded);
+    TEST_ASSERT_EQUAL_UINT32(2, adapterDiagnostics->getDiagnostics().txTerminal);
+    TEST_ASSERT_EQUAL_UINT32(2, hook->released);
+    TEST_ASSERT_EQUAL_INT32(liveBefore, packetPoolLiveBytes());
+}
+
+// The guarded event repeats the production pre-TX hook contract. Keep these
+// real-HAL cases beside the adapter lifecycle tests so DROP and DEFER cannot
+// regress into a dequeue or a double release while the draft is enabled.
+static void test_w12_burst_pre_tx_defer_and_drop_preserve_hook_ownership()
+{
+    makeW12BurstOwnerFixture();
+    const auto deferLiveBefore = packetPoolLiveBytes();
+    for (unsigned i = 0; i < 2; ++i)
+        TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+    adapterHal->irqOnSetTx = RADIOLIB_LR2021_IRQ_TX_DONE;
+    adapter->serviceNotifications();
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->burstTimerPendingForTest());
+    auto *deferHook = new BurstDraftTxHook(RadioTxHook::PRETX_DEFER);
+    adapterOwnedTxHook = deferHook;
+    adapter->serviceNotifications();
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+    TEST_ASSERT_EQUAL_UINT32(0, deferHook->released);
+    TEST_ASSERT_FALSE(adapter->burstTimerPendingForTest());
+    adapter->releaseQueuedTransmissions();
+    TEST_ASSERT_EQUAL_INT32(deferLiveBefore, packetPoolLiveBytes());
+    deleteW12Adapter();
+
+    makeW12BurstOwnerFixture();
+    const auto dropLiveBefore = packetPoolLiveBytes();
+    for (unsigned i = 0; i < 2; ++i)
+        TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+    adapterHal->irqOnSetTx = RADIOLIB_LR2021_IRQ_TX_DONE;
+    adapter->serviceNotifications();
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->burstTimerPendingForTest());
+    auto *dropHook = new BurstDraftTxHook(RadioTxHook::PRETX_DROP);
+    adapterOwnedTxHook = dropHook;
+    adapter->serviceNotifications();
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->packetsInTxQueue());
+    TEST_ASSERT_EQUAL_UINT32(1, dropHook->released);
+    TEST_ASSERT_EQUAL_INT32(dropLiveBefore, packetPoolLiveBytes());
+}
+
+// A TX_DONE may already be queued when a maintenance or STOP path enters standby.
+// The real LR2021 standby drain must finish that notification while burst arming is
+// suppressed, then leave the radio in standby without a second guarded event.
+static void test_w12_burst_pending_tx_done_is_drained_without_rearming()
+{
+    makeW12Adapter();
+    adapter->stop();
+    adapterHal->irqOnSetTx = RADIOLIB_LR2021_IRQ_TX_DONE;
+    auto *packet = makeAdapterTransmission();
+    TEST_ASSERT_TRUE(adapter->sendNow(packet));
+    TEST_ASSERT_TRUE(adapter->isSending());
+
+    adapter->stop();
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_FALSE(adapter->receiving());
+    TEST_ASSERT_FALSE(adapter->burstTimerPendingForTest());
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->goodTransmits());
+}
+
+// Reconfigure cannot erase NotifiedWorkerThread's one pending slot. Drive a
+// real owner guard through reconfigure, consume that stale event, and verify
+// the queued second owner packet completes through the ordinary lifecycle.
+static void test_w12_burst_reconfigure_consumes_stale_event_before_ordinary_send()
+{
+    makeW12BurstOwnerFixture();
+    const auto liveBefore = packetPoolLiveBytes();
+    for (unsigned i = 0; i < 2; ++i)
+        TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+    adapterHal->irqOnSetTx = RADIOLIB_LR2021_IRQ_TX_DONE;
+    adapter->serviceNotifications();
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->burstTimerPendingForTest());
+    TEST_ASSERT_TRUE(adapter->reconfigureForTest());
+    TEST_ASSERT_FALSE(adapter->burstTimerPendingForTest());
+
+    adapter->serviceNotifications(); // stale guard consumes and schedules ordinary TX
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->isSending());
+    adapter->serviceNotifications();
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_EQUAL_UINT32(2, adapterDiagnostics->getStats().txSucceeded);
+    TEST_ASSERT_EQUAL_UINT32(2, adapterDiagnostics->getDiagnostics().txTerminal);
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->packetsInTxQueue());
+    TEST_ASSERT_EQUAL_INT32(liveBefore, packetPoolLiveBytes());
+}
+
+// A non-overwriting guarded notification must fail closed when the single
+// notification slot is occupied. The queue remains owned by the ordinary path.
+static void test_w12_burst_scheduler_rejection_keeps_packet_queued()
+{
+    makeW12Adapter();
+    adapter->stop();
+    auto *packet = makeAdapterTransmission();
+    TEST_ASSERT_TRUE(adapter->queueOnlyForTest(packet));
+    TEST_ASSERT_TRUE(adapter->queueOrdinaryNotificationForTest());
+    TEST_ASSERT_FALSE(adapter->queueBurstNotificationForTest());
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+    adapter->releaseQueuedTransmissions();
+}
+#endif
 #else
 static void test_w12_adapter_default_gate_refuses_flrc_send_and_releases_packet()
 {
@@ -1610,6 +2288,19 @@ static void runW12AdapterTests()
     RUN_TEST(test_w12_adapter_send_without_tx_done_times_out_and_releases_packet_once);
     RUN_TEST(test_w12_adapter_failed_irq_status_cannot_credit_stale_tx_done);
     RUN_TEST(test_w12_adapter_terminal_send_error_and_start_failure_release_without_success);
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+    RUN_TEST(test_w12_burst_production_four_frame_sequence_counts_and_rearms);
+    RUN_TEST(test_w12_burst_production_pending_tx_done_standby_does_not_arm);
+    RUN_TEST(test_w12_burst_production_reconfigure_inflight_frame_resumes_ordinary_queue);
+    RUN_TEST(test_w12_burst_null_tx_overwrite_restores_live_handoffs);
+    RUN_TEST(test_w12_burst_null_tx_overwrite_restores_ordinary_timer);
+    RUN_TEST(test_w12_burst_standby_release_hook_reconfigure_stays_standby);
+    RUN_TEST(test_w12_burst_stop_and_standby_stale_events_preserve_normal_send);
+    RUN_TEST(test_w12_burst_pre_tx_defer_and_drop_preserve_hook_ownership);
+    RUN_TEST(test_w12_burst_pending_tx_done_is_drained_without_rearming);
+    RUN_TEST(test_w12_burst_reconfigure_consumes_stale_event_before_ordinary_send);
+    RUN_TEST(test_w12_burst_scheduler_rejection_keeps_packet_queued);
+#endif
 #else
     RUN_TEST(test_w12_adapter_default_gate_refuses_flrc_send_and_releases_packet);
 #endif
