@@ -130,6 +130,8 @@ void LR2021Interface::startReceive()
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
 #if defined(MESHTASTIC_W12_BENCHMARK_SINGLE_RX) && MESHTASTIC_W12_BENCHMARK_SINGLE_RX
     constexpr uint32_t rxTimeout = RADIOLIB_LR2021_RX_TIMEOUT_NONE;
+#elif defined(MESHTASTIC_W12_BENCHMARK_RX_TIMEOUT_MS)
+    constexpr uint32_t rxTimeout = W12FlrcProfile::RX_TIMEOUT_TICKS;
 #else
     constexpr uint32_t rxTimeout = RADIOLIB_LR2021_RX_TIMEOUT_INF;
 #endif

@@ -249,6 +249,12 @@ static void makeW12Adapter();
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
 #if defined(MESHTASTIC_W12_BENCHMARK_SINGLE_RX) && MESHTASTIC_W12_BENCHMARK_SINGLE_RX
 static constexpr uint8_t adapterExpectedRxTimeout[3] = {0, 0, 0};
+#elif defined(MESHTASTIC_W12_BENCHMARK_RX_TIMEOUT_MS)
+static constexpr uint8_t adapterExpectedRxTimeout[3] = {
+    static_cast<uint8_t>(W12FlrcProfile::RX_TIMEOUT_TICKS >> 16),
+    static_cast<uint8_t>(W12FlrcProfile::RX_TIMEOUT_TICKS >> 8),
+    static_cast<uint8_t>(W12FlrcProfile::RX_TIMEOUT_TICKS),
+};
 #else
 static constexpr uint8_t adapterExpectedRxTimeout[3] = {0xFF, 0xFF, 0xFF};
 #endif
@@ -264,6 +270,11 @@ static void assertAdapterSetRxTimeout()
     TEST_ASSERT_EQUAL_UINT8(adapterExpectedRxTimeout[0], (*setRx)[2]);
     TEST_ASSERT_EQUAL_UINT8(adapterExpectedRxTimeout[1], (*setRx)[3]);
     TEST_ASSERT_EQUAL_UINT8(adapterExpectedRxTimeout[2], (*setRx)[4]);
+#if defined(MESHTASTIC_W12_BENCHMARK_RX_TIMEOUT_MS) && MESHTASTIC_W12_BENCHMARK_RX_TIMEOUT_MS == 1000
+    TEST_ASSERT_EQUAL_UINT8(0x00, (*setRx)[2]);
+    TEST_ASSERT_EQUAL_UINT8(0x80, (*setRx)[3]);
+    TEST_ASSERT_EQUAL_UINT8(0x00, (*setRx)[4]);
+#endif
 }
 
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
@@ -878,8 +889,80 @@ static void test_w12_adapter_rx_arm_uses_configured_fallback_and_expected_timeou
     TEST_ASSERT_NOT_NULL(fallback);
     TEST_ASSERT_GREATER_OR_EQUAL_size_t(3, fallback->size());
     TEST_ASSERT_EQUAL_UINT8(RADIOLIB_LR2021_FALLBACK_MODE_STBY_RC, (*fallback)[2]);
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
     assertAdapterSetRxTimeout();
 }
+
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && defined(MESHTASTIC_W12_BENCHMARK_RX_TIMEOUT_MS)
+static size_t adapterTransactionIndex(const std::vector<uint8_t> &prefix, size_t occurrence)
+{
+    size_t seen = 0;
+    for (size_t index = 0; index < adapterHal->recording.transactions.size(); ++index) {
+        const auto &transaction = adapterHal->recording.transactions[index];
+        if (transaction.size() >= prefix.size() && std::equal(prefix.begin(), prefix.end(), transaction.begin()) &&
+            ++seen == occurrence)
+            return index;
+    }
+    return adapterHal->recording.transactions.size();
+}
+
+// A finite chip timeout is diagnostic only: every normal ISR/poll path must reject TIMEOUT, clear it,
+// and re-arm RX with the same measured 24-bit timeout without reading a payload.
+static void assertFiniteTimeoutRearm(uint32_t expectedBadReceives)
+{
+    TEST_ASSERT_EQUAL_UINT32(expectedBadReceives, adapter->badReceives());
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_FALSE(adapter->isOffline());
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->irq);
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_READ_RX_FIFO)));
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+    assertAdapterSetRxTimeout();
+
+    const size_t clearIndex = adapterTransactionIndex(op16(RADIOLIB_LR2021_CMD_CLEAR_IRQ), 1);
+    const size_t standbyIndex = adapterTransactionIndex(op16(RADIOLIB_LR2021_CMD_SET_STANDBY), 1);
+    const size_t dioBeforeIndex = adapterTransactionIndex(op16(RADIOLIB_LR2021_CMD_SET_DIO_IRQ_CONFIG), 1);
+    const size_t setRxIndex = adapterTransactionIndex(op16(RADIOLIB_LR2021_CMD_SET_RX), 1);
+    const size_t dioAfterIndex = adapterTransactionIndex(op16(RADIOLIB_LR2021_CMD_SET_DIO_IRQ_CONFIG), 2);
+    const auto *dioBefore = adapterHal->recording.first(op16(RADIOLIB_LR2021_CMD_SET_DIO_IRQ_CONFIG));
+    TEST_ASSERT_NOT_NULL(dioBefore);
+    TEST_ASSERT_GREATER_OR_EQUAL_size_t(7, dioBefore->size());
+    const uint32_t dioBeforeFlags = (uint32_t((*dioBefore)[3]) << 24) | (uint32_t((*dioBefore)[4]) << 16) |
+                                    (uint32_t((*dioBefore)[5]) << 8) | (*dioBefore)[6];
+    TEST_ASSERT_TRUE(dioBeforeFlags & RADIOLIB_LR2021_IRQ_TIMEOUT);
+    TEST_ASSERT_TRUE(setRxIndex < adapterHal->recording.transactions.size());
+    TEST_ASSERT_TRUE(clearIndex < standbyIndex);
+    TEST_ASSERT_TRUE(standbyIndex < dioBeforeIndex);
+    TEST_ASSERT_TRUE(dioBeforeIndex < setRxIndex);
+    TEST_ASSERT_TRUE(setRxIndex < dioAfterIndex);
+}
+
+static void test_w12_adapter_finite_timeout_rejects_and_rearms()
+{
+    makeW12Adapter();
+    const uint32_t badBefore = adapter->badReceives();
+
+    adapterHal->recording.transactions.clear();
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_TIMEOUT);
+    adapter->serviceNotifications();
+    assertFiniteTimeoutRearm(badBefore + 1);
+
+    adapterHal->recording.transactions.clear();
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_TIMEOUT);
+    adapter->serviceNotifications();
+    assertFiniteTimeoutRearm(badBefore + 2);
+
+    adapterHal->recording.transactions.clear();
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE | RADIOLIB_LR2021_IRQ_TIMEOUT);
+    adapter->serviceNotifications();
+    assertFiniteTimeoutRearm(badBefore + 3);
+
+    adapterHal->recording.transactions.clear();
+    adapterHal->irq = RADIOLIB_LR2021_IRQ_TIMEOUT;
+    adapter->pollMissedIrqs();
+    adapter->serviceNotifications();
+    assertFiniteTimeoutRearm(badBefore + 4);
+}
+#endif
 
 static void test_w12_adapter_failed_rx_remains_offline_until_successful_rearm()
 {
@@ -1371,6 +1454,9 @@ static void test_w12_adapter_default_gate_refuses_flrc_send_and_releases_packet(
 static void runW12AdapterTests()
 {
     RUN_TEST(test_w12_adapter_rx_arm_uses_configured_fallback_and_expected_timeout);
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && defined(MESHTASTIC_W12_BENCHMARK_RX_TIMEOUT_MS)
+    RUN_TEST(test_w12_adapter_finite_timeout_rejects_and_rearms);
+#endif
     RUN_TEST(test_w12_adapter_recovery_preserves_active_flrc_and_rearms_rx);
     RUN_TEST(test_w12_adapter_failed_rx_remains_offline_until_successful_rearm);
     RUN_TEST(test_w12_adapter_sensing_busy_and_failed_reads_defer_without_lora_cad);
