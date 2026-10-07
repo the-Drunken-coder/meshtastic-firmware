@@ -43,6 +43,14 @@ void LockingArduinoHal::spiTransfer(uint8_t *out, size_t len, uint8_t *in)
 }
 #endif
 
+#if defined(ARCH_ESP32) && defined(MESHNOLOGY_W12) && defined(MESHTASTIC_W12_BENCHMARK) && MESHTASTIC_W12_BENCHMARK &&           \
+    defined(MESHTASTIC_W12_BENCHMARK_BULK_SPI) && MESHTASTIC_W12_BENCHMARK_BULK_SPI
+void LockingArduinoHal::spiTransfer(uint8_t *out, size_t len, uint8_t *in)
+{
+    w12_bulk_spi::transfer(*spi, out, len, in);
+}
+#endif
+
 RadioLibInterface::RadioLibInterface(LockingArduinoHal *hal, RADIOLIB_PIN_TYPE cs, RADIOLIB_PIN_TYPE irq, RADIOLIB_PIN_TYPE rst,
                                      RADIOLIB_PIN_TYPE busy, PhysicalLayer *_iface)
     : NotifiedWorkerThread("RadioIf"), module(hal, cs, irq, rst, busy), iface(_iface)
