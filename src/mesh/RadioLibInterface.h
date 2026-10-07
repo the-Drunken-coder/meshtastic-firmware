@@ -12,6 +12,11 @@
 static_assert(std::atomic<uint32_t>::is_always_lock_free, "W12 radio diagnostic state requires lock-free 32-bit atomics");
 #endif
 
+#if defined(ARCH_ESP32) && defined(MESHNOLOGY_W12) && defined(MESHTASTIC_W12_BENCHMARK) && MESHTASTIC_W12_BENCHMARK &&           \
+    defined(MESHTASTIC_W12_BENCHMARK_BULK_SPI) && MESHTASTIC_W12_BENCHMARK_BULK_SPI
+#include "W12BulkSpiTransfer.h"
+#endif
+
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
 struct W12RxLivenessSample {
     uint32_t rawIrqFlags = 0;
@@ -61,6 +66,10 @@ class LockingArduinoHal : public ArduinoHal
 #if ARCH_PORTDUINO
     void spiTransfer(uint8_t *out, size_t len, uint8_t *in) override;
 
+#endif
+#if defined(ARCH_ESP32) && defined(MESHNOLOGY_W12) && defined(MESHTASTIC_W12_BENCHMARK) && MESHTASTIC_W12_BENCHMARK &&           \
+    defined(MESHTASTIC_W12_BENCHMARK_BULK_SPI) && MESHTASTIC_W12_BENCHMARK_BULK_SPI
+    void spiTransfer(uint8_t *out, size_t len, uint8_t *in) override;
 #endif
 };
 
