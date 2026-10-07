@@ -835,6 +835,7 @@ void W12BenchmarkModule::onRxArmStage(RxArmStage stage, int16_t result, bool ret
         if (result != RADIOLIB_ERR_NONE)
             saturatingIncrement(radioDiagnostics.rxIrqMapFailures);
         break;
+    case RxArmStage::FIFO_CLEAR:
     case RxArmStage::NONE:
         break;
     }

@@ -78,7 +78,7 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     };
 
     enum class RxDecodeResult : uint8_t { Success, Reject, Opaque };
-    enum class RxArmStage : uint8_t { NONE = 0, STANDBY = 1, RX_START = 2, IRQ_MAP = 3 };
+    enum class RxArmStage : uint8_t { NONE = 0, STANDBY = 1, RX_START = 2, IRQ_MAP = 3, FIFO_CLEAR = 4 };
     enum class RadioPhase : uint8_t { RX_START = 0, CHANNEL_ACTIVE = 1, START_SEND = 2 };
     enum class RxLivenessRearmResult : uint8_t { NEVER_PERFORMED = 0, SOFTWARE_ARMED = 1, SOFTWARE_NOT_ARMED = 2 };
 

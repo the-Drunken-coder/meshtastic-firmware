@@ -1149,7 +1149,7 @@
         1,
         "rx_arm_last_stage",
         "u8",
-        "0 success, 1 standby, 2 RX start, 3 IRQ map, 255 no attempt"
+        "0 success, 1 standby, 2 RX start, 3 IRQ map, 4 finite-RX FIFO clear, 255 no attempt"
       ],
       [
         217,

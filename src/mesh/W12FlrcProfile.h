@@ -40,6 +40,11 @@ static_assert(RX_TIMEOUT_TICKS_WIDE > 0 && RX_TIMEOUT_TICKS_WIDE <= RX_TIMEOUT_M
               "Diagnostic RX timeout does not fit a finite LR2021 24-bit timeout");
 constexpr uint32_t RX_TIMEOUT_TICKS = static_cast<uint32_t>(RX_TIMEOUT_TICKS_WIDE);
 #endif
+#if defined(MESHTASTIC_W12_BENCHMARK_RX_FIFO_CLEAR) && MESHTASTIC_W12_BENCHMARK_RX_FIFO_CLEAR
+#if !(MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) || !defined(MESHTASTIC_W12_BENCHMARK_RX_TIMEOUT_MS)
+#error "Diagnostic RX FIFO clear requires the finite-RX benchmark"
+#endif
+#endif
 #if MESHTASTIC_W12_BENCHMARK && defined(MESHTASTIC_W12_BENCHMARK_BUSY_DBM)
 constexpr int16_t BUSY_THRESHOLD_DBM = MESHTASTIC_W12_BENCHMARK_BUSY_DBM;
 static_assert(BUSY_THRESHOLD_DBM >= -110 && BUSY_THRESHOLD_DBM <= -60, "Diagnostic CCA threshold out of range");
@@ -129,6 +134,14 @@ inline int16_t readIrqFlags(Module &module, uint32_t &flags, uint16_t *rawStatus
 
 // These LR2021 FIFO helpers are protected by RadioLib unless GODMODE is enabled. Keep the
 // diagnostic access bounded to the existing command/status stream helper and expose no driver API.
+#if defined(MESHTASTIC_W12_BENCHMARK_RX_FIFO_CLEAR) && MESHTASTIC_W12_BENCHMARK_RX_FIFO_CLEAR
+// Match the pinned driver's protected clearRxFifo command, including its command-status check.
+inline int16_t clearRxFifo(Module &module)
+{
+    return module.SPIwriteStream(RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO, nullptr, 0, true, true);
+}
+#endif
+
 inline int16_t readFifoIrqFlags(Module &module, uint8_t &rxFlags, uint8_t &txFlags)
 {
     uint8_t data[2] = {};

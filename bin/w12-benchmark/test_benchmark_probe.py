@@ -353,6 +353,10 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(serialized["scope"], "board_local_radio_phase")
         self.assertEqual(serialized["status"], "complete")
         self.assertEqual(serialized["rx_arm_last_stage"], "success")
+        fifo_failure = benchmark.decode_radio_diagnostics(
+            radio_diagnostic_payload(run, rx_arm_last_stage=4)
+        )
+        self.assertEqual(benchmark._radio_diagnostic_dict(fifo_failure)["rx_arm_last_stage"], "fifo_clear")
         self.assertEqual(serialized["rx_done_bucket_anchor"], "local_START")
         self.assertTrue(serialized["last_rx_read_age_unknown"])
         self.assertIsNone(serialized["last_rx_read_age_ms"])
@@ -377,7 +381,7 @@ class ProtocolTests(unittest.TestCase):
             "pending_status_mismatch": bytes(valid[:20] + b"\x05\x01" + valid[22:]),
             "poll_done": bytes(valid[:146] + b"\x02" + valid[147:]),
             "attachment": bytes(valid[:149] + b"\x04" + valid[150:]),
-            "stage": bytes(valid[:216] + b"\x04" + valid[217:]),
+            "stage": bytes(valid[:216] + b"\x05" + valid[217:]),
             "chip_status_observed": bytes(valid[:219] + b"\x02" + valid[220:]),
         }
         for name, payload in adverse.items():
