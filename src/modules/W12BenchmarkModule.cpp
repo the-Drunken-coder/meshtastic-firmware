@@ -22,7 +22,7 @@ constexpr int32_t kProducerIntervalMs = 0;
 bool validOperation(W12BenchmarkModule::Op op)
 {
     return op == W12BenchmarkModule::Op::RESET || op == W12BenchmarkModule::Op::START || op == W12BenchmarkModule::Op::STOP ||
-           op == W12BenchmarkModule::Op::SNAPSHOT;
+           op == W12BenchmarkModule::Op::SNAPSHOT || op == W12BenchmarkModule::Op::SNAPSHOT_DIAGNOSTICS;
 }
 } // namespace
 
@@ -30,6 +30,17 @@ W12BenchmarkModule::W12BenchmarkModule()
     : MeshModule("W12Benchmark", meshtastic_PortNum_PRIVATE_APP), concurrency::OSThread("W12Benchmark")
 {
     w12BenchmarkModule = this;
+}
+
+void W12BenchmarkModule::saturatingIncrement(uint32_t &value)
+{
+    if (value != UINT32_MAX)
+        ++value;
+}
+
+void W12BenchmarkModule::saturatingAdd(uint32_t &value, uint32_t amount)
+{
+    value = UINT32_MAX - value < amount ? UINT32_MAX : value + amount;
 }
 
 void W12BenchmarkModule::put16(uint8_t *bytes, uint16_t value)
@@ -177,6 +188,70 @@ size_t W12BenchmarkModule::encodeReport(uint8_t *bytes, size_t capacity, const S
     return REPORT_BYTES;
 }
 
+size_t W12BenchmarkModule::encodeDiagnosticsReport(uint8_t *bytes, size_t capacity, const Stats &value, const Diagnostics &d,
+                                                   uint8_t pendingTxCount)
+{
+    if (!bytes || capacity < DIAGNOSTIC_REPORT_BYTES)
+        return 0;
+
+    memset(bytes, 0, DIAGNOSTIC_REPORT_BYTES);
+    put16(bytes, MAGIC);
+    bytes[2] = VERSION;
+    bytes[3] = static_cast<uint8_t>(Kind::DIAGNOSTICS);
+    put32(bytes + 4, value.config.runId);
+    put32(bytes + 8, value.config.source);
+    put32(bytes + 12, value.config.destination);
+    put32(bytes + 16, value.elapsedMs);
+    bytes[20] = static_cast<uint8_t>((value.prepared ? 1 : 0) | (value.running ? 2 : 0) | (value.complete ? 4 : 0) |
+                                     (d.ccaRssiSampleCount ? 8 : 0) | (pendingTxCount ? 16 : 0) |
+                                     (value.running || pendingTxCount ? 32 : 0));
+    bytes[21] = pendingTxCount;
+
+    put32(bytes + 24, d.txDelayScheduledAttempts);
+    put32(bytes + 28, d.preCanSendDeferred);
+    put32(bytes + 32, d.ccaDecisions);
+    for (uint8_t i = 0; i < 7; i++)
+        put32(bytes + 36 + i * sizeof(uint32_t), d.ccaReasons[i]);
+    put32(bytes + 64, d.ccaRssiSampleCount);
+    put16(bytes + 68, static_cast<uint16_t>(d.ccaRssiMinDbm));
+    put16(bytes + 70, static_cast<uint16_t>(d.ccaRssiMaxDbm));
+    for (uint8_t i = 0; i < 8; i++)
+        put32(bytes + 72 + i * sizeof(uint32_t), d.ccaRssiHistogram[i]);
+    put32(bytes + 104, d.queueStartDurationCount);
+    put32(bytes + 108, d.queueStartDurationSumMs);
+    put32(bytes + 112, d.queueStartDurationMaxMs);
+    put32(bytes + 116, d.txDurationCount);
+    put32(bytes + 120, d.txDurationSumMs);
+    put32(bytes + 124, d.txDurationMaxMs);
+    put32(bytes + 128, d.txStarted);
+    put32(bytes + 132, d.txTerminal);
+    put32(bytes + 136, d.producerBlockedTotal);
+    put32(bytes + 140, d.producerQueueFreeZero);
+    put32(bytes + 144, d.producerQueueWindow);
+    put32(bytes + 148, d.producerTxCapacity);
+    put32(bytes + 152, d.rxIrqDone);
+    put32(bytes + 156, d.rxCrcErrors);
+    put32(bytes + 160, d.rxLenErrors);
+    put32(bytes + 164, d.rxHeaderCrcErrors);
+    put32(bytes + 168, d.rxTimeouts);
+    put32(bytes + 172, d.rxOtherErrors);
+    put32(bytes + 176, d.rxReadSuccess);
+    put32(bytes + 180, d.rxReadFailure);
+    put32(bytes + 184, d.rxQueueEnqueued);
+    put32(bytes + 188, d.rxQueueDrop);
+    put32(bytes + 192, d.rxDecodeSuccess);
+    put32(bytes + 196, d.rxDecodeReject);
+    put32(bytes + 200, d.rxDecodeOpaque);
+    put32(bytes + 204, d.rxAuthAccepted);
+    put32(bytes + 208, d.moduleReceiveHandlerCount);
+    put32(bytes + 212, d.moduleReceiveHandlerSumMs);
+    put32(bytes + 216, d.moduleReceiveHandlerMaxMs);
+    put32(bytes + 220, d.txDelayFired);
+    put32(bytes + 224, d.txDelayScheduleAccepted);
+    put32(bytes + 228, d.txDelayScheduleRejected);
+    return DIAGNOSTIC_REPORT_BYTES;
+}
+
 bool W12BenchmarkModule::sameConfig(const RunConfig &a, const RunConfig &b)
 {
     return a.runId == b.runId && a.source == b.source && a.destination == b.destination && a.count == b.count &&
@@ -263,7 +338,16 @@ void W12BenchmarkModule::onTxStarted(const meshtastic_MeshPacket *packet)
     TxSlot *slot = findTxSlot(packet);
     if (slot && !slot->started) {
         slot->started = true;
+        slot->startedAtMs = Time::getMillis();
         stats.txStarted++;
+        if (collectTxLifecycleDiagnostics()) {
+            const uint32_t elapsed = slot->startedAtMs - slot->queuedAtMs;
+            saturatingIncrement(diagnostics.txStarted);
+            saturatingIncrement(diagnostics.queueStartDurationCount);
+            saturatingAdd(diagnostics.queueStartDurationSumMs, elapsed);
+            if (elapsed > diagnostics.queueStartDurationMaxMs)
+                diagnostics.queueStartDurationMaxMs = elapsed;
+        }
     }
 }
 
@@ -275,6 +359,19 @@ void W12BenchmarkModule::onTxFinished(const meshtastic_MeshPacket *packet, Radio
     TxSlot *slot = findTxSlot(packet);
     if (!slot)
         return;
+
+    const bool collect = collectTxLifecycleDiagnostics();
+    const uint32_t finishedAtMs = Time::getMillis();
+    if (collect) {
+        saturatingIncrement(diagnostics.txTerminal);
+        if (slot->started) {
+            const uint32_t elapsed = finishedAtMs - slot->startedAtMs;
+            saturatingIncrement(diagnostics.txDurationCount);
+            saturatingAdd(diagnostics.txDurationSumMs, elapsed);
+            if (elapsed > diagnostics.txDurationMaxMs)
+                diagnostics.txDurationMaxMs = elapsed;
+        }
+    }
 
     switch (state) {
     case RadioInterface::TxState::Sent:
@@ -297,6 +394,148 @@ void W12BenchmarkModule::onTxFinished(const meshtastic_MeshPacket *packet, Radio
     *slot = TxSlot{};
     if (pendingTxCount != 0)
         pendingTxCount--;
+}
+
+void W12BenchmarkModule::onTxDelayScheduled(const meshtastic_MeshPacket *packet, bool accepted)
+{
+    if (!collectTxLifecycleDiagnostics() || !findTxSlot(packet))
+        return;
+    saturatingIncrement(diagnostics.txDelayScheduledAttempts);
+    saturatingIncrement(accepted ? diagnostics.txDelayScheduleAccepted : diagnostics.txDelayScheduleRejected);
+}
+
+void W12BenchmarkModule::onTxDelayFired(const meshtastic_MeshPacket *packet)
+{
+    if (collectTxLifecycleDiagnostics() && findTxSlot(packet))
+        saturatingIncrement(diagnostics.txDelayFired);
+}
+
+void W12BenchmarkModule::onPreCanSendDeferred(const meshtastic_MeshPacket *packet)
+{
+    if (collectTxLifecycleDiagnostics() && findTxSlot(packet))
+        saturatingIncrement(diagnostics.preCanSendDeferred);
+}
+
+void W12BenchmarkModule::onCcaDecision(CcaReason reason)
+{
+    if (!collectDiagnostics())
+        return;
+    saturatingIncrement(diagnostics.ccaDecisions);
+    const auto index = static_cast<uint8_t>(reason);
+    if (index < 7)
+        saturatingIncrement(diagnostics.ccaReasons[index]);
+}
+
+void W12BenchmarkModule::onCcaRssiSample(int16_t rssiDbm)
+{
+    if (!collectDiagnostics())
+        return;
+    saturatingIncrement(diagnostics.ccaRssiSampleCount);
+    if (rssiDbm < diagnostics.ccaRssiMinDbm)
+        diagnostics.ccaRssiMinDbm = rssiDbm;
+    if (rssiDbm > diagnostics.ccaRssiMaxDbm)
+        diagnostics.ccaRssiMaxDbm = rssiDbm;
+    const uint8_t bin = rssiDbm <= -120   ? 0
+                        : rssiDbm <= -110 ? 1
+                        : rssiDbm <= -100 ? 2
+                        : rssiDbm <= -95  ? 3
+                        : rssiDbm <= -90  ? 4
+                        : rssiDbm <= -85  ? 5
+                        : rssiDbm <= -80  ? 6
+                                          : 7;
+    saturatingIncrement(diagnostics.ccaRssiHistogram[bin]);
+}
+
+void W12BenchmarkModule::onRxIrq(bool readOk, bool rxDone, bool crcError, bool lenError, bool headerCrcError, bool timeout,
+                                 bool otherError)
+{
+    if (!collectDiagnostics())
+        return;
+    if (!readOk) {
+        saturatingIncrement(diagnostics.rxOtherErrors);
+        return;
+    }
+    if (rxDone)
+        saturatingIncrement(diagnostics.rxIrqDone);
+    if (crcError)
+        saturatingIncrement(diagnostics.rxCrcErrors);
+    if (lenError)
+        saturatingIncrement(diagnostics.rxLenErrors);
+    if (headerCrcError)
+        saturatingIncrement(diagnostics.rxHeaderCrcErrors);
+    if (timeout)
+        saturatingIncrement(diagnostics.rxTimeouts);
+    if (otherError)
+        saturatingIncrement(diagnostics.rxOtherErrors);
+}
+
+void W12BenchmarkModule::onRxRead(bool success)
+{
+    if (collectDiagnostics())
+        saturatingIncrement(success ? diagnostics.rxReadSuccess : diagnostics.rxReadFailure);
+}
+
+void W12BenchmarkModule::onRxQueueEnqueued()
+{
+    if (collectDiagnostics())
+        saturatingIncrement(diagnostics.rxQueueEnqueued);
+}
+
+void W12BenchmarkModule::onRxQueueDrop()
+{
+    if (collectDiagnostics())
+        saturatingIncrement(diagnostics.rxQueueDrop);
+}
+
+void W12BenchmarkModule::onRxDecode(RxDecodeResult result)
+{
+    if (!collectDiagnostics())
+        return;
+    switch (result) {
+    case RxDecodeResult::Success:
+        saturatingIncrement(diagnostics.rxDecodeSuccess);
+        break;
+    case RxDecodeResult::Reject:
+        saturatingIncrement(diagnostics.rxDecodeReject);
+        break;
+    case RxDecodeResult::Opaque:
+        saturatingIncrement(diagnostics.rxDecodeOpaque);
+        break;
+    }
+}
+
+void W12BenchmarkModule::onRxAuthenticated()
+{
+    if (collectDiagnostics())
+        saturatingIncrement(diagnostics.rxAuthAccepted);
+}
+
+void W12BenchmarkModule::onModuleReceiveHandlerDuration(uint32_t elapsedMs)
+{
+    if (!stats.prepared)
+        return;
+    saturatingIncrement(diagnostics.moduleReceiveHandlerCount);
+    saturatingAdd(diagnostics.moduleReceiveHandlerSumMs, elapsedMs);
+    if (elapsedMs > diagnostics.moduleReceiveHandlerMaxMs)
+        diagnostics.moduleReceiveHandlerMaxMs = elapsedMs;
+}
+
+bool W12BenchmarkModule::collectDiagnostics() const
+{
+    return stats.prepared && stats.running;
+}
+
+bool W12BenchmarkModule::collectTxLifecycleDiagnostics() const
+{
+    return stats.prepared && (stats.running || pendingTxCount != 0);
+}
+
+void W12BenchmarkModule::producerBlocked(uint32_t &reasonCounter)
+{
+    if (!collectDiagnostics())
+        return;
+    saturatingIncrement(diagnostics.producerBlockedTotal);
+    saturatingIncrement(reasonCounter);
 }
 
 void W12BenchmarkModule::clearBitmap()
@@ -325,6 +564,9 @@ void W12BenchmarkModule::resetRun(const RunConfig &config)
     receiverWindowStarted = false;
     snapshotRequested = false;
     snapshotRunMatches = false;
+    diagnosticSnapshotRequested = false;
+    diagnosticSnapshotRunMatches = false;
+    diagnostics = Diagnostics{};
     for (auto &slot : txSlots)
         slot = TxSlot{};
     pendingTxCount = 0;
@@ -343,6 +585,8 @@ int8_t W12BenchmarkModule::reserveTxSlot(const meshtastic_MeshPacket *packet, ui
             slot.sequence = sequence;
             slot.occupied = true;
             slot.started = false;
+            slot.queuedAtMs = Time::getMillis();
+            slot.startedAtMs = 0;
             pendingTxCount++;
             return static_cast<int8_t>(i);
         }
@@ -431,6 +675,14 @@ bool W12BenchmarkModule::handleControl(const meshtastic_MeshPacket &mp)
         snapshotRequested = true;
         snapshotRunMatches = true;
         return true;
+    case Op::SNAPSHOT_DIAGNOSTICS:
+        if (!stats.running && !stats.complete)
+            return false;
+        if (stats.running && receiverWindowStarted && Throttle::hasElapsed(startedAtMs, activeConfig.durationMs))
+            finishRun();
+        diagnosticSnapshotRequested = true;
+        diagnosticSnapshotRunMatches = true;
+        return true;
     case Op::RESET:
         break;
     }
@@ -500,7 +752,14 @@ ProcessMessage W12BenchmarkModule::handleReceived(const meshtastic_MeshPacket &m
 
     if (mp.which_payload_variant == meshtastic_MeshPacket_decoded_tag && mp.decoded.portnum == meshtastic_PortNum_PRIVATE_APP &&
         isBenchmarkData(mp)) {
+        const bool receiverData =
+            stats.running && mp.transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA;
+        const uint32_t handlerStartedAt = receiverData ? Time::getMillis() : 0;
+        if (receiverData)
+            onRxAuthenticated();
         handleData(mp);
+        if (receiverData)
+            onModuleReceiveHandlerDuration(Time::getMillis() - handlerStartedAt);
         // RoutingModule still owns forwarding and reliability side effects for RF data.
         return ProcessMessage::CONTINUE;
     }
@@ -509,7 +768,9 @@ ProcessMessage W12BenchmarkModule::handleReceived(const meshtastic_MeshPacket &m
 
 meshtastic_MeshPacket *W12BenchmarkModule::allocReply()
 {
-    if (!snapshotRequested || !snapshotRunMatches)
+    const bool reportRequested = snapshotRequested && snapshotRunMatches;
+    const bool diagnosticsRequested = diagnosticSnapshotRequested && diagnosticSnapshotRunMatches;
+    if (!reportRequested && !diagnosticsRequested)
         return nullptr;
 
     meshtastic_MeshPacket *reply = router->allocForSending();
@@ -519,13 +780,19 @@ meshtastic_MeshPacket *W12BenchmarkModule::allocReply()
     reply->hop_limit = 0;
     reply->want_ack = false;
     reply->decoded.portnum = meshtastic_PortNum_PRIVATE_APP;
-    reply->decoded.payload.size = encodeReport(reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes), getStats());
+    const Stats currentStats = getStats();
+    reply->decoded.payload.size =
+        diagnosticsRequested ? encodeDiagnosticsReport(reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes),
+                                                       currentStats, diagnostics, pendingTxCount)
+                             : encodeReport(reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes), currentStats);
     if (reply->decoded.payload.size == 0) {
         packetPool.release(reply);
         return nullptr;
     }
     snapshotRequested = false;
     snapshotRunMatches = false;
+    diagnosticSnapshotRequested = false;
+    diagnosticSnapshotRunMatches = false;
     return reply;
 }
 
@@ -574,8 +841,18 @@ int32_t W12BenchmarkModule::runOnce()
 
     const meshtastic_QueueStatus queueStatus = router->getQueueStatus();
     const size_t queueDepth = queueStatus.maxlen >= queueStatus.free ? queueStatus.maxlen - queueStatus.free : queueStatus.maxlen;
-    if (queueStatus.free == 0 || queueDepth >= activeConfig.window || !hasTxCapacity())
+    if (queueStatus.free == 0) {
+        producerBlocked(diagnostics.producerQueueFreeZero);
         return kQueueRetryIntervalMs;
+    }
+    if (queueDepth >= activeConfig.window) {
+        producerBlocked(diagnostics.producerQueueWindow);
+        return kQueueRetryIntervalMs;
+    }
+    if (!hasTxCapacity()) {
+        producerBlocked(diagnostics.producerTxCapacity);
+        return kQueueRetryIntervalMs;
+    }
 
     meshtastic_MeshPacket *packet = router->allocForSending();
     if (!packet) {
@@ -599,6 +876,7 @@ int32_t W12BenchmarkModule::runOnce()
     const int8_t slotIndex = reserveTxSlot(packet, stats.enqueued);
     if (slotIndex < 0) {
         packetPool.release(packet);
+        producerBlocked(diagnostics.producerTxCapacity);
         return kQueueRetryIntervalMs;
     }
 

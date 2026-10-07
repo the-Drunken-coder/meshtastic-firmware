@@ -26,6 +26,7 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     static constexpr uint16_t CONTROL_BYTES = 32;
     static constexpr uint16_t DATA_HEADER_BYTES = 24;
     static constexpr uint16_t REPORT_BYTES = 86;
+    static constexpr uint16_t DIAGNOSTIC_REPORT_BYTES = 233;
     static constexpr uint16_t DEFAULT_SIZE = 219;
     static constexpr uint16_t MAX_SIZE = 219;
     static constexpr uint32_t MIN_COUNT = 1000;
@@ -38,12 +39,69 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
         START = 2,
         STOP = 3,
         SNAPSHOT = 4,
+        SNAPSHOT_DIAGNOSTICS = 5,
     };
 
     enum class Kind : uint8_t {
         CONTROL = 1,
         DATA = 2,
         REPORT = 3,
+        DIAGNOSTICS = 4,
+    };
+
+    enum class CcaReason : uint8_t {
+        NOT_READY = 0,
+        RSSI_READ_ERROR = 1,
+        RX_IRQ_PENDING = 2,
+        RX_ACTIVE = 3,
+        RSSI_INVALID = 4,
+        ENERGY_BUSY = 5,
+        FREE = 6,
+    };
+
+    enum class RxDecodeResult : uint8_t { Success, Reject, Opaque };
+
+    struct Diagnostics {
+        uint32_t txDelayScheduledAttempts = 0;
+        uint32_t txDelayFired = 0;
+        uint32_t txDelayScheduleAccepted = 0;
+        uint32_t txDelayScheduleRejected = 0;
+        uint32_t preCanSendDeferred = 0;
+        uint32_t ccaDecisions = 0;
+        uint32_t ccaReasons[7] = {};
+        uint32_t ccaRssiSampleCount = 0;
+        int16_t ccaRssiMinDbm = 127;
+        int16_t ccaRssiMaxDbm = -127;
+        uint32_t ccaRssiHistogram[8] = {};
+        uint32_t queueStartDurationCount = 0;
+        uint32_t queueStartDurationSumMs = 0;
+        uint32_t queueStartDurationMaxMs = 0;
+        uint32_t txDurationCount = 0;
+        uint32_t txDurationSumMs = 0;
+        uint32_t txDurationMaxMs = 0;
+        uint32_t txStarted = 0;
+        uint32_t txTerminal = 0;
+        uint32_t producerBlockedTotal = 0;
+        uint32_t producerQueueFreeZero = 0;
+        uint32_t producerQueueWindow = 0;
+        uint32_t producerTxCapacity = 0;
+        uint32_t rxIrqDone = 0;
+        uint32_t rxCrcErrors = 0;
+        uint32_t rxLenErrors = 0;
+        uint32_t rxHeaderCrcErrors = 0;
+        uint32_t rxTimeouts = 0;
+        uint32_t rxOtherErrors = 0;
+        uint32_t rxReadSuccess = 0;
+        uint32_t rxReadFailure = 0;
+        uint32_t rxQueueEnqueued = 0;
+        uint32_t rxQueueDrop = 0;
+        uint32_t rxDecodeSuccess = 0;
+        uint32_t rxDecodeReject = 0;
+        uint32_t rxDecodeOpaque = 0;
+        uint32_t rxAuthAccepted = 0;
+        uint32_t moduleReceiveHandlerCount = 0;
+        uint32_t moduleReceiveHandlerSumMs = 0;
+        uint32_t moduleReceiveHandlerMaxMs = 0;
     };
 
     struct RunConfig {
@@ -90,8 +148,21 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     // The integration layer calls these from the radio lifecycle hook after filtering the packet.
     void onTxStarted(const meshtastic_MeshPacket *packet);
     void onTxFinished(const meshtastic_MeshPacket *packet, RadioInterface::TxState state);
+    void onTxDelayScheduled(const meshtastic_MeshPacket *packet, bool accepted);
+    void onTxDelayFired(const meshtastic_MeshPacket *packet);
+    void onPreCanSendDeferred(const meshtastic_MeshPacket *packet);
+    void onCcaDecision(CcaReason reason);
+    void onCcaRssiSample(int16_t rssiDbm);
+    void onRxIrq(bool readOk, bool rxDone, bool crcError, bool lenError, bool headerCrcError, bool timeout, bool otherError);
+    void onRxRead(bool success);
+    void onRxQueueEnqueued();
+    void onRxQueueDrop();
+    void onRxDecode(RxDecodeResult result);
+    void onRxAuthenticated();
+    void onModuleReceiveHandlerDuration(uint32_t elapsedMs);
 
     Stats getStats() const;
+    Diagnostics getDiagnostics() const { return diagnostics; }
 
     // Public pure wire helpers keep host harnesses independent of object/thread setup.
     static bool decodeControl(const uint8_t *bytes, size_t size, Op &op, RunConfig &config);
@@ -99,6 +170,8 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     static size_t encodeData(uint8_t *bytes, size_t capacity, const RunConfig &config, uint32_t sequence);
     static bool decodeData(const uint8_t *bytes, size_t size, RunConfig &config, uint32_t &sequence);
     static size_t encodeReport(uint8_t *bytes, size_t capacity, const Stats &stats);
+    static size_t encodeDiagnosticsReport(uint8_t *bytes, size_t capacity, const Stats &stats, const Diagnostics &diagnostics,
+                                          uint8_t pendingTxCount);
     static bool validConfig(const RunConfig &config);
 
   protected:
@@ -121,6 +194,8 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
         uint32_t sequence = 0;
         bool occupied = false;
         bool started = false;
+        uint32_t queuedAtMs = 0;
+        uint32_t startedAtMs = 0;
     };
 
     RunConfig activeConfig;
@@ -130,8 +205,11 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     bool receiverWindowStarted = false;
     bool snapshotRequested = false;
     bool snapshotRunMatches = false;
+    bool diagnosticSnapshotRequested = false;
+    bool diagnosticSnapshotRunMatches = false;
     TxSlot txSlots[TX_SLOT_COUNT] = {};
     uint8_t pendingTxCount = 0;
+    Diagnostics diagnostics;
 
     bool isLocalControl(const meshtastic_MeshPacket &mp) const;
     bool handleControl(const meshtastic_MeshPacket &mp);
@@ -152,6 +230,11 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     static uint16_t get16(const uint8_t *bytes);
     static uint32_t get32(const uint8_t *bytes);
     static uint8_t patternByte(const RunConfig &config, uint32_t sequence, uint16_t offset);
+    void producerBlocked(uint32_t &reasonCounter);
+    bool collectDiagnostics() const;
+    bool collectTxLifecycleDiagnostics() const;
+    static void saturatingIncrement(uint32_t &value);
+    static void saturatingAdd(uint32_t &value, uint32_t amount);
 };
 
 extern W12BenchmarkModule *w12BenchmarkModule;

@@ -56,7 +56,8 @@
           "RESET": 1,
           "START": 2,
           "STOP": 3,
-          "SNAPSHOT": 4
+          "SNAPSHOT": 4,
+          "SNAPSHOT_DIAGNOSTICS": 5
         }
       ],
       [
@@ -398,6 +399,408 @@
     "goodput": "received * size * 1000 / elapsed_ms; zero when elapsed_ms is zero",
     "snapshot": "SNAPSHOT returns a report after the burst when want_response is set; receiver completes only after its first-frame anchored duration has elapsed; no-first-frame STOP reports elapsed=0 and goodput=0"
   },
+  "diagnostics": {
+    "operation": 5,
+    "response_kind": 4,
+    "response_bytes": 233,
+    "scope": "board_local_aggregate",
+    "request": "local operation 5 through the existing 32-byte PRIVATE_APP control; accepted after STOP or while running as an as-of snapshot",
+    "pending_tx_allowed": true,
+    "running_snapshot_allowed": true,
+    "coverage": "status bits and pending_tx_count identify as-of state; running or pending snapshots make no full-coverage claim",
+    "full_window_coverage": "true only when prepared, complete, not running, pending_tx_count=0, as_of_incomplete=false, and elapsed_ms=60000",
+    "terminal_partial": "prepared+complete+not running+pending_tx_count=0 with elapsed_ms other than 60000 remains a valid parsed terminal snapshot, but is not full-window coverage",
+    "rf_coverage": "never authoritative; counters are board-local aggregates and do not establish RF delivery"
+  },
+  "diagnostic_report": {
+    "kind": 4,
+    "bytes": 233,
+    "module_payload_limit": 233,
+    "phy_payload_ceiling": 239,
+    "integer_encoding": "little-endian",
+    "status_bits": {
+      "prepared": 1,
+      "running": 2,
+      "complete": 4,
+      "cca_rssi_observed": 8,
+      "pending_tx": 16,
+      "as_of_incomplete": 32
+    },
+    "cca_reason": {
+      "not_ready": 0,
+      "rssi_read_error": 1,
+      "rx_irq_pending": 2,
+      "rx_active": 3,
+      "rssi_invalid": 4,
+      "energy_busy": 5,
+      "free": 6
+    },
+    "cca_rssi_bins_dbm": [
+      "<=-120",
+      "-119..-110",
+      "-109..-100",
+      "-99..-95",
+      "-94..-90",
+      "-89..-85",
+      "-84..-80",
+      ">=-79"
+    ],
+    "fields": [
+      [
+        0,
+        2,
+        "magic",
+        "u16",
+        "0x5731"
+      ],
+      [
+        2,
+        1,
+        "version",
+        "u8",
+        1
+      ],
+      [
+        3,
+        1,
+        "kind",
+        "u8",
+        4
+      ],
+      [
+        4,
+        4,
+        "run_id",
+        "u32"
+      ],
+      [
+        8,
+        4,
+        "source",
+        "u32"
+      ],
+      [
+        12,
+        4,
+        "destination",
+        "u32"
+      ],
+      [
+        16,
+        4,
+        "elapsed_ms",
+        "u32"
+      ],
+      [
+        20,
+        1,
+        "status",
+        "u8"
+      ],
+      [
+        21,
+        1,
+        "pending_tx_count",
+        "u8"
+      ],
+      [
+        22,
+        2,
+        "reserved",
+        "bytes",
+        "zero"
+      ],
+      [
+        24,
+        4,
+        "tx_delay_scheduled_attempts",
+        "u32"
+      ],
+      [
+        28,
+        4,
+        "pre_can_send_deferred",
+        "u32"
+      ],
+      [
+        32,
+        4,
+        "cca_decisions",
+        "u32"
+      ],
+      [
+        36,
+        4,
+        "cca_not_ready",
+        "u32"
+      ],
+      [
+        40,
+        4,
+        "cca_rssi_read_error",
+        "u32"
+      ],
+      [
+        44,
+        4,
+        "cca_rx_irq_pending",
+        "u32"
+      ],
+      [
+        48,
+        4,
+        "cca_rx_active",
+        "u32"
+      ],
+      [
+        52,
+        4,
+        "cca_rssi_invalid",
+        "u32"
+      ],
+      [
+        56,
+        4,
+        "cca_energy_busy",
+        "u32"
+      ],
+      [
+        60,
+        4,
+        "cca_free",
+        "u32"
+      ],
+      [
+        64,
+        4,
+        "cca_rssi_sample_count",
+        "u32"
+      ],
+      [
+        68,
+        2,
+        "cca_rssi_min_dbm",
+        "i16",
+        "127 when no finite sample"
+      ],
+      [
+        70,
+        2,
+        "cca_rssi_max_dbm",
+        "i16",
+        "-127 when no finite sample"
+      ],
+      [
+        72,
+        32,
+        "cca_rssi_histogram",
+        "u32[8]",
+        "all finite samples, bins <=-120,-119..-110,-109..-100,-99..-95,-94..-90,-89..-85,-84..-80,>=-79"
+      ],
+      [
+        104,
+        4,
+        "queue_start_duration_count",
+        "u32"
+      ],
+      [
+        108,
+        4,
+        "queue_start_duration_sum_ms",
+        "u32"
+      ],
+      [
+        112,
+        4,
+        "queue_start_duration_max_ms",
+        "u32"
+      ],
+      [
+        116,
+        4,
+        "tx_duration_count",
+        "u32"
+      ],
+      [
+        120,
+        4,
+        "tx_duration_sum_ms",
+        "u32"
+      ],
+      [
+        124,
+        4,
+        "tx_duration_max_ms",
+        "u32"
+      ],
+      [
+        128,
+        4,
+        "tx_started",
+        "u32"
+      ],
+      [
+        132,
+        4,
+        "tx_terminal",
+        "u32"
+      ],
+      [
+        136,
+        4,
+        "producer_blocked_total",
+        "u32"
+      ],
+      [
+        140,
+        4,
+        "producer_queue_free_zero",
+        "u32"
+      ],
+      [
+        144,
+        4,
+        "producer_queue_window",
+        "u32"
+      ],
+      [
+        148,
+        4,
+        "producer_tx_capacity",
+        "u32"
+      ],
+      [
+        152,
+        4,
+        "rx_irq_done",
+        "u32"
+      ],
+      [
+        156,
+        4,
+        "rx_crc_errors",
+        "u32"
+      ],
+      [
+        160,
+        4,
+        "rx_len_errors",
+        "u32"
+      ],
+      [
+        164,
+        4,
+        "rx_header_crc_errors",
+        "u32"
+      ],
+      [
+        168,
+        4,
+        "rx_timeouts",
+        "u32"
+      ],
+      [
+        172,
+        4,
+        "rx_other_errors",
+        "u32"
+      ],
+      [
+        176,
+        4,
+        "rx_read_success",
+        "u32"
+      ],
+      [
+        180,
+        4,
+        "rx_read_failure",
+        "u32"
+      ],
+      [
+        184,
+        4,
+        "rx_queue_enqueued",
+        "u32",
+        "one actual successful enqueue after Router retry evictions"
+      ],
+      [
+        188,
+        4,
+        "rx_queue_drop",
+        "u32",
+        "old packets evicted while enqueue retries"
+      ],
+      [
+        192,
+        4,
+        "rx_decode_success",
+        "u32"
+      ],
+      [
+        196,
+        4,
+        "rx_decode_reject",
+        "u32"
+      ],
+      [
+        200,
+        4,
+        "rx_decode_opaque",
+        "u32"
+      ],
+      [
+        204,
+        4,
+        "rx_auth_accepted",
+        "u32"
+      ],
+      [
+        208,
+        4,
+        "module_receive_handler_count",
+        "u32"
+      ],
+      [
+        212,
+        4,
+        "module_receive_handler_sum_ms",
+        "u32"
+      ],
+      [
+        216,
+        4,
+        "module_receive_handler_max_ms",
+        "u32"
+      ],
+      [
+        220,
+        4,
+        "tx_delay_fired",
+        "u32"
+      ],
+      [
+        224,
+        4,
+        "tx_delay_schedule_accepted",
+        "u32"
+      ],
+      [
+        228,
+        4,
+        "tx_delay_schedule_rejected",
+        "u32"
+      ],
+      [
+        232,
+        1,
+        "reserved_tail",
+        "bytes",
+        "zero"
+      ]
+    ],
+    "coverage": "A snapshot while running or while pending TX remains reports only counters observed as of the reply; it makes no full-coverage claim. rx_queue_enqueued is counted once after the Router enqueue retry loop actually succeeds."
+  },
   "sequence": [
     "RESET receiver and sender with identical config; RESET is rejected while running or while physical TX slots remain pending",
     "START receiver first; it arms without starting its timer",
@@ -411,5 +814,16 @@
     "matching": "fixed 16-slot pointer plus packet-id binding established before service enqueue; duplicate start callbacks count once; stale completions do nothing",
     "window": "pending physical bindings are capped by config.window and 16; queue free capacity is also checked",
     "send_failures": "MeshService admission failures; terminal physical counters come only from lifecycle callbacks"
+  },
+  "host_clock": {
+    "continuity_tolerance_seconds": 2.0,
+    "samples": [
+      "sender_START_return",
+      "burst_checkpoints",
+      "drain_checkpoints"
+    ],
+    "discontinuity": "abs(wall_elapsed_seconds - monotonic_elapsed_seconds) > continuity_tolerance_seconds",
+    "failure_reason": "host_clock_discontinuity",
+    "cause_interpretation": "record both clocks without attributing the discrepancy to sleep or another specific cause"
   }
 }
