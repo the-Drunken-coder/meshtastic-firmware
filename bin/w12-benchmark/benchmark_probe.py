@@ -756,7 +756,7 @@ def decode_radio_diagnostics(payload: bytes) -> RadioDiagnosticReport:
     if irq_gpio_source != 0:
         raise BenchmarkError("radio diagnostic GPIO source is unsupported")
     rx_arm_last_stage = payload[216]
-    if rx_arm_last_stage not in (0, 1, 2, 3, 0xFF):
+    if rx_arm_last_stage not in (0, 1, 2, 3, 4, 0xFF):
         raise BenchmarkError("radio diagnostic arm stage is invalid")
     return RadioDiagnosticReport(
         run_id=_diagnostic_u32(payload, 4),
@@ -830,6 +830,7 @@ def _radio_diagnostic_dict(report: RadioDiagnosticReport) -> dict[str, Any]:
         1: "standby",
         2: "rx_start",
         3: "irq_map",
+        4: "fifo_clear",
         0xFF: "no_attempt",
     }
     attachment_labels = {

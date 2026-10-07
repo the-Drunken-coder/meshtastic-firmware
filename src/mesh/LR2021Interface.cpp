@@ -147,33 +147,37 @@ void LR2021Interface::startReceive()
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
     W12BenchmarkModule::RxArmStage failureStage = W12BenchmarkModule::RxArmStage::STANDBY;
 #endif
-    if (result == RADIOLIB_ERR_NONE) {
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    if (w12BenchmarkModule)
+        w12BenchmarkModule->onRxArmStage(W12BenchmarkModule::RxArmStage::STANDBY, result);
+#endif
+    auto armReceive = [&]([[maybe_unused]] bool retry) {
+#if defined(MESHTASTIC_W12_BENCHMARK_RX_FIFO_CLEAR) && MESHTASTIC_W12_BENCHMARK_RX_FIFO_CLEAR
+        // Finite RX has ended before this full arm. Rejected frames skip readData's FIFO clear.
+        // Keep this experiment out of continuous RX, where a second valid frame can be queued.
+        result = W12FlrcProfile::clearRxFifo(module);
+        failureStage = W12BenchmarkModule::RxArmStage::FIFO_CLEAR;
         if (w12BenchmarkModule)
-            w12BenchmarkModule->onRxArmStage(W12BenchmarkModule::RxArmStage::STANDBY, result);
+            w12BenchmarkModule->onRxArmStage(failureStage, result);
+        if (result != RADIOLIB_ERR_NONE)
+            return;
 #endif
         result = lora.startReceive(rxTimeout);
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
         if (w12BenchmarkModule)
-            w12BenchmarkModule->onRxArmStage(W12BenchmarkModule::RxArmStage::RX_START, result);
-#endif
-#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+            w12BenchmarkModule->onRxArmStage(W12BenchmarkModule::RxArmStage::RX_START, result, retry);
         failureStage = W12BenchmarkModule::RxArmStage::RX_START;
 #endif
-    } else {
-#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
-        if (w12BenchmarkModule)
-            w12BenchmarkModule->onRxArmStage(W12BenchmarkModule::RxArmStage::STANDBY, result);
+    };
+    if (result == RADIOLIB_ERR_NONE)
+        armReceive(false);
+    bool canRecover = result != RADIOLIB_ERR_NONE;
+#if defined(MESHTASTIC_W12_BENCHMARK_RX_FIFO_CLEAR) && MESHTASTIC_W12_BENCHMARK_RX_FIFO_CLEAR
+    // Do not silently bypass a failed FIFO clear with a direct RX retry.
+    canRecover = canRecover && failureStage != W12BenchmarkModule::RxArmStage::FIFO_CLEAR;
 #endif
-    }
-    if (result != RADIOLIB_ERR_NONE && maybeRecoverChipStateLoss()) {
-        result = lora.startReceive(rxTimeout);
-#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
-        if (w12BenchmarkModule)
-            w12BenchmarkModule->onRxArmStage(W12BenchmarkModule::RxArmStage::RX_START, result, true);
-        failureStage = W12BenchmarkModule::RxArmStage::RX_START;
-#endif
-    }
+    if (canRecover && maybeRecoverChipStateLoss())
+        armReceive(true);
     // The generic IRQ map misses terminal FLRC LEN_ERROR and command errors.
     if (result == RADIOLIB_ERR_NONE) {
         result = lora.setIrqFlags(W12FlrcProfile::RECEIVE_IRQS);

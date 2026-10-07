@@ -171,18 +171,23 @@ class W12AdapterHal : public LockingArduinoHal
                 // Complete during the actual command; firmware must observe the IRQ after startTransmit returns.
                 irq = irqOnSetTx;
             }
+            // Zero-payload writes are verified by RadioLib with a following six-byte NOP status
+            // read, so carry a scripted CLEAR_RX_FIFO failure into that status transaction.
+            if (command == RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO && commandFailed)
+                clearRxFifoStatusFailed = true;
             if (commandFailed)
                 in[0] = 0x02;
         }
         if (length == 6 && std::all_of(out, out + length, [](uint8_t b) { return b == 0; })) {
             if (++irqReads == injectIrqAtRead)
                 signalReceive(irqOnRead);
-            in[0] = rawStatusFailed ? 0x02 : 0x04;
+            in[0] = (rawStatusFailed || clearRxFifoStatusFailed) ? 0x02 : 0x04;
             in[1] = rawStatusMode;
             in[2] = irq >> 24;
             in[3] = irq >> 16;
             in[4] = irq >> 8;
             in[5] = irq;
+            clearRxFifoStatusFailed = false;
         }
     }
 
@@ -197,6 +202,7 @@ class W12AdapterHal : public LockingArduinoHal
     bool fifoLevelReplyFailed = false;
     bool errorsReplyPending = false;
     bool errorsReplyFailed = false;
+    bool clearRxFifoStatusFailed = false;
     void (*interruptCallback)() = nullptr;
 };
 
@@ -275,6 +281,18 @@ static void assertAdapterSetRxTimeout()
     TEST_ASSERT_EQUAL_UINT8(0x80, (*setRx)[3]);
     TEST_ASSERT_EQUAL_UINT8(0x00, (*setRx)[4]);
 #endif
+}
+
+static size_t adapterTransactionIndex(const std::vector<uint8_t> &prefix, size_t occurrence)
+{
+    size_t seen = 0;
+    for (size_t index = 0; index < adapterHal->recording.transactions.size(); ++index) {
+        const auto &transaction = adapterHal->recording.transactions[index];
+        if (transaction.size() >= prefix.size() && std::equal(prefix.begin(), prefix.end(), transaction.begin()) &&
+            ++seen == occurrence)
+            return index;
+    }
+    return adapterHal->recording.transactions.size();
 }
 
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
@@ -893,19 +911,29 @@ static void test_w12_adapter_rx_arm_uses_configured_fallback_and_expected_timeou
     assertAdapterSetRxTimeout();
 }
 
-#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && defined(MESHTASTIC_W12_BENCHMARK_RX_TIMEOUT_MS)
-static size_t adapterTransactionIndex(const std::vector<uint8_t> &prefix, size_t occurrence)
+// The finite-RX experiment opts into an explicit FIFO reset between standby and RX start;
+// the default build must retain the existing arm sequence.
+static void test_w12_adapter_rx_arm_fifo_clear_is_opt_in()
 {
-    size_t seen = 0;
-    for (size_t index = 0; index < adapterHal->recording.transactions.size(); ++index) {
-        const auto &transaction = adapterHal->recording.transactions[index];
-        if (transaction.size() >= prefix.size() && std::equal(prefix.begin(), prefix.end(), transaction.begin()) &&
-            ++seen == occurrence)
-            return index;
-    }
-    return adapterHal->recording.transactions.size();
+    makeW12Adapter();
+    adapterHal->recording.transactions.clear();
+    adapter->armReceive();
+
+#if defined(MESHTASTIC_W12_BENCHMARK_RX_FIFO_CLEAR) && MESHTASTIC_W12_BENCHMARK_RX_FIFO_CLEAR
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO)));
+    const size_t standbyIndex = adapterTransactionIndex(op16(RADIOLIB_LR2021_CMD_SET_STANDBY), 1);
+    const size_t clearIndex = adapterTransactionIndex(op16(RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO), 1);
+    const size_t setRxIndex = adapterTransactionIndex(op16(RADIOLIB_LR2021_CMD_SET_RX), 1);
+    TEST_ASSERT_TRUE(standbyIndex < clearIndex);
+    TEST_ASSERT_TRUE(clearIndex < setRxIndex);
+#else
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO)));
+#endif
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+    assertAdapterSetRxTimeout();
 }
 
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && defined(MESHTASTIC_W12_BENCHMARK_RX_TIMEOUT_MS)
 // A finite chip timeout is diagnostic only: every normal ISR/poll path must reject TIMEOUT, clear it,
 // and re-arm RX with the same measured 24-bit timeout without reading a payload.
 static void assertFiniteTimeoutRearm(uint32_t expectedBadReceives)
@@ -962,6 +990,78 @@ static void test_w12_adapter_finite_timeout_rejects_and_rearms()
     adapter->serviceNotifications();
     assertFiniteTimeoutRearm(badBefore + 4);
 }
+
+#if defined(MESHTASTIC_W12_BENCHMARK_RX_FIFO_CLEAR) && MESHTASTIC_W12_BENCHMARK_RX_FIFO_CLEAR
+// A W12FlrcProfile::clearRxFifo failure must leave LR2021Interface::startReceive before
+// lora.startReceive and its recovery retry, then recover only through the later maintenance path.
+static void test_w12_adapter_fifo_clear_failure_stays_offline_until_retry()
+{
+    makeW12AdapterWithDiagnostics();
+    adapterHal->recording.transactions.clear();
+    adapterHal->failCommand = RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO;
+    adapter->armReceive();
+
+    auto diagnostics = adapterDiagnostics->getRadioDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.rxArmAttempts);
+    TEST_ASSERT_EQUAL_UINT32(0, diagnostics.rxArmSuccesses);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.rxArmFailures);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.rxStandbyCalls);
+    TEST_ASSERT_EQUAL_UINT32(0, diagnostics.rxStartCalls);
+    TEST_ASSERT_EQUAL_UINT32(0, diagnostics.rxIrqMapCalls);
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_SPI_CMD_INVALID, diagnostics.rxArmLastResult);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(W12BenchmarkModule::RxArmStage::FIFO_CLEAR), diagnostics.rxArmLastStage);
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO)));
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+    TEST_ASSERT_TRUE(adapter->isOffline());
+    TEST_ASSERT_FALSE(adapter->receiving());
+    TEST_ASSERT_FALSE(RadioMode::status(config.lora).active_initialized);
+
+    adapterHal->failCommand = 0;
+    Time::advanceTestMillis(30000);
+    adapter->periodicRadioMaintenance();
+
+    diagnostics = adapterDiagnostics->getRadioDiagnostics();
+    TEST_ASSERT_FALSE(adapter->isOffline());
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(2, diagnostics.rxArmAttempts);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.rxArmSuccesses);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.rxArmFailures);
+    TEST_ASSERT_EQUAL_UINT32(2, diagnostics.rxStandbyCalls);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.rxStartCalls);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.rxIrqMapCalls);
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_NONE, diagnostics.rxArmLastResult);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(W12BenchmarkModule::RxArmStage::NONE), diagnostics.rxArmLastStage);
+    TEST_ASSERT_EQUAL_UINT32(2, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO)));
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+    assertAdapterSetRxTimeout();
+}
+
+static void test_w12_adapter_terminal_errors_rearm_fifo_without_reading_payload()
+{
+    makeW12Adapter();
+    constexpr uint32_t terminalErrors[] = {RADIOLIB_LR2021_IRQ_CRC_ERROR, RADIOLIB_LR2021_IRQ_LEN_ERROR,
+                                           RADIOLIB_LR2021_IRQ_TIMEOUT};
+    for (size_t index = 0; index < sizeof(terminalErrors) / sizeof(terminalErrors[0]); ++index) {
+        adapterHal->recording.transactions.clear();
+        adapterHal->irq = RADIOLIB_LR2021_IRQ_RX_DONE | terminalErrors[index];
+        adapter->receiveInterrupt();
+        TEST_ASSERT_EQUAL_UINT32(index + 1, adapter->badReceives());
+        TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_READ_RX_FIFO)));
+        TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO)));
+
+        adapter->armReceive();
+        TEST_ASSERT_TRUE(adapter->receiving());
+        TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO)));
+        TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+        const size_t standbyIndex = adapterTransactionIndex(op16(RADIOLIB_LR2021_CMD_SET_STANDBY), 1);
+        const size_t clearIndex = adapterTransactionIndex(op16(RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO), 1);
+        const size_t setRxIndex = adapterTransactionIndex(op16(RADIOLIB_LR2021_CMD_SET_RX), 1);
+        TEST_ASSERT_TRUE(standbyIndex < clearIndex);
+        TEST_ASSERT_TRUE(clearIndex < setRxIndex);
+        assertAdapterSetRxTimeout();
+    }
+}
+#endif
 #endif
 
 static void test_w12_adapter_failed_rx_remains_offline_until_successful_rearm()
@@ -1141,7 +1241,19 @@ static void assertAdapterReceptionDeliveredOnce()
     TEST_ASSERT_EQUAL_UINT32(0, adapter->badReceives());
     TEST_ASSERT_TRUE(adapter->receiving());
     TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_READ_RX_FIFO)));
+#if defined(MESHTASTIC_W12_BENCHMARK_RX_FIFO_CLEAR) && MESHTASTIC_W12_BENCHMARK_RX_FIFO_CLEAR
+    // readData clears the consumed frame; finite-RX arm then performs the diagnostic reset again.
+    TEST_ASSERT_EQUAL_UINT32(2, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO)));
+    const size_t readIndex = adapterTransactionIndex(op16(RADIOLIB_LR2021_CMD_READ_RX_FIFO), 1);
+    const size_t readClearIndex = adapterTransactionIndex(op16(RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO), 1);
+    const size_t armClearIndex = adapterTransactionIndex(op16(RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO), 2);
+    const size_t setRxIndex = adapterTransactionIndex(op16(RADIOLIB_LR2021_CMD_SET_RX), 1);
+    TEST_ASSERT_TRUE(readIndex < readClearIndex);
+    TEST_ASSERT_TRUE(readClearIndex < armClearIndex);
+    TEST_ASSERT_TRUE(armClearIndex < setRxIndex);
+#else
     TEST_ASSERT_GREATER_THAN_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO)));
+#endif
     TEST_ASSERT_GREATER_THAN_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_CLEAR_IRQ)));
     TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
     assertAdapterSetRxTimeout();
@@ -1454,8 +1566,13 @@ static void test_w12_adapter_default_gate_refuses_flrc_send_and_releases_packet(
 static void runW12AdapterTests()
 {
     RUN_TEST(test_w12_adapter_rx_arm_uses_configured_fallback_and_expected_timeout);
+    RUN_TEST(test_w12_adapter_rx_arm_fifo_clear_is_opt_in);
 #if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && defined(MESHTASTIC_W12_BENCHMARK_RX_TIMEOUT_MS)
     RUN_TEST(test_w12_adapter_finite_timeout_rejects_and_rearms);
+#if defined(MESHTASTIC_W12_BENCHMARK_RX_FIFO_CLEAR) && MESHTASTIC_W12_BENCHMARK_RX_FIFO_CLEAR
+    RUN_TEST(test_w12_adapter_fifo_clear_failure_stays_offline_until_retry);
+    RUN_TEST(test_w12_adapter_terminal_errors_rearm_fifo_without_reading_payload);
+#endif
 #endif
     RUN_TEST(test_w12_adapter_recovery_preserves_active_flrc_and_rearms_rx);
     RUN_TEST(test_w12_adapter_failed_rx_remains_offline_until_successful_rearm);
