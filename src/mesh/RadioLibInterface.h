@@ -5,10 +5,33 @@
 #include "concurrency/NotifiedWorkerThread.h"
 
 #include <RadioLib.h>
+#include <cstdint>
 #include <sys/types.h>
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
 #include <atomic>
 static_assert(std::atomic<uint32_t>::is_always_lock_free, "W12 radio diagnostic state requires lock-free 32-bit atomics");
+#endif
+
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+struct W12RxLivenessSample {
+    uint32_t rawIrqFlags = 0;
+    uint16_t rawStatus = 0;
+    int16_t irqReadResult = INT16_MIN;
+    uint16_t chipRxPackets = 0;
+    uint16_t chipCrcErrors = 0;
+    uint16_t chipLenErrors = 0;
+    int16_t chipStatsResult = INT16_MIN;
+    int16_t rssiDbm = INT16_MIN;
+    int16_t rssiReadResult = INT16_MIN;
+    uint32_t softwareState = 0;
+};
+
+struct W12RxRearmResult {
+    uint32_t beforeState = 0;
+    uint32_t afterState = 0;
+    uint32_t durationUs = 0;
+    bool softwareArmed = false;
+};
 #endif
 
 // ESP32 has special rules about ISR code
@@ -204,6 +227,8 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     }
     bool isW12DiagnosticPollContext() const { return w12DiagnosticPollContext; }
     void setW12DiagnosticPollContext(bool active) { w12DiagnosticPollContext = active; }
+    virtual bool readW12RxLiveness(W12RxLivenessSample &sample) { return false; }
+    virtual bool performW12RxRearm(W12RxRearmResult &result);
 #endif
 
     /**

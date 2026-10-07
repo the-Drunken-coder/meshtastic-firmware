@@ -7,6 +7,7 @@
 #include "mesh/MeshService.h"
 #include "mesh/NodeDB.h"
 #include "mesh/RadioInterface.h"
+#include "mesh/RadioLibInterface.h"
 #include "mesh/ReliableRouter.h"
 #include "modules/RoutingModule.h"
 #include "modules/W12BenchmarkModule.h"
@@ -122,6 +123,46 @@ class BenchmarkRadio : public RadioInterface
 
   private:
     std::vector<meshtastic_MeshPacket *> pending;
+};
+
+class BenchmarkDiagnosticRadio : public RadioLibInterface
+{
+  public:
+    BenchmarkDiagnosticRadio() : RadioLibInterface(nullptr, 0, 0, 0, 0) {}
+
+    bool isChannelActive() override { return false; }
+    bool isActivelyReceiving() override { return false; }
+    uint32_t getPacketTime(uint32_t, bool = false) override { return 0; }
+    int16_t getCurrentRSSI() override { return -100; }
+    void addReceiveMetadata(meshtastic_MeshPacket *) override {}
+    void setRadioIsr(void (*)()) override {}
+    void clearRadioIsr() override {}
+    bool isSending() override { return sending; }
+    void startReceive() override { ++startReceiveCalls; }
+
+    bool performW12RxRearm(W12RxRearmResult &result) override
+    {
+        result = W12RxRearmResult{};
+        if (sending)
+            return false;
+        result.beforeState = getW12DiagnosticRadioState();
+        const uint32_t startedAt = micros();
+        startReceive();
+        result.durationUs = static_cast<uint32_t>(micros() - startedAt);
+        result.afterState = getW12DiagnosticRadioState();
+        result.softwareArmed = false;
+        return true;
+    }
+
+    bool readW12RxLiveness(W12RxLivenessSample &sample) override
+    {
+        sample = scriptedSample;
+        return true;
+    }
+
+    W12RxLivenessSample scriptedSample;
+    uint32_t startReceiveCalls = 0;
+    bool sending = false;
 };
 
 class BenchmarkRouter : public ReliableRouter
@@ -788,6 +829,158 @@ void test_radio_diagnostic_tail_keeps_rx_done_after_completion_with_pending_tx()
                           static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.source)));
 }
 
+void test_rx_liveness_page_is_fixed_wire_and_local_authorized()
+{
+    const auto run = runConfig();
+    W12BenchmarkModule::Stats stats;
+    stats.config = run;
+    stats.prepared = true;
+    stats.running = true;
+    stats.elapsedMs = 77;
+    W12BenchmarkModule::RxLivenessDiagnostics diagnostics;
+    diagnostics.snapshotSequence = 9;
+    diagnostics.snapshotTimeMs = 1234;
+    diagnostics.sampleStatus = 1 | 2 | 4 | 32;
+    diagnostics.sampleSource = 1;
+    diagnostics.rearmCount = 1;
+    diagnostics.rearmResult = static_cast<uint8_t>(W12BenchmarkModule::RxLivenessRearmResult::SOFTWARE_ARMED);
+    diagnostics.rearmBeforeState = 0x14;
+    diagnostics.rearmAfterState = 0x15;
+    diagnostics.rearmLastTimeMs = 1200;
+    diagnostics.rearmLastDurationUs = 33;
+    diagnostics.rawIrqFlags = 0x10203040;
+    diagnostics.rawStatus = 0x0404;
+    diagnostics.irqReadResult = -7;
+    diagnostics.chipRxPackets = 12;
+    diagnostics.chipCrcErrors = 3;
+    diagnostics.chipLenErrors = 4;
+    diagnostics.chipStatsResult = 0;
+    diagnostics.rssiDbm = -91;
+    diagnostics.rssiReadResult = 0;
+    diagnostics.softwareState = 0x15;
+
+    uint8_t wire[W12BenchmarkModule::RX_LIVENESS_REPORT_BYTES] = {};
+    TEST_ASSERT_EQUAL_UINT(W12BenchmarkModule::RX_LIVENESS_REPORT_BYTES,
+                           W12BenchmarkModule::encodeRxLivenessReport(wire, sizeof(wire), stats, diagnostics, 2));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(W12BenchmarkModule::Kind::RX_LIVENESS), wire[3]);
+    TEST_ASSERT_EQUAL_UINT8(1 | 2 | 16 | 32, wire[20]);
+    TEST_ASSERT_EQUAL_UINT8(2, wire[21]);
+    TEST_ASSERT_EQUAL_UINT32(9, read32(wire, 24));
+    TEST_ASSERT_EQUAL_UINT32(1234, read32(wire, 28));
+    TEST_ASSERT_EQUAL_UINT8(1 | 2 | 4 | 32, wire[32]);
+    TEST_ASSERT_EQUAL_UINT8(1, wire[33]);
+    TEST_ASSERT_EQUAL_UINT32(0x10203040, read32(wire, 52));
+    TEST_ASSERT_EQUAL_UINT16(0x0404, static_cast<uint16_t>(wire[56] | wire[57] << 8));
+    TEST_ASSERT_EQUAL_INT16(-7, read16s(wire, 58));
+    TEST_ASSERT_EQUAL_INT16(-91, read16s(wire, 68));
+    TEST_ASSERT_EQUAL_INT16(0, read16s(wire, 70));
+    TEST_ASSERT_EQUAL_UINT32(0x15, read32(wire, 72));
+
+    myNodeInfo.my_node_num = run.source;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.source)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::START, run.source)));
+    Time::setTestMillis(41);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::SNAPSHOT_RX_LIVENESS, run.source)));
+    meshtastic_MeshPacket *reply = testModule->allocReply();
+    TEST_ASSERT_NOT_NULL(reply);
+    TEST_ASSERT_EQUAL_UINT(W12BenchmarkModule::RX_LIVENESS_REPORT_BYTES, reply->decoded.payload.size);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(W12BenchmarkModule::Kind::RX_LIVENESS), reply->decoded.payload.bytes[3]);
+    TEST_ASSERT_EQUAL_UINT8(1 | 2 | 32, reply->decoded.payload.bytes[20]);
+    TEST_ASSERT_EQUAL_UINT32(41, read32(reply->decoded.payload.bytes, 28));
+    TEST_ASSERT_EQUAL_UINT8(0, reply->decoded.payload.bytes[32]);
+    TEST_ASSERT_EQUAL_INT16(INT16_MIN, read16s(reply->decoded.payload.bytes, 58));
+    packetPool.release(reply);
+
+    auto wrongRun = run;
+    wrongRun.runId++;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(wrongRun, W12BenchmarkModule::Op::SNAPSHOT_RX_LIVENESS, run.source)));
+    TEST_ASSERT_NULL(testModule->allocReply());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::SNAPSHOT_RX_LIVENESS, run.source,
+                                                       meshtastic_MeshPacket_TransportMechanism_TRANSPORT_INTERNAL, run.source)));
+    TEST_ASSERT_NULL(testModule->allocReply());
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::STOP, run.source)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.source)));
+}
+
+void test_rx_liveness_rearm_requires_receiver_window_and_radio_and_does_not_consume_budget()
+{
+    const auto run = runConfig();
+    myNodeInfo.my_node_num = run.destination;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.destination)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::START, run.destination)));
+
+    // Before the first authenticated frame there is no current receiver window.
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::REARM_RX_LIVENESS, run.destination)));
+    TEST_ASSERT_NULL(testModule->allocReply());
+
+    Time::setTestMillis(100);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(testModule->handleReceived(makeData(run, 0))));
+    TEST_ASSERT_EQUAL_UINT(1, testModule->getStats().received);
+
+    // The native benchmark fixture has no RadioLib instance. The operation must reject without
+    // consuming its one-shot budget or manufacturing a report.
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::REARM_RX_LIVENESS, run.destination)));
+    TEST_ASSERT_NULL(testModule->allocReply());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::REARM_RX_LIVENESS, run.destination)));
+    TEST_ASSERT_NULL(testModule->allocReply());
+
+    BenchmarkDiagnosticRadio diagnosticRadio;
+    diagnosticRadio.sending = true;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::REARM_RX_LIVENESS, run.destination)));
+    TEST_ASSERT_EQUAL_UINT32(0, diagnosticRadio.startReceiveCalls);
+    diagnosticRadio.sending = false;
+    diagnosticRadio.scriptedSample.irqReadResult = -8;
+    diagnosticRadio.scriptedSample.chipStatsResult = -7;
+    diagnosticRadio.scriptedSample.rssiReadResult = -9;
+    diagnosticRadio.scriptedSample.softwareState = 0x15;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::REARM_RX_LIVENESS, run.destination)));
+    TEST_ASSERT_EQUAL_UINT32(1, diagnosticRadio.startReceiveCalls);
+    meshtastic_MeshPacket *rearmReply = testModule->allocReply();
+    TEST_ASSERT_NOT_NULL(rearmReply);
+    const uint8_t *rearmWire = rearmReply->decoded.payload.bytes;
+    TEST_ASSERT_EQUAL_UINT(W12BenchmarkModule::RX_LIVENESS_REPORT_BYTES, rearmReply->decoded.payload.size);
+    TEST_ASSERT_EQUAL_UINT8(8 | 32, rearmWire[32]);
+    TEST_ASSERT_EQUAL_UINT32(1, read32(rearmWire, 34));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(W12BenchmarkModule::RxLivenessRearmResult::SOFTWARE_NOT_ARMED), rearmWire[38]);
+    TEST_ASSERT_EQUAL_INT16(-8, read16s(rearmWire, 58));
+    TEST_ASSERT_EQUAL_INT16(-7, read16s(rearmWire, 66));
+    TEST_ASSERT_EQUAL_INT16(-9, read16s(rearmWire, 70));
+    packetPool.release(rearmReply);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::REARM_RX_LIVENESS, run.destination)));
+    TEST_ASSERT_EQUAL_UINT32(1, diagnosticRadio.startReceiveCalls);
+    TEST_ASSERT_NULL(testModule->allocReply());
+
+    auto wrongRun = run;
+    wrongRun.runId++;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(wrongRun, W12BenchmarkModule::Op::REARM_RX_LIVENESS, run.destination)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::REARM_RX_LIVENESS, run.destination,
+                                                       meshtastic_MeshPacket_TransportMechanism_TRANSPORT_INTERNAL, run.source)));
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::STOP, run.destination)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.destination)));
+}
+
 void test_behavior_producer_uses_real_service_and_terminal_slots()
 {
     auto run = runConfig();
@@ -972,6 +1165,8 @@ void setup()
     RUN_TEST(test_diagnostic_snapshot_accepts_zero_first_receiver_window);
     RUN_TEST(test_radio_diagnostic_page_tracks_authorization_stages_buckets_and_reset);
     RUN_TEST(test_radio_diagnostic_tail_keeps_rx_done_after_completion_with_pending_tx);
+    RUN_TEST(test_rx_liveness_page_is_fixed_wire_and_local_authorized);
+    RUN_TEST(test_rx_liveness_rearm_requires_receiver_window_and_radio_and_does_not_consume_budget);
     RUN_TEST(test_behavior_control_is_local_authorized_and_reset_is_not_mid_run);
     RUN_TEST(test_behavior_producer_uses_real_service_and_terminal_slots);
     RUN_TEST(test_behavior_receiver_requires_direct_authenticated_rf_and_validates_pattern);

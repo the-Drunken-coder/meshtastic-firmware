@@ -825,6 +825,14 @@ void RadioLibInterface::startReceive()
     powerMon->setState(meshtastic_PowerMon_State_Lora_RXOn);
 }
 
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+bool RadioLibInterface::performW12RxRearm(W12RxRearmResult &result)
+{
+    result = W12RxRearmResult{};
+    return false;
+}
+#endif
+
 void RadioLibInterface::pollMissedIrqs()
 {
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
