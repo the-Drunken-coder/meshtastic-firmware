@@ -35,7 +35,11 @@ using namespace STM32_LittleFS_Namespace;
 // ESP32 version
 #include "LittleFS.h"
 #define FSCom LittleFS
+#if MESHTASTIC_W12_BENCHMARK
+#define FSBegin() FSCom.begin(false) // Diagnostic updates must preserve the installed filesystem.
+#else
 #define FSBegin() FSCom.begin(true) // format on failure
+#endif
 #define FILE_O_WRITE "w"
 #define FILE_O_READ "r"
 #endif

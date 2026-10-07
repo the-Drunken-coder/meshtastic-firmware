@@ -13,11 +13,21 @@ constexpr uint16_t BIT_RATE_KBPS = 1040;
 constexpr int8_t CHIP_POWER_DBM = -9;
 constexpr uint16_t PREAMBLE_BITS = 32;
 constexpr uint8_t CRC_BYTES = 4;
+#if MESHTASTIC_W12_BENCHMARK && defined(MESHTASTIC_W12_BENCHMARK_SLOT_MS)
+constexpr uint32_t SLOT_MS = MESHTASTIC_W12_BENCHMARK_SLOT_MS;
+static_assert(SLOT_MS <= 10, "Diagnostic slot must stay within the bounded experiment");
+#else
 constexpr uint32_t SLOT_MS = 10;
+#endif
 constexpr uint32_t TURNAROUND_MS = 2;
 constexpr uint32_t COMPLETION_ALLOWANCE_US = 3000;
 constexpr uint32_t TX_TIMEOUT_MS = 100;
+#if MESHTASTIC_W12_BENCHMARK && defined(MESHTASTIC_W12_BENCHMARK_BUSY_DBM)
+constexpr int16_t BUSY_THRESHOLD_DBM = MESHTASTIC_W12_BENCHMARK_BUSY_DBM;
+static_assert(BUSY_THRESHOLD_DBM >= -110 && BUSY_THRESHOLD_DBM <= -60, "Diagnostic CCA threshold out of range");
+#else
 constexpr int16_t BUSY_THRESHOLD_DBM = -90;
+#endif
 constexpr uint32_t OBSERVATION_US = 200;
 #if RADIOLIB_EXCLUDE_LR2021 != 1
 constexpr uint32_t ERROR_IRQS = RADIOLIB_LR2021_IRQ_CRC_ERROR | RADIOLIB_LR2021_IRQ_LEN_ERROR |

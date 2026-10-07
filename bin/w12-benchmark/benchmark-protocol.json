@@ -1,0 +1,415 @@
+{
+  "name": "w12-sustained-throughput",
+  "version": 1,
+  "feature_gate": "MESHTASTIC_W12_BENCHMARK=1",
+  "port": "PRIVATE_APP",
+  "transport": {
+    "control": "local decoded PRIVATE_APP addressed to self; from must be zero and getFrom must equal local node; SNAPSHOT requests want_response",
+    "data": "ordinary PKI encrypted direct LoRa packet, hop_limit=0, want_ack=false; sender requests PKI before MeshService admission",
+    "report": "local decoded PRIVATE_APP addressed to self",
+    "mqtt_data_is_invalid": true
+  },
+  "bounds": {
+    "count": {
+      "minimum": 1000,
+      "maximum": 8192
+    },
+    "size": {
+      "minimum": 219,
+      "maximum": 219,
+      "default": 219
+    },
+    "duration_ms": {
+      "minimum": 60000,
+      "maximum": 60000
+    },
+    "window": {
+      "minimum": 1,
+      "maximum": 16
+    },
+    "flags": 0
+  },
+  "control": {
+    "bytes": 32,
+    "integer_encoding": "little-endian",
+    "fields": [
+      [
+        0,
+        2,
+        "magic",
+        "u16",
+        "0x5731"
+      ],
+      [
+        2,
+        1,
+        "version",
+        "u8",
+        1
+      ],
+      [
+        3,
+        1,
+        "op",
+        "u8",
+        {
+          "RESET": 1,
+          "START": 2,
+          "STOP": 3,
+          "SNAPSHOT": 4
+        }
+      ],
+      [
+        4,
+        4,
+        "run_id",
+        "u32"
+      ],
+      [
+        8,
+        4,
+        "source",
+        "u32"
+      ],
+      [
+        12,
+        4,
+        "destination",
+        "u32"
+      ],
+      [
+        16,
+        4,
+        "count",
+        "u32"
+      ],
+      [
+        20,
+        2,
+        "size",
+        "u16"
+      ],
+      [
+        22,
+        4,
+        "duration_ms",
+        "u32"
+      ],
+      [
+        26,
+        2,
+        "window",
+        "u16"
+      ],
+      [
+        28,
+        1,
+        "flags",
+        "u8"
+      ],
+      [
+        29,
+        3,
+        "reserved",
+        "bytes",
+        "zero"
+      ]
+    ]
+  },
+  "data": {
+    "minimum_bytes": 219,
+    "maximum_bytes": 219,
+    "default_bytes": 219,
+    "integer_encoding": "little-endian",
+    "fields": [
+      [
+        0,
+        2,
+        "magic",
+        "u16",
+        "0x5731"
+      ],
+      [
+        2,
+        1,
+        "version",
+        "u8",
+        1
+      ],
+      [
+        3,
+        1,
+        "kind",
+        "u8",
+        2
+      ],
+      [
+        4,
+        4,
+        "run_id",
+        "u32"
+      ],
+      [
+        8,
+        4,
+        "source",
+        "u32"
+      ],
+      [
+        12,
+        4,
+        "destination",
+        "u32"
+      ],
+      [
+        16,
+        4,
+        "sequence",
+        "u32"
+      ],
+      [
+        20,
+        2,
+        "payload_size",
+        "u16",
+        "must_equal_decoded_payload_size"
+      ],
+      [
+        22,
+        1,
+        "flags",
+        "u8",
+        0
+      ],
+      [
+        23,
+        1,
+        "reserved",
+        "u8",
+        0
+      ],
+      [
+        24,
+        "size-24",
+        "pattern",
+        "bytes",
+        "deterministic_from_run_source_destination_sequence_offset"
+      ]
+    ],
+    "identity": [
+      "run_id",
+      "source",
+      "destination",
+      "size",
+      "flags"
+    ],
+    "receiver_admission": [
+      "decoded PRIVATE_APP",
+      "local node == destination",
+      "TRANSPORT_LORA",
+      "mp.from == source",
+      "mp.to == destination",
+      "pki_encrypted",
+      "!via_mqtt"
+    ],
+    "sender_suppression_identity": [
+      "local node == source",
+      "RX_SRC_LOCAL",
+      "TRANSPORT_INTERNAL",
+      "!via_mqtt",
+      "getFrom == source",
+      "mp.to == destination",
+      "exact live TxSlot packet pointer and PacketId"
+    ],
+    "validation": "pattern is checked before bitmap insertion; a corrupt first copy does not block a later valid copy",
+    "sequence": "sequence >= count increments out_of_range and is never inserted into the bitmap",
+    "pattern_bytes": 195,
+    "wire_helpers": "Pure encode/decode helpers can parse smaller shapes, but active run admission is fixed to 219 bytes."
+  },
+  "report": {
+    "bytes": 86,
+    "integer_encoding": "little-endian",
+    "status_bits": {
+      "prepared": 1,
+      "running": 2,
+      "complete": 4
+    },
+    "fields": [
+      [
+        0,
+        2,
+        "magic",
+        "u16",
+        "0x5731"
+      ],
+      [
+        2,
+        1,
+        "version",
+        "u8",
+        1
+      ],
+      [
+        3,
+        1,
+        "kind",
+        "u8",
+        3
+      ],
+      [
+        4,
+        4,
+        "run_id",
+        "u32"
+      ],
+      [
+        8,
+        4,
+        "source",
+        "u32"
+      ],
+      [
+        12,
+        4,
+        "destination",
+        "u32"
+      ],
+      [
+        16,
+        4,
+        "count",
+        "u32"
+      ],
+      [
+        20,
+        2,
+        "size",
+        "u16"
+      ],
+      [
+        22,
+        4,
+        "duration_ms",
+        "u32"
+      ],
+      [
+        26,
+        2,
+        "window",
+        "u16"
+      ],
+      [
+        28,
+        1,
+        "flags",
+        "u8"
+      ],
+      [
+        29,
+        1,
+        "status",
+        "u8"
+      ],
+      [
+        30,
+        4,
+        "enqueued",
+        "u32"
+      ],
+      [
+        34,
+        4,
+        "send_failures",
+        "u32"
+      ],
+      [
+        38,
+        4,
+        "tx_started",
+        "u32"
+      ],
+      [
+        42,
+        4,
+        "tx_succeeded",
+        "u32"
+      ],
+      [
+        46,
+        4,
+        "tx_failures",
+        "u32"
+      ],
+      [
+        50,
+        4,
+        "tx_dropped",
+        "u32"
+      ],
+      [
+        54,
+        4,
+        "tx_cancelled",
+        "u32"
+      ],
+      [
+        58,
+        4,
+        "received",
+        "u32"
+      ],
+      [
+        62,
+        4,
+        "missing",
+        "u32"
+      ],
+      [
+        66,
+        4,
+        "duplicates",
+        "u32"
+      ],
+      [
+        70,
+        4,
+        "corrupt",
+        "u32"
+      ],
+      [
+        74,
+        4,
+        "out_of_range",
+        "u32"
+      ],
+      [
+        78,
+        4,
+        "elapsed_ms",
+        "u32"
+      ],
+      [
+        82,
+        4,
+        "goodput_bps",
+        "u32"
+      ]
+    ],
+    "goodput": "received * size * 1000 / elapsed_ms; zero when elapsed_ms is zero",
+    "snapshot": "SNAPSHOT returns a report after the burst when want_response is set; receiver completes only after its first-frame anchored duration has elapsed; no-first-frame STOP reports elapsed=0 and goodput=0"
+  },
+  "sequence": [
+    "RESET receiver and sender with identical config; RESET is rejected while running or while physical TX slots remain pending",
+    "START receiver first; it arms without starting its timer",
+    "START sender; sender produces through MeshService and Router until duration or count",
+    "wait for the receiver deadline and radio terminal callbacks to drain",
+    "SNAPSHOT receiver and sender via local control"
+  ],
+  "tx_hooks": {
+    "onTxStarted": "void onTxStarted(const meshtastic_MeshPacket*)",
+    "onTxFinished": "void onTxFinished(const meshtastic_MeshPacket*, RadioInterface::TxState)",
+    "matching": "fixed 16-slot pointer plus packet-id binding established before service enqueue; duplicate start callbacks count once; stale completions do nothing",
+    "window": "pending physical bindings are capped by config.window and 16; queue free capacity is also checked",
+    "send_failures": "MeshService admission failures; terminal physical counters come only from lifecycle callbacks"
+  }
+}
