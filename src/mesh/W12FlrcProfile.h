@@ -22,6 +22,24 @@ constexpr uint32_t SLOT_MS = 10;
 constexpr uint32_t TURNAROUND_MS = 2;
 constexpr uint32_t COMPLETION_ALLOWANCE_US = 3000;
 constexpr uint32_t TX_TIMEOUT_MS = 100;
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && defined(MESHTASTIC_W12_BENCHMARK_RX_TIMEOUT_MS)
+#if defined(MESHTASTIC_W12_BENCHMARK_SINGLE_RX) && MESHTASTIC_W12_BENCHMARK_SINGLE_RX
+#error "MESHTASTIC_W12_BENCHMARK_RX_TIMEOUT_MS cannot be combined with single RX"
+#endif
+// SetRx uses 24-bit periods of the LR2021's 32.768 kHz RTC. 0xFFFFFF is reserved for continuous RX.
+constexpr uint32_t RX_TIMEOUT_RTC_HZ = 32768;
+constexpr uint32_t RX_TIMEOUT_MAX_TICKS = 0xFFFFFEUL;
+constexpr uint32_t RX_TIMEOUT_MAX_MS = (static_cast<uint64_t>(RX_TIMEOUT_MAX_TICKS) * 1000) / RX_TIMEOUT_RTC_HZ;
+constexpr uint32_t RX_TIMEOUT_MIN_MS = 100;
+constexpr int64_t RX_TIMEOUT_MS = MESHTASTIC_W12_BENCHMARK_RX_TIMEOUT_MS;
+static_assert(RX_TIMEOUT_MS > 0, "Diagnostic RX timeout must be positive");
+static_assert(RX_TIMEOUT_MS >= RX_TIMEOUT_MIN_MS, "Diagnostic RX timeout must leave margin for a full FLRC frame");
+static_assert(RX_TIMEOUT_MS <= RX_TIMEOUT_MAX_MS, "Diagnostic RX timeout exceeds the finite LR2021 24-bit limit");
+constexpr uint64_t RX_TIMEOUT_TICKS_WIDE = (static_cast<uint64_t>(RX_TIMEOUT_MS) * RX_TIMEOUT_RTC_HZ + 999) / 1000;
+static_assert(RX_TIMEOUT_TICKS_WIDE > 0 && RX_TIMEOUT_TICKS_WIDE <= RX_TIMEOUT_MAX_TICKS,
+              "Diagnostic RX timeout does not fit a finite LR2021 24-bit timeout");
+constexpr uint32_t RX_TIMEOUT_TICKS = static_cast<uint32_t>(RX_TIMEOUT_TICKS_WIDE);
+#endif
 #if MESHTASTIC_W12_BENCHMARK && defined(MESHTASTIC_W12_BENCHMARK_BUSY_DBM)
 constexpr int16_t BUSY_THRESHOLD_DBM = MESHTASTIC_W12_BENCHMARK_BUSY_DBM;
 static_assert(BUSY_THRESHOLD_DBM >= -110 && BUSY_THRESHOLD_DBM <= -60, "Diagnostic CCA threshold out of range");
