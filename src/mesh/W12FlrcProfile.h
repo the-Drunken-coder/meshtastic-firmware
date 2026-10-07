@@ -87,10 +87,13 @@ inline int16_t readStatus(Module &module, uint16_t command, uint8_t *data, size_
     return result;
 }
 
-// The pinned common IRQ getter discards SPI errors. Validate its raw status-plus-IRQ response.
-inline int16_t readIrqFlags(Module &module, uint32_t &flags)
+// The pinned common IRQ getter discards SPI errors. Validate its raw status-plus-IRQ response. The
+// optional status output only exposes bytes already returned by this transaction.
+inline int16_t readIrqFlags(Module &module, uint32_t &flags, uint16_t *rawStatus = nullptr)
 {
     flags = 0;
+    if (rawStatus)
+        *rawStatus = 0;
     uint8_t data[6] = {};
     const auto width = module.spiConfig.widths[RADIOLIB_MODULE_SPI_WIDTH_STATUS];
     module.spiConfig.widths[RADIOLIB_MODULE_SPI_WIDTH_STATUS] = Module::BITS_0;
@@ -98,8 +101,11 @@ inline int16_t readIrqFlags(Module &module, uint32_t &flags)
     module.spiConfig.widths[RADIOLIB_MODULE_SPI_WIDTH_STATUS] = width;
     if (result == RADIOLIB_ERR_NONE && module.spiConfig.parseStatusCb)
         result = module.spiConfig.parseStatusCb(data[0]);
-    if (result == RADIOLIB_ERR_NONE)
+    if (result == RADIOLIB_ERR_NONE) {
         flags = (uint32_t(data[2]) << 24) | (uint32_t(data[3]) << 16) | (uint32_t(data[4]) << 8) | data[5];
+        if (rawStatus)
+            *rawStatus = (uint16_t(data[0]) << 8) | data[1];
+    }
     return result;
 }
 

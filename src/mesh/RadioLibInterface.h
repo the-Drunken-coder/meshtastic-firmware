@@ -6,6 +6,10 @@
 
 #include <RadioLib.h>
 #include <sys/types.h>
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+#include <atomic>
+static_assert(std::atomic<uint32_t>::is_always_lock_free, "W12 radio diagnostic state requires lock-free 32-bit atomics");
+#endif
 
 // ESP32 has special rules about ISR code
 #ifdef ARDUINO_ARCH_ESP32
@@ -171,6 +175,9 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     {
         if (!isrEverArmed)
             return;
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+        publishW12DiagnosticIrqAttachment(0);
+#endif
         clearRadioIsr();
     }
 
@@ -181,8 +188,23 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     {
         // Latch before arming: the ISR can fire the moment the handler is installed.
         isrEverArmed = true;
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+        const uint8_t attachment = isIsrTxCallback(callback) ? 2 : (callback == isrRxLevel0 ? 1 : 3);
+        publishW12DiagnosticIrqAttachment(attachment);
+#endif
         setRadioIsr(callback);
     }
+
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    uint32_t getW12DiagnosticRadioState() const
+    {
+        uint32_t state = w12DiagnosticRadioState.load(std::memory_order_relaxed);
+        state = (state & ~0x03u) | (isReceiving ? 1u : 0u) | (rxOffline ? 2u : 0u);
+        return state;
+    }
+    bool isW12DiagnosticPollContext() const { return w12DiagnosticPollContext; }
+    void setW12DiagnosticPollContext(bool active) { w12DiagnosticPollContext = active; }
+#endif
 
     /**
      * Poll as a backup to catch missed edge-triggered interrupts.
@@ -213,6 +235,19 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
 
     /// Set by a driver's startReceive() when it gives up and leaves RX off; cleared once RX is armed again.
     bool rxOffline = false;
+
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    // One relaxed atomic word publishes only IRQ attachment from ISR-adjacent glue. The owner-thread
+    // snapshot combines this with its plain software isReceiving/rxOffline state.
+    std::atomic<uint32_t> w12DiagnosticRadioState{0};
+    bool w12DiagnosticPollContext = false;
+
+    void INTERRUPT_ATTR publishW12DiagnosticIrqAttachment(uint8_t attachment)
+    {
+        const uint32_t state = ((attachment & 0x03u) << 2) | (1u << 4);
+        w12DiagnosticRadioState.store(state, std::memory_order_relaxed);
+    }
+#endif
 
     /**
      * Debugging counts

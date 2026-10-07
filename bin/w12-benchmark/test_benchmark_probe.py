@@ -169,6 +169,115 @@ def diagnostic_payload(run, **changes):
     return bytes(payload)
 
 
+def radio_diagnostic_payload(run, **changes):
+    values = {
+        "status": 0x05,
+        "pending_tx_count": 0,
+        "rx_arm_last_result": -7,
+        "rx_standby_last_result": -8,
+        "rx_start_last_result": -9,
+        "rx_irq_map_last_result": -10,
+        "poll_rx_last_result": -11,
+        "poll_tx_last_done": 0xFF,
+        "snapshot_is_receiving": 1,
+        "snapshot_rx_offline": 0,
+        "snapshot_irq_attachment": 1,
+        "snapshot_state_valid": 1,
+        "irq_gpio_level": 0xFF,
+        "irq_gpio_source": 0,
+        "poll_chip_status0": 4,
+        "poll_chip_status1": 5,
+        "poll_chip_status_observed": 1,
+        "poll_chip_status_age_ms": 789,
+        "poll_chip_rx_count": 3,
+        "poll_chip_nonrx_count": 4,
+        "rx_arm_last_stage": 0,
+        "last_rx_done_age_ms": 123,
+        "last_rx_read_age_ms": benchmark.UINT32_MAX,
+        "last_rx_auth_age_ms": 456,
+    }
+    values.update(changes)
+    payload = bytearray(benchmark.DIAGNOSTIC_REPORT_BYTES)
+    payload[0:2] = benchmark.MAGIC.to_bytes(2, "little")
+    payload[2:4] = bytes((benchmark.VERSION, 5))
+    payload[4:8] = run.run_id.to_bytes(4, "little")
+    payload[8:12] = run.source.to_bytes(4, "little")
+    payload[12:16] = run.destination.to_bytes(4, "little")
+    payload[16:20] = run.duration_ms.to_bytes(4, "little")
+    payload[20] = values["status"]
+    payload[21] = values["pending_tx_count"]
+    signed_offsets = {
+        44: "rx_standby_last_result",
+        54: "rx_start_last_result",
+        68: "rx_irq_map_last_result",
+        70: "rx_arm_last_result",
+        132: "poll_rx_last_result",
+    }
+    u8_offsets = {
+        146: "poll_tx_last_done",
+        147: "snapshot_is_receiving",
+        148: "snapshot_rx_offline",
+        149: "snapshot_irq_attachment",
+        150: "snapshot_state_valid",
+        151: "irq_gpio_level",
+        152: "irq_gpio_source",
+        217: "poll_chip_status0",
+        218: "poll_chip_status1",
+        219: "poll_chip_status_observed",
+        216: "rx_arm_last_stage",
+    }
+    for offset, name in signed_offsets.items():
+        payload[offset : offset + 2] = values[name].to_bytes(2, "little", signed=True)
+    for offset, name in u8_offsets.items():
+        payload[offset] = values[name]
+    u32_names = (
+        "rx_arm_attempts",
+        "rx_arm_successes",
+        "rx_arm_failures",
+        "rx_standby_calls",
+        "rx_standby_failures",
+        "rx_start_calls",
+        "rx_start_failures",
+        "rx_start_retry_calls",
+        "rx_irq_map_calls",
+        "rx_irq_map_failures",
+        "rx_start_duration_count_us",
+        "rx_start_duration_sum_us",
+        "rx_start_duration_max_us",
+        "channel_active_duration_count_us",
+        "channel_active_duration_sum_us",
+        "channel_active_duration_max_us",
+        "start_send_duration_count_us",
+        "start_send_duration_sum_us",
+        "start_send_duration_max_us",
+        "poll_calls",
+        "poll_rx_checks",
+        "poll_rx_read_success",
+        "poll_rx_read_failure",
+        "poll_rx_pending",
+        "poll_rx_last_flags",
+        "poll_rx_flags_or",
+        "poll_tx_checks",
+        "poll_tx_pending",
+    )
+    for index, name in enumerate(u32_names):
+        values.setdefault(name, index + 1)
+    offsets = [24, 28, 32, 36, 40, 46, 50, 56, 60, 64, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112, 116, 120, 124, 128, 134, 138, 142]
+    for offset, name in zip(offsets, u32_names):
+        payload[offset : offset + 4] = values[name].to_bytes(4, "little")
+    for offset, name in (
+        (220, "poll_chip_status_age_ms"),
+        (224, "poll_chip_rx_count"),
+        (228, "poll_chip_nonrx_count"),
+    ):
+        payload[offset : offset + 4] = values[name].to_bytes(4, "little")
+    for index in range(12):
+        payload[156 + index * 4 : 160 + index * 4] = (index + 20).to_bytes(4, "little")
+    for offset, name in ((204, "last_rx_done_age_ms"), (208, "last_rx_read_age_ms"), (212, "last_rx_auth_age_ms")):
+        payload[offset : offset + 4] = values[name].to_bytes(4, "little")
+    return bytes(payload)
+
+
 class ProtocolTests(unittest.TestCase):
     def test_control_frame_is_exact_little_endian_contract(self):
         run = config()
@@ -206,6 +315,17 @@ class ProtocolTests(unittest.TestCase):
             (benchmark.CONTROL_SNAPSHOT_DIAGNOSTICS, run),
         )
 
+    def test_radio_diagnostic_control_uses_unchanged_32_byte_shape(self):
+        run = config()
+        encoded = benchmark.encode_control(
+            run, benchmark.CONTROL_SNAPSHOT_RADIO_DIAGNOSTICS
+        )
+        self.assertEqual(len(encoded), benchmark.CONTROL_BYTES)
+        self.assertEqual(
+            benchmark.decode_control(encoded),
+            (benchmark.CONTROL_SNAPSHOT_RADIO_DIAGNOSTICS, run),
+        )
+
     def test_diagnostic_report_round_trips_all_counter_groups(self):
         run = config()
         decoded = benchmark.decode_diagnostics(diagnostic_payload(run))
@@ -220,6 +340,50 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(serialized["status"], "complete")
         self.assertTrue(serialized["coverage_complete"])
 
+    def test_radio_diagnostic_decodes_signed_phase_state_and_unknown_ages(self):
+        run = config()
+        decoded = benchmark.decode_radio_diagnostics(radio_diagnostic_payload(run))
+        self.assertEqual(decoded.rx_standby_last_result, -8)
+        self.assertEqual(decoded.rx_start_last_result, -9)
+        self.assertEqual(decoded.rx_done_by_5s_bucket, tuple(range(20, 32)))
+        self.assertEqual(decoded.last_rx_read_age_ms, benchmark.UINT32_MAX)
+        self.assertEqual(decoded.poll_chip_status0, 4)
+        self.assertEqual(decoded.poll_chip_rx_count, 3)
+        serialized = benchmark._radio_diagnostic_dict(decoded)
+        self.assertEqual(serialized["scope"], "board_local_radio_phase")
+        self.assertEqual(serialized["status"], "complete")
+        self.assertEqual(serialized["rx_arm_last_stage"], "success")
+        self.assertEqual(serialized["rx_done_bucket_anchor"], "local_START")
+        self.assertTrue(serialized["last_rx_read_age_unknown"])
+        self.assertIsNone(serialized["last_rx_read_age_ms"])
+        self.assertEqual(serialized["poll_chip_status_age_ms"], 789)
+        self.assertEqual(
+            serialized["poll_chip_mode_source"], "poll_chip_status1 low three bits"
+        )
+        self.assertFalse(serialized["rf_coverage_authoritative"])
+
+    def test_radio_diagnostic_parser_rejects_length_reserved_status_and_enum_errors(self):
+        run = config()
+        valid = radio_diagnostic_payload(run)
+        adverse = {
+            "short": valid[:-1],
+            "long": valid + b"\x00",
+            "kind": bytes(valid[:3] + b"\x04" + valid[4:]),
+            "header_reserved": bytes(valid[:22] + b"\x01" + valid[23:]),
+            "phase_reserved": bytes(valid[:153] + b"\x01" + valid[154:]),
+            "tail_reserved": bytes(valid[:232] + b"\x01"),
+            "unknown_status": bytes(valid[:20] + b"\x08" + valid[21:]),
+            "running_and_complete": bytes(valid[:20] + b"\x27" + valid[21:]),
+            "pending_status_mismatch": bytes(valid[:20] + b"\x05\x01" + valid[22:]),
+            "poll_done": bytes(valid[:146] + b"\x02" + valid[147:]),
+            "attachment": bytes(valid[:149] + b"\x04" + valid[150:]),
+            "stage": bytes(valid[:216] + b"\x04" + valid[217:]),
+            "chip_status_observed": bytes(valid[:219] + b"\x02" + valid[220:]),
+        }
+        for name, payload in adverse.items():
+            with self.subTest(name=name), self.assertRaises(benchmark.BenchmarkError):
+                benchmark.decode_radio_diagnostics(payload)
+
     def test_protocol_manifest_records_frozen_diagnostic_operation_and_offsets(self):
         manifest = json.loads(
             (MODULE_PATH.with_name("benchmark-protocol.json")).read_text()
@@ -228,11 +392,19 @@ class ProtocolTests(unittest.TestCase):
             field for field in manifest["control"]["fields"] if field[2] == "op"
         )
         self.assertEqual(operation[4]["SNAPSHOT_DIAGNOSTICS"], 5)
+        self.assertEqual(operation[4]["SNAPSHOT_RADIO_DIAGNOSTICS"], 6)
         self.assertEqual(manifest["diagnostics"]["response_kind"], 4)
         self.assertEqual(manifest["diagnostics"]["response_bytes"], 233)
         fields = {field[2]: field for field in manifest["diagnostic_report"]["fields"]}
         self.assertEqual(fields["tx_delay_schedule_accepted"][:2], [224, 4])
         self.assertEqual(fields["tx_delay_schedule_rejected"][:2], [228, 4])
+        phase_fields = {
+            field[2]: field for field in manifest["radio_phase_report"]["fields"]
+        }
+        self.assertEqual(manifest["radio_phase_report"]["status_bits"]["reserved"], 8)
+        self.assertEqual(phase_fields["rx_done_by_5s_bucket"][:2], [156, 48])
+        self.assertEqual(phase_fields["poll_chip_rx_count"][:2], [224, 4])
+        self.assertIn("poll_chip_status1", phase_fields["poll_chip_rx_count"][4])
         self.assertEqual(manifest["host_clock"]["continuity_tolerance_seconds"], 2.0)
         self.assertEqual(manifest["host_clock"]["failure_reason"], "host_clock_discontinuity")
 
@@ -446,6 +618,68 @@ class ProtocolTests(unittest.TestCase):
                     benchmark.BenchmarkError, "peer_public_key_missing_or_invalid"
                 ):
                     benchmark._peer_bitmap(sessions, "base", "walker")
+
+
+class BoardResponseTests(unittest.TestCase):
+    def setUp(self):
+        self.session = object.__new__(benchmark.BoardSession)
+        self.session.node_num = benchmark.BOARD_IDENTITIES["base"][1]
+        self.run = config(
+            source=benchmark.BOARD_IDENTITIES["base"][1],
+            destination=benchmark.BOARD_IDENTITIES["walker"][1],
+        )
+
+    def _event(self, response_key, **changes):
+        response = {
+            "run_id": self.run.run_id,
+            "source": self.run.source,
+            "destination": self.run.destination,
+        }
+        response.update(changes.pop("response", {}))
+        event = {
+            "kind": "packet",
+            "request_id": 77,
+            "to": self.session.node_num,
+            "from": self.session.node_num,
+            response_key: response,
+        }
+        event.update(changes)
+        return event
+
+    def test_every_report_kind_requires_local_address_and_identity(self):
+        for response_key in ("report", "diagnostics", "radio_diagnostics"):
+            with self.subTest(response_key=response_key):
+                valid = self._event(response_key)
+                self.assertTrue(
+                    self.session._response_event_matches(
+                        valid, 77, response_key, self.run
+                    )
+                )
+                for field in ("to", "from"):
+                    invalid = dict(valid)
+                    invalid[field] = self.run.destination
+                    self.assertFalse(
+                        self.session._response_event_matches(
+                            invalid, 77, response_key, self.run
+                        )
+                    )
+                for identity_field in ("run_id", "source", "destination"):
+                    invalid_response = dict(valid[response_key])
+                    invalid_response[identity_field] += 1
+                    invalid = dict(valid)
+                    invalid[response_key] = invalid_response
+                    self.assertFalse(
+                        self.session._response_event_matches(
+                            invalid, 77, response_key, self.run
+                        )
+                    )
+
+    def test_missing_address_cannot_match_local_report(self):
+        event = self._event("report")
+        del event["from"]
+        self.assertFalse(
+            self.session._response_event_matches(event, 77, "report", self.run)
+        )
 
 
 class ReportingTests(unittest.TestCase):
@@ -784,6 +1018,137 @@ class QueueSafetyTests(unittest.TestCase):
             self.assertEqual(saved[0]["run_id"], config().run_id)
 
 
+class BoardSessionConstructionTests(unittest.TestCase):
+    def _fake_classes(self, failure_phase, stuck_reader=False):
+        expected_node = benchmark.BOARD_IDENTITIES["base"][1]
+
+        class FakeStream:
+            def __init__(self):
+                self.close_count = 0
+
+            def close(self):
+                self.close_count += 1
+
+        class FakeReader:
+            def __init__(self):
+                self.alive = True
+
+            def is_alive(self):
+                return self.alive
+
+            def join(self, _timeout):
+                if not stuck_reader:
+                    self.alive = False
+
+        class FakeInterface:
+            instances = []
+
+            def __init__(self, _path, connectNow=False, timeout=0, capture=None):
+                del connectNow, timeout
+                self.capture = capture
+                self._wantExit = False
+                self._rxThread = None
+                self.stream = None
+                self.heartbeatTimer = None
+                self.myInfo = SimpleNamespace(my_node_num=expected_node)
+                type(self).instances.append(self)
+
+            def connect(self):
+                self.stream = FakeStream()
+                self.initial_stream = self.stream
+                self._rxThread = FakeReader()
+                if failure_phase == "connect":
+                    raise RuntimeError("reader started before connect failure")
+
+            def waitForConfig(self):
+                if failure_phase == "config":
+                    raise TimeoutError("config wait failed")
+
+        return FakeInterface
+
+    def _construct_failing_session(self, failure_phase, *, stuck_reader=False):
+        fake_interface = self._fake_classes(failure_phase, stuck_reader)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            port = SimpleNamespace(
+                serial_number=benchmark.BOARD_IDENTITIES["base"][0],
+                device="/dev/fake-w12",
+            )
+            with mock.patch.object(
+                benchmark,
+                "_make_capture_serial_classes",
+                lambda: (object, fake_interface, object, object),
+            ), mock.patch(
+                "serial.tools.list_ports.comports", return_value=[port]
+            ):
+                try:
+                    benchmark.BoardSession("base", output)
+                except BaseException as error:
+                    events_path = output / "base" / "capture-events.json"
+                    events = json.loads(events_path.read_text())
+                    return error, fake_interface.instances[0], events
+            self.fail("constructor unexpectedly succeeded")
+
+    def test_connect_failure_after_reader_start_is_cleaned_and_original_error_survives(self):
+        error, interface, events = self._construct_failing_session("connect")
+
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("reader started before connect failure", str(error))
+        self.assertFalse(interface._rxThread.is_alive())
+        self.assertEqual(interface.initial_stream.close_count, 1)
+        self.assertEqual(events[-1]["kind"], "session_construction_failed")
+
+    def test_config_wait_failure_is_cleaned_and_capture_is_persisted(self):
+        error, interface, events = self._construct_failing_session("config")
+
+        self.assertIsInstance(error, TimeoutError)
+        self.assertIn("config wait failed", str(error))
+        self.assertFalse(interface._rxThread.is_alive())
+        self.assertEqual(interface.initial_stream.close_count, 1)
+        self.assertEqual(events[-1]["error_type"], "TimeoutError")
+
+    def test_cleanup_timeout_fails_closed_and_chains_original_failure(self):
+        error, interface, events = self._construct_failing_session(
+            "connect", stuck_reader=True
+        )
+
+        self.assertIsInstance(error, benchmark.BenchmarkError)
+        self.assertIn("port reuse prohibited", str(error))
+        self.assertIsInstance(error.__cause__, RuntimeError)
+        self.assertTrue(interface._rxThread.is_alive())
+        self.assertEqual(interface.initial_stream.close_count, 1)
+        self.assertEqual(events[-1]["kind"], "session_construction_failed")
+
+    def test_cleanup_exception_fails_closed_and_chains_original_failure(self):
+        fake_interface = self._fake_classes("connect")
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            port = SimpleNamespace(
+                serial_number=benchmark.BOARD_IDENTITIES["base"][0],
+                device="/dev/fake-w12",
+            )
+            with mock.patch.object(
+                benchmark,
+                "_make_capture_serial_classes",
+                lambda: (object, fake_interface, object, object),
+            ), mock.patch(
+                "serial.tools.list_ports.comports", return_value=[port]
+            ), mock.patch.object(
+                benchmark.BoardSession,
+                "close",
+                side_effect=OSError("close failed"),
+            ):
+                with self.assertRaisesRegex(
+                    benchmark.BenchmarkError,
+                    "cleanup raised OSError; port reuse prohibited",
+                ) as raised:
+                    benchmark.BoardSession("base", output)
+            self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+            self.assertTrue(
+                (output / "base" / "capture-events.json").exists()
+            )
+
+
 class HardwareHarnessTests(unittest.TestCase):
     def test_run_hardware_captures_controls_closes_and_freshly_reconnects(self):
         class FakeClock:
@@ -906,6 +1271,21 @@ class HardwareHarnessTests(unittest.TestCase):
                 )
                 return diagnostics
 
+            def snapshot_radio_diagnostics(self, run, _timeout):
+                packet_id = self.control(
+                    benchmark.CONTROL_SNAPSHOT_RADIO_DIAGNOSTICS,
+                    run,
+                    want_response=True,
+                )
+                parsed = benchmark.decode_radio_diagnostics(
+                    radio_diagnostic_payload(run)
+                )
+                diagnostics = benchmark._radio_diagnostic_dict(parsed)
+                self.capture.record(
+                    "packet", request_id=packet_id, radio_diagnostics=diagnostics
+                )
+                return diagnostics
+
             def snapshot_config(self, _output, _label):
                 return dict(self.config_snapshot)
 
@@ -972,7 +1352,8 @@ class HardwareHarnessTests(unittest.TestCase):
             )
             self.assertTrue(
                 all(
-                    board["scope"] == "board_local_aggregate"
+                    board["aggregate"]["scope"] == "board_local_aggregate"
+                    and board["radio_phase"]["scope"] == "board_local_radio_phase"
                     for board in result["diagnostics"]["boards"].values()
                 )
             )
@@ -993,11 +1374,27 @@ class HardwareHarnessTests(unittest.TestCase):
                     == benchmark.CONTROL_SNAPSHOT_DIAGNOSTICS
                 ]
                 self.assertEqual(len(diagnostic_controls), 1)
+                radio_controls = [
+                    event
+                    for event in events
+                    if event.get("kind") == "control_attempt"
+                    and event.get("operation")
+                    == benchmark.CONTROL_SNAPSHOT_RADIO_DIAGNOSTICS
+                ]
+                self.assertEqual(len(radio_controls), 1)
                 self.assertTrue(
                     any(
                         event.get("kind") == "packet"
                         and event.get("diagnostics", {}).get("scope")
                         == "board_local_aggregate"
+                        for event in events
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        event.get("kind") == "packet"
+                        and event.get("radio_diagnostics", {}).get("scope")
+                        == "board_local_radio_phase"
                         for event in events
                     )
                 )

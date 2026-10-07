@@ -473,7 +473,20 @@ void RadioLibInterface::onNotify(uint32_t notification)
                 } else if (action == RadioTxHook::PRETX_DEFER) {
                     setTransmitDelay(); // the radio config moved, so re-run the delay and scan on it
                 } else {
-                    if (isChannelActive()) {
+                    bool channelActive;
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+                    if (w12BenchmarkModule) {
+                        const uint32_t phaseStartedAt = micros();
+                        channelActive = isChannelActive();
+                        w12BenchmarkModule->onRadioPhase(W12BenchmarkModule::RadioPhase::CHANNEL_ACTIVE,
+                                                         static_cast<uint32_t>(micros() - phaseStartedAt));
+                    } else {
+                        channelActive = isChannelActive();
+                    }
+#else
+                    channelActive = isChannelActive();
+#endif
+                    if (channelActive) {
                         // Passive observations leave RX armed; restarting would discard the packet just detected.
                         if (!isReceiving && !RadioTxHooks::holdsRadio(txp)) {
                             startReceive();
@@ -814,12 +827,28 @@ void RadioLibInterface::startReceive()
 
 void RadioLibInterface::pollMissedIrqs()
 {
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    if (w12BenchmarkModule)
+        w12BenchmarkModule->onRadioPoll();
+#endif
     // RadioLibInterface::enableInterrupt uses EDGE-TRIGGERED interrupts. Poll as a backup to catch missed edges.
     if (isReceiving) {
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+        setW12DiagnosticPollContext(true);
+#endif
         checkRxDoneIrqFlag();
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+        setW12DiagnosticPollContext(false);
+#endif
     }
     if (sendingPacket) {
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+        setW12DiagnosticPollContext(true);
+#endif
         checkTxDoneIrqFlag();
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+        setW12DiagnosticPollContext(false);
+#endif
     }
 }
 
@@ -881,7 +910,12 @@ void RadioLibInterface::checkRxDoneIrqFlag()
 
 void RadioLibInterface::checkTxDoneIrqFlag()
 {
-    if (iface->checkIrq(RADIOLIB_IRQ_TX_DONE)) {
+    const bool pending = iface->checkIrq(RADIOLIB_IRQ_TX_DONE);
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    if (w12DiagnosticPollContext && w12BenchmarkModule)
+        w12BenchmarkModule->onRadioPollTx(pending);
+#endif
+    if (pending) {
         LOG_WARN("caught missed TX_DONE");
         notify(ISR_TX, true);
     }
@@ -902,6 +936,9 @@ void RadioLibInterface::setStandby()
 /** start an immediate transmit */
 bool RadioLibInterface::startSend(meshtastic_MeshPacket *txp)
 {
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    const uint32_t phaseStartedAt = micros();
+#endif
     notifyTxStarted(txp);
     /* NOTE: Minimize the actions before startTransmit() to keep the time between
              channel scan and actual transmit as low as possible to avoid collisions. */
@@ -912,6 +949,11 @@ bool RadioLibInterface::startSend(meshtastic_MeshPacket *txp)
         RadioTxHooks::packetReleased(this, txp);
         packetPool.release(txp);
         startReceive();
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+        if (w12BenchmarkModule)
+            w12BenchmarkModule->onRadioPhase(W12BenchmarkModule::RadioPhase::START_SEND,
+                                             static_cast<uint32_t>(micros() - phaseStartedAt));
+#endif
         return false;
     } else {
         configHardwareForSend(); // must be after setStandby
@@ -952,6 +994,12 @@ bool RadioLibInterface::startSend(meshtastic_MeshPacket *txp)
 #endif
         }
 
-        return res == RADIOLIB_ERR_NONE;
+        const bool sent = res == RADIOLIB_ERR_NONE;
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+        if (w12BenchmarkModule)
+            w12BenchmarkModule->onRadioPhase(W12BenchmarkModule::RadioPhase::START_SEND,
+                                             static_cast<uint32_t>(micros() - phaseStartedAt));
+#endif
+        return sent;
     }
 }

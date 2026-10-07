@@ -57,7 +57,8 @@
           "START": 2,
           "STOP": 3,
           "SNAPSHOT": 4,
-          "SNAPSHOT_DIAGNOSTICS": 5
+          "SNAPSHOT_DIAGNOSTICS": 5,
+          "SNAPSHOT_RADIO_DIAGNOSTICS": 6
         }
       ],
       [
@@ -825,5 +826,383 @@
     "discontinuity": "abs(wall_elapsed_seconds - monotonic_elapsed_seconds) > continuity_tolerance_seconds",
     "failure_reason": "host_clock_discontinuity",
     "cause_interpretation": "record both clocks without attributing the discrepancy to sleep or another specific cause"
+  },
+  "radio_phase": {
+    "operation": 6,
+    "response_kind": 5,
+    "response_bytes": 233,
+    "scope": "board_local_radio_phase",
+    "request": "local operation 6 through the existing 32-byte PRIVATE_APP control; accepted while running or complete with pending TX allowed",
+    "rf_effect": "none",
+    "state_note": "is_receiving and rx_offline are software state; they do not assert physical RX",
+    "coverage": "status bits and pending_tx_count identify as-of state; full_window_coverage additionally requires elapsed_ms=60000 and a terminal non-pending snapshot",
+    "rf_coverage_authoritative": false
+  },
+  "radio_phase_report": {
+    "kind": 5,
+    "bytes": 233,
+    "integer_encoding": "little-endian",
+    "header": "bytes 0..23 match kind 4: magic u16, version u8, kind u8, run_id/source/destination/elapsed_ms u32, status u8, pending_tx_count u8, two reserved bytes",
+    "status_bits": {
+      "prepared": 1,
+      "running": 2,
+      "complete": 4,
+      "reserved": 8,
+      "as_of_incomplete": 32,
+      "pending_tx": 16
+    },
+    "fields": [
+      [
+        24,
+        4,
+        "rx_arm_attempts",
+        "u32"
+      ],
+      [
+        28,
+        4,
+        "rx_arm_successes",
+        "u32"
+      ],
+      [
+        32,
+        4,
+        "rx_arm_failures",
+        "u32"
+      ],
+      [
+        36,
+        4,
+        "rx_standby_calls",
+        "u32"
+      ],
+      [
+        40,
+        4,
+        "rx_standby_failures",
+        "u32"
+      ],
+      [
+        44,
+        2,
+        "rx_standby_last_result",
+        "i16",
+        "existing RadioLib result code"
+      ],
+      [
+        46,
+        4,
+        "rx_start_calls",
+        "u32",
+        "actual lora.startReceive calls, including retry"
+      ],
+      [
+        50,
+        4,
+        "rx_start_failures",
+        "u32"
+      ],
+      [
+        54,
+        2,
+        "rx_start_last_result",
+        "i16",
+        "existing RadioLib result code"
+      ],
+      [
+        56,
+        4,
+        "rx_start_retry_calls",
+        "u32"
+      ],
+      [
+        60,
+        4,
+        "rx_irq_map_calls",
+        "u32",
+        "setIrqFlags calls"
+      ],
+      [
+        64,
+        4,
+        "rx_irq_map_failures",
+        "u32"
+      ],
+      [
+        68,
+        2,
+        "rx_irq_map_last_result",
+        "i16",
+        "existing RadioLib result code"
+      ],
+      [
+        70,
+        2,
+        "rx_arm_last_result",
+        "i16",
+        "final result of the last startReceive arm attempt"
+      ],
+      [
+        72,
+        4,
+        "rx_start_duration_count_us",
+        "u32"
+      ],
+      [
+        76,
+        4,
+        "rx_start_duration_sum_us",
+        "u32"
+      ],
+      [
+        80,
+        4,
+        "rx_start_duration_max_us",
+        "u32"
+      ],
+      [
+        84,
+        4,
+        "channel_active_duration_count_us",
+        "u32"
+      ],
+      [
+        88,
+        4,
+        "channel_active_duration_sum_us",
+        "u32"
+      ],
+      [
+        92,
+        4,
+        "channel_active_duration_max_us",
+        "u32"
+      ],
+      [
+        96,
+        4,
+        "start_send_duration_count_us",
+        "u32"
+      ],
+      [
+        100,
+        4,
+        "start_send_duration_sum_us",
+        "u32"
+      ],
+      [
+        104,
+        4,
+        "start_send_duration_max_us",
+        "u32"
+      ],
+      [
+        108,
+        4,
+        "poll_calls",
+        "u32",
+        "existing main-loop one-second poll calls"
+      ],
+      [
+        112,
+        4,
+        "poll_rx_checks",
+        "u32"
+      ],
+      [
+        116,
+        4,
+        "poll_rx_read_success",
+        "u32"
+      ],
+      [
+        120,
+        4,
+        "poll_rx_read_failure",
+        "u32"
+      ],
+      [
+        124,
+        4,
+        "poll_rx_pending",
+        "u32",
+        "raw RECEIVE_IRQS present; read failures are separate"
+      ],
+      [
+        128,
+        4,
+        "poll_rx_last_flags",
+        "u32"
+      ],
+      [
+        132,
+        2,
+        "poll_rx_last_result",
+        "i16",
+        "existing RadioLib result code"
+      ],
+      [
+        134,
+        4,
+        "poll_rx_flags_or",
+        "u32"
+      ],
+      [
+        138,
+        4,
+        "poll_tx_checks",
+        "u32"
+      ],
+      [
+        142,
+        4,
+        "poll_tx_pending",
+        "u32",
+        "boolean check results"
+      ],
+      [
+        146,
+        1,
+        "poll_tx_last_done",
+        "u8",
+        "0/1; 255 means no TX poll yet"
+      ],
+      [
+        147,
+        1,
+        "snapshot_is_receiving",
+        "u8",
+        "software state only; does not assert hardware RX"
+      ],
+      [
+        148,
+        1,
+        "snapshot_rx_offline",
+        "u8",
+        "software recovery state"
+      ],
+      [
+        149,
+        1,
+        "snapshot_irq_attachment",
+        "u8",
+        "0 none, 1 RX callback, 2 TX callback, 3 unknown"
+      ],
+      [
+        150,
+        1,
+        "snapshot_state_valid",
+        "u8",
+        "1 when packed software state was available"
+      ],
+      [
+        151,
+        1,
+        "irq_gpio_level",
+        "u8",
+        "255 unavailable; no GPIO read is added"
+      ],
+      [
+        152,
+        1,
+        "irq_gpio_source",
+        "u8",
+        "0 unavailable"
+      ],
+      [
+        153,
+        3,
+        "reserved_phase",
+        "bytes",
+        "zero"
+      ],
+      [
+        156,
+        48,
+        "rx_done_by_5s_bucket",
+        "u32[12]",
+        "START-anchored diagnostic buckets: 0..4 through 55..60+ seconds"
+      ],
+      [
+        204,
+        4,
+        "last_rx_done_age_ms",
+        "u32",
+        "UINT32_MAX means no sample"
+      ],
+      [
+        208,
+        4,
+        "last_rx_read_age_ms",
+        "u32",
+        "UINT32_MAX means no successful read"
+      ],
+      [
+        212,
+        4,
+        "last_rx_auth_age_ms",
+        "u32",
+        "UINT32_MAX means no authenticated handoff"
+      ],
+      [
+        216,
+        1,
+        "rx_arm_last_stage",
+        "u8",
+        "0 success, 1 standby, 2 RX start, 3 IRQ map, 255 no attempt"
+      ],
+      [
+        217,
+        1,
+        "poll_chip_status0",
+        "u8",
+        "raw status byte data[0] from existing successful RX IRQ poll"
+      ],
+      [
+        218,
+        1,
+        "poll_chip_status1",
+        "u8",
+        "raw status byte data[1] from existing successful RX IRQ poll"
+      ],
+      [
+        219,
+        1,
+        "poll_chip_status_observed",
+        "u8",
+        "1 after a successful status sample"
+      ],
+      [
+        220,
+        4,
+        "poll_chip_status_age_ms",
+        "u32",
+        "UINT32_MAX means no successful status sample"
+      ],
+      [
+        224,
+        4,
+        "poll_chip_rx_count",
+        "u32",
+        "successful status samples where poll_chip_status1 low three bits equal RX mode 4; status0 is retained raw and is not used for mode derivation"
+      ],
+      [
+        228,
+        4,
+        "poll_chip_nonrx_count",
+        "u32",
+        "successful status samples with any other chip mode"
+      ],
+      [
+        232,
+        1,
+        "reserved_tail",
+        "bytes",
+        "zero"
+      ]
+    ],
+    "counter_rules": "All counts, sums, maxima, ages, and buckets are u32 and saturate at UINT32_MAX. Phase durations use micros() and unsigned wrap subtraction. RX buckets use the explicit START timestamp, independently of the receiver's first-authenticated-frame timing window. Chip status is observed only from the existing successful one-second RX poll and does not assert hardware state.",
+    "poll_rules": "The one-second poll reports only the raw IRQ read already performed by receiveIrqPending(). No additional SPI read is made. TX polling exposes only the existing boolean check result, never an invented RadioLib error code. Successful LR2021 IRQ status bytes data[0..1] are retained alongside IRQ data[2..5].",
+    "state_rules": "Snapshot state is the software's published isReceiving/rxOffline/IRQ attachment state. It is not a hardware RX assertion. IRQ GPIO is unavailable because this path does not already read it. No ISR performs logging, allocation, module calls, or diagnostic counter updates."
   }
 }
