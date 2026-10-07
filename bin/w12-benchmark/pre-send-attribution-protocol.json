@@ -1,0 +1,327 @@
+{
+  "name": "w12-pre-send-attribution",
+  "version": 1,
+  "feature_gate": "MESHTASTIC_W12_BENCHMARK=1",
+  "scope": "board_local_diagnostic_not_rf_acceptance",
+  "control": {
+    "operation": 9,
+    "bytes": 32,
+    "integer_encoding": "little-endian",
+    "layout_authority": "benchmark-protocol.json control fields; op=9",
+    "authorization": "decoded PRIVATE_APP, local API or INTERNAL, from=0, getFrom=self, to=self, not MQTT, want_ack=false, pki_encrypted=false, want_response=true",
+    "config": "exact matching prepared run, either running or complete; not accepted before START",
+    "effects": "read-only snapshot; no FIFO or chip-error clear, RX rearm, TX cancellation, or policy change"
+  },
+  "reply": {
+    "kind": 7,
+    "bytes": 233,
+    "integer_encoding": "little-endian",
+    "identity": "local self PRIVATE_APP reply; request_id matches the control packet ID; header run/source/destination match the request config",
+    "fields": [
+      [
+        0,
+        2,
+        "magic",
+        "u16",
+        "0x5731"
+      ],
+      [
+        2,
+        1,
+        "version",
+        "u8",
+        1
+      ],
+      [
+        3,
+        1,
+        "kind",
+        "u8",
+        7
+      ],
+      [
+        4,
+        4,
+        "run_id",
+        "u32"
+      ],
+      [
+        8,
+        4,
+        "source",
+        "u32"
+      ],
+      [
+        12,
+        4,
+        "destination",
+        "u32"
+      ],
+      [
+        16,
+        4,
+        "elapsed_ms",
+        "u32"
+      ],
+      [
+        20,
+        1,
+        "status",
+        "u8"
+      ],
+      [
+        21,
+        1,
+        "pending_tx_count",
+        "u8"
+      ],
+      [
+        22,
+        2,
+        "reserved",
+        "bytes",
+        "zero"
+      ],
+      [
+        24,
+        4,
+        "busy_tx_deferrals",
+        "u32"
+      ],
+      [
+        28,
+        4,
+        "busy_rx_active_deferrals",
+        "u32"
+      ],
+      [
+        32,
+        4,
+        "busy_rx_irq_read_failure_deferrals",
+        "u32"
+      ],
+      [
+        36,
+        4,
+        "tx_timer_accepted",
+        "u32"
+      ],
+      [
+        40,
+        4,
+        "tx_timer_dispatches",
+        "u32"
+      ],
+      [
+        44,
+        4,
+        "tx_timer_late_count",
+        "u32"
+      ],
+      [
+        48,
+        4,
+        "tx_timer_late_sum_ms",
+        "u32"
+      ],
+      [
+        52,
+        4,
+        "tx_timer_late_max_ms",
+        "u32"
+      ],
+      [
+        56,
+        4,
+        "tx_timer_overwritten",
+        "u32"
+      ],
+      [
+        60,
+        4,
+        "tx_timer_stale",
+        "u32"
+      ],
+      [
+        64,
+        4,
+        "tx_timer_cancelled",
+        "u32"
+      ],
+      [
+        68,
+        4,
+        "tx_timer_irq_displaced",
+        "u32"
+      ],
+      [
+        72,
+        1,
+        "tx_timer_active",
+        "u8",
+        "0 or 1"
+      ],
+      [
+        73,
+        1,
+        "rx_sample_valid",
+        "u8",
+        "0 or 1"
+      ],
+      [
+        74,
+        1,
+        "rx_sample_status",
+        "u8"
+      ],
+      [
+        75,
+        1,
+        "rx_dio_level",
+        "u8",
+        "0 or 1"
+      ],
+      [
+        76,
+        1,
+        "rx_busy_level",
+        "u8",
+        "0 or 1"
+      ],
+      [
+        77,
+        1,
+        "reserved",
+        "u8",
+        0
+      ],
+      [
+        78,
+        4,
+        "rx_active_receive_start_ms",
+        "u32"
+      ],
+      [
+        82,
+        4,
+        "rx_sampled_at_ms",
+        "u32"
+      ],
+      [
+        86,
+        4,
+        "rx_raw_irq_flags",
+        "u32"
+      ],
+      [
+        90,
+        2,
+        "rx_raw_status",
+        "u16"
+      ],
+      [
+        92,
+        2,
+        "rx_fifo_level",
+        "u16"
+      ],
+      [
+        94,
+        1,
+        "rx_fifo_flags",
+        "u8"
+      ],
+      [
+        95,
+        1,
+        "tx_fifo_flags",
+        "u8"
+      ],
+      [
+        96,
+        2,
+        "rx_chip_errors",
+        "u16"
+      ],
+      [
+        98,
+        2,
+        "rx_irq_read_result",
+        "i16"
+      ],
+      [
+        100,
+        2,
+        "rx_fifo_flags_result",
+        "i16"
+      ],
+      [
+        102,
+        2,
+        "rx_fifo_level_result",
+        "i16"
+      ],
+      [
+        104,
+        2,
+        "rx_errors_result",
+        "i16"
+      ],
+      [
+        106,
+        4,
+        "rx_software_state",
+        "u32"
+      ],
+      [
+        110,
+        4,
+        "tx_timer_due_at_ms",
+        "u32"
+      ],
+      [
+        114,
+        119,
+        "reserved_tail",
+        "bytes",
+        "zero"
+      ]
+    ],
+    "status_bits": {
+      "prepared": 1,
+      "running": 2,
+      "complete": 4,
+      "pending_tx": 16,
+      "as_of_incomplete": 32
+    },
+    "sample_status_bits": {
+      "irq_read_succeeded": 1,
+      "fifo_flags_read_succeeded": 2,
+      "fifo_level_read_succeeded": 4,
+      "errors_read_succeeded": 8,
+      "sample_available": 16
+    },
+    "software_state_bits": {
+      "is_receiving": 1,
+      "rx_offline": 2,
+      "irq_attachment_mask": 12,
+      "irq_attachment_shift": 2,
+      "irq_attachment_encoding": {
+        "0": "none",
+        "1": "RX callback",
+        "2": "TX callback",
+        "3": "unknown"
+      },
+      "irq_attachment_sample_valid": 16
+    }
+  },
+  "validation": {
+    "reserved": "all reserved bytes zero; unknown status or software-state bits invalid",
+    "state": "prepared; exactly one running/complete; pending count <=16; pending status matches count; as_of flag equals running or pending",
+    "sample": "sample_valid matches sample_available; unavailable sample has no success bits and i16 read results INT16_MIN; available results not INT16_MIN and result=0 exactly when respective success bit set",
+    "timer": "dispatches <= accepted; late_count <= dispatches; no late_count implies late_sum=max=0; nonzero late_count implies max>0 and sum>=max; active timer has nonzero due_at, inactive has zero",
+    "counter_scope": "saturating board-local counters reset with benchmark RESET; exclusive primary pre-send reasons BUSY_TX then IRQ-read failure then RX-active; do not convert counts into RF occupancy",
+    "host_bounds": "only correlated responses within the request finite deadline are evidence; stale, malformed, foreign, and parser/reader/write failures invalidate capture",
+    "interpretation": "on-demand reads perturb timing; report exact request and observation timestamps; no delivery, PER, capacity or recovery authorization follows from kind7 alone"
+  }
+}

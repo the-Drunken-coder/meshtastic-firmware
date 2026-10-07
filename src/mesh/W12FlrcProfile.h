@@ -109,6 +109,25 @@ inline int16_t readIrqFlags(Module &module, uint32_t &flags, uint16_t *rawStatus
     return result;
 }
 
+// These LR2021 FIFO helpers are protected by RadioLib unless GODMODE is enabled. Keep the
+// diagnostic access bounded to the existing command/status stream helper and expose no driver API.
+inline int16_t readFifoIrqFlags(Module &module, uint8_t &rxFlags, uint8_t &txFlags)
+{
+    uint8_t data[2] = {};
+    int16_t result = readStatus(module, RADIOLIB_LR2021_CMD_GET_FIFO_IRQ_FLAGS, data, sizeof(data));
+    rxFlags = data[0];
+    txFlags = data[1];
+    return result;
+}
+
+inline int16_t readRxFifoLevel(Module &module, uint16_t &level)
+{
+    uint8_t data[2] = {};
+    int16_t result = readStatus(module, RADIOLIB_LR2021_CMD_GET_RX_FIFO_LEVEL, data, sizeof(data));
+    level = (uint16_t(data[0]) << 8) | data[1];
+    return result;
+}
+
 inline int16_t readRssi(Module &module, bool packet, float &rssi)
 {
     uint8_t data[5] = {};

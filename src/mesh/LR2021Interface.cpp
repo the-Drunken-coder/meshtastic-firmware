@@ -293,12 +293,16 @@ bool LR2021Interface::isChannelActive()
 
 bool LR2021Interface::isActivelyReceiving()
 {
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    return readW12ActiveReceiveState() != W12ActiveReceiveState::INACTIVE;
+#else
     if (!RadioMode::isFlrc())
         return LR20x0Interface::isActivelyReceiving();
     uint32_t flags = 0;
     if (W12FlrcProfile::readIrqFlags(module, flags) != RADIOLIB_ERR_NONE)
         return true;
     return isFlrcReceptionActive(flags, activeReceiveStart);
+#endif
 }
 
 int16_t LR2021Interface::getCurrentRSSI()
@@ -329,6 +333,17 @@ uint32_t LR2021Interface::getPacketTime(uint32_t length, bool received)
 }
 
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+W12ActiveReceiveState LR2021Interface::readW12ActiveReceiveState()
+{
+    if (!RadioMode::isFlrc())
+        return LR20x0Interface::isActivelyReceiving() ? W12ActiveReceiveState::ACTIVE : W12ActiveReceiveState::INACTIVE;
+
+    uint32_t flags = 0;
+    if (W12FlrcProfile::readIrqFlags(module, flags) != RADIOLIB_ERR_NONE)
+        return W12ActiveReceiveState::IRQ_READ_FAILURE;
+    return isFlrcReceptionActive(flags, activeReceiveStart) ? W12ActiveReceiveState::ACTIVE : W12ActiveReceiveState::INACTIVE;
+}
+
 bool LR2021Interface::readW12RxLiveness(W12RxLivenessSample &sample)
 {
     sample = W12RxLivenessSample{};
@@ -343,6 +358,24 @@ bool LR2021Interface::readW12RxLiveness(W12RxLivenessSample &sample)
     sample.rssiReadResult = W12FlrcProfile::readRssi(module, false, rssi);
     if (sample.rssiReadResult == RADIOLIB_ERR_NONE)
         sample.rssiDbm = static_cast<int16_t>(lround(rssi));
+    return true;
+}
+
+bool LR2021Interface::readW12RxRecovery(W12RxRecoverySample &sample)
+{
+    sample = W12RxRecoverySample{};
+    if (!RadioMode::isFlrc() || !module.hal)
+        return false;
+
+    sample.sampledAtMs = Time::getMillis();
+    sample.activeReceiveStartMs = activeReceiveStart;
+    sample.softwareState = getW12DiagnosticRadioState();
+    sample.busyLevel = static_cast<uint8_t>(module.hal->digitalRead(module.getGpio()) != 0);
+    sample.dioLevel = static_cast<uint8_t>(module.hal->digitalRead(module.getIrq()) != 0);
+    sample.irqReadResult = W12FlrcProfile::readIrqFlags(module, sample.rawIrqFlags, &sample.rawStatus);
+    sample.fifoFlagsResult = W12FlrcProfile::readFifoIrqFlags(module, sample.fifoRxFlags, sample.fifoTxFlags);
+    sample.fifoLevelResult = W12FlrcProfile::readRxFifoLevel(module, sample.rxFifoLevel);
+    sample.errorsResult = lora.getErrors(&sample.chipErrors);
     return true;
 }
 

@@ -624,6 +624,7 @@ class BoardResponseTests(unittest.TestCase):
     def setUp(self):
         self.session = object.__new__(benchmark.BoardSession)
         self.session.node_num = benchmark.BOARD_IDENTITIES["base"][1]
+        self.session._last_control = {77: 20.0}
         self.run = config(
             source=benchmark.BOARD_IDENTITIES["base"][1],
             destination=benchmark.BOARD_IDENTITIES["walker"][1],
@@ -639,6 +640,7 @@ class BoardResponseTests(unittest.TestCase):
         event = {
             "kind": "packet",
             "request_id": 77,
+            "monotonic": 21.0,
             "to": self.session.node_num,
             "from": self.session.node_num,
             response_key: response,
@@ -680,6 +682,24 @@ class BoardResponseTests(unittest.TestCase):
         self.assertFalse(
             self.session._response_event_matches(event, 77, "report", self.run)
         )
+
+    def test_local_report_rejects_stale_late_and_invalid_timestamps(self):
+        for response_key in ("report", "diagnostics", "radio_diagnostics"):
+            for observed in (19.99, 25.01, None, float("nan"), float("inf"), True):
+                with self.subTest(kind=response_key, observed=observed):
+                    self.assertFalse(self.session._response_event_matches(
+                        self._event(response_key, monotonic=observed), 77,
+                        response_key, self.run, deadline=25.0,
+                    ))
+            for observed in (20.0, 25.0):
+                self.assertTrue(self.session._response_event_matches(
+                    self._event(response_key, monotonic=observed), 77,
+                    response_key, self.run, deadline=25.0,
+                ))
+        self.session._last_control.clear()
+        self.assertFalse(self.session._response_event_matches(
+            self._event("report"), 77, "report", self.run, deadline=25.0,
+        ))
 
 
 class ReportingTests(unittest.TestCase):

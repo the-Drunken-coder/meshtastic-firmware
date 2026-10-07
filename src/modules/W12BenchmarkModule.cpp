@@ -25,7 +25,7 @@ bool validOperation(W12BenchmarkModule::Op op)
     return op == W12BenchmarkModule::Op::RESET || op == W12BenchmarkModule::Op::START || op == W12BenchmarkModule::Op::STOP ||
            op == W12BenchmarkModule::Op::SNAPSHOT || op == W12BenchmarkModule::Op::SNAPSHOT_DIAGNOSTICS ||
            op == W12BenchmarkModule::Op::SNAPSHOT_RADIO_DIAGNOSTICS || op == W12BenchmarkModule::Op::SNAPSHOT_RX_LIVENESS ||
-           op == W12BenchmarkModule::Op::REARM_RX_LIVENESS;
+           op == W12BenchmarkModule::Op::REARM_RX_LIVENESS || op == W12BenchmarkModule::Op::SNAPSHOT_PRE_SEND_ATTRIBUTION;
 }
 
 uint32_t diagnosticAge(bool present, uint32_t timestamp, uint32_t nowMs)
@@ -376,6 +376,58 @@ size_t W12BenchmarkModule::encodeRxLivenessReport(uint8_t *bytes, size_t capacit
     return RX_LIVENESS_REPORT_BYTES;
 }
 
+size_t W12BenchmarkModule::encodePreSendAttributionReport(uint8_t *bytes, size_t capacity, const Stats &value,
+                                                          const PreSendAttributionDiagnostics &d, uint8_t pendingTxCount)
+{
+    if (!bytes || capacity < PRE_SEND_ATTRIBUTION_REPORT_BYTES)
+        return 0;
+
+    memset(bytes, 0, PRE_SEND_ATTRIBUTION_REPORT_BYTES);
+    put16(bytes, MAGIC);
+    bytes[2] = VERSION;
+    bytes[3] = static_cast<uint8_t>(Kind::PRE_SEND_ATTRIBUTION);
+    put32(bytes + 4, value.config.runId);
+    put32(bytes + 8, value.config.source);
+    put32(bytes + 12, value.config.destination);
+    put32(bytes + 16, value.elapsedMs);
+    bytes[20] = static_cast<uint8_t>((value.prepared ? 1 : 0) | (value.running ? 2 : 0) | (value.complete ? 4 : 0) |
+                                     (pendingTxCount ? 16 : 0) | ((value.running || pendingTxCount) ? 32 : 0));
+    bytes[21] = pendingTxCount;
+
+    put32(bytes + 24, d.busyTxDeferrals);
+    put32(bytes + 28, d.busyRxActiveDeferrals);
+    put32(bytes + 32, d.busyRxIrqReadFailureDeferrals);
+    put32(bytes + 36, d.txTimerAccepted);
+    put32(bytes + 40, d.txTimerDispatches);
+    put32(bytes + 44, d.txTimerLateCount);
+    put32(bytes + 48, d.txTimerLateSumMs);
+    put32(bytes + 52, d.txTimerLateMaxMs);
+    put32(bytes + 56, d.txTimerOverwritten);
+    put32(bytes + 60, d.txTimerStale);
+    put32(bytes + 64, d.txTimerCancelled);
+    put32(bytes + 68, d.txTimerIrqDisplaced);
+    bytes[72] = static_cast<uint8_t>(d.txTimerActive);
+    bytes[73] = static_cast<uint8_t>(d.rxSampleValid);
+    bytes[74] = d.rxSampleStatus;
+    bytes[75] = d.rxDioLevel;
+    bytes[76] = d.rxBusyLevel;
+    put32(bytes + 78, d.rxActiveReceiveStartMs);
+    put32(bytes + 82, d.rxSampledAtMs);
+    put32(bytes + 86, d.rxRawIrqFlags);
+    put16(bytes + 90, d.rxRawStatus);
+    put16(bytes + 92, d.rxFifoLevel);
+    bytes[94] = d.rxFifoFlags;
+    bytes[95] = d.txFifoFlags;
+    put16(bytes + 96, d.rxChipErrors);
+    put16(bytes + 98, static_cast<uint16_t>(d.rxIrqReadResult));
+    put16(bytes + 100, static_cast<uint16_t>(d.rxFifoFlagsResult));
+    put16(bytes + 102, static_cast<uint16_t>(d.rxFifoLevelResult));
+    put16(bytes + 104, static_cast<uint16_t>(d.rxErrorsResult));
+    put32(bytes + 106, d.rxSoftwareState);
+    put32(bytes + 110, d.txTimerDueAtMs);
+    return PRE_SEND_ATTRIBUTION_REPORT_BYTES;
+}
+
 bool W12BenchmarkModule::sameConfig(const RunConfig &a, const RunConfig &b)
 {
     return a.runId == b.runId && a.source == b.source && a.destination == b.destination && a.count == b.count &&
@@ -484,6 +536,16 @@ void W12BenchmarkModule::onTxFinished(const meshtastic_MeshPacket *packet, Radio
     if (!slot)
         return;
 
+    if (trackedTxTimerActive && trackedTxTimerPacket == packet && trackedTxTimerId == packet->id) {
+        saturatingIncrement(preSendDiagnostics.txTimerCancelled);
+        trackedTxTimerActive = false;
+        trackedTxTimerPacket = nullptr;
+        trackedTxTimerId = 0;
+        trackedTxTimerDueAtMs = 0;
+        preSendDiagnostics.txTimerActive = false;
+        preSendDiagnostics.txTimerDueAtMs = 0;
+    }
+
     const bool collect = collectTxLifecycleDiagnostics();
     const uint32_t finishedAtMs = Time::getMillis();
     if (collect) {
@@ -528,6 +590,56 @@ void W12BenchmarkModule::onTxDelayScheduled(const meshtastic_MeshPacket *packet,
     saturatingIncrement(accepted ? diagnostics.txDelayScheduleAccepted : diagnostics.txDelayScheduleRejected);
 }
 
+void W12BenchmarkModule::onTxDelayScheduled(const meshtastic_MeshPacket *packet, bool accepted, uint32_t dueAtMs)
+{
+    if (!collectTxLifecycleDiagnostics() || !findTxSlot(packet))
+        return;
+
+    saturatingIncrement(diagnostics.txDelayScheduledAttempts);
+    saturatingIncrement(accepted ? diagnostics.txDelayScheduleAccepted : diagnostics.txDelayScheduleRejected);
+    if (!accepted)
+        return;
+
+    saturatingIncrement(preSendDiagnostics.txTimerAccepted);
+    if (trackedTxTimerActive)
+        saturatingIncrement(preSendDiagnostics.txTimerOverwritten);
+    trackedTxTimerActive = true;
+    trackedTxTimerPacket = packet;
+    trackedTxTimerId = packet->id;
+    trackedTxTimerDueAtMs = dueAtMs;
+    preSendDiagnostics.txTimerActive = true;
+    preSendDiagnostics.txTimerDueAtMs = dueAtMs;
+}
+
+void W12BenchmarkModule::onTxDelayNotification(bool isTxDelay, const meshtastic_MeshPacket *packet)
+{
+    if (!trackedTxTimerActive)
+        return;
+
+    if (!isTxDelay) {
+        saturatingIncrement(preSendDiagnostics.txTimerIrqDisplaced);
+    } else if (!packet || packet != trackedTxTimerPacket || packet->id != trackedTxTimerId) {
+        saturatingIncrement(preSendDiagnostics.txTimerStale);
+    } else {
+        saturatingIncrement(preSendDiagnostics.txTimerDispatches);
+        const uint32_t nowMs = Time::getMillis();
+        if (Throttle::deadlinePassedAt(nowMs, trackedTxTimerDueAtMs) && nowMs != trackedTxTimerDueAtMs) {
+            const uint32_t lateMs = nowMs - trackedTxTimerDueAtMs;
+            saturatingIncrement(preSendDiagnostics.txTimerLateCount);
+            saturatingAdd(preSendDiagnostics.txTimerLateSumMs, lateMs);
+            if (lateMs > preSendDiagnostics.txTimerLateMaxMs)
+                preSendDiagnostics.txTimerLateMaxMs = lateMs;
+        }
+    }
+
+    trackedTxTimerActive = false;
+    trackedTxTimerPacket = nullptr;
+    trackedTxTimerId = 0;
+    trackedTxTimerDueAtMs = 0;
+    preSendDiagnostics.txTimerActive = false;
+    preSendDiagnostics.txTimerDueAtMs = 0;
+}
+
 void W12BenchmarkModule::onTxDelayFired(const meshtastic_MeshPacket *packet)
 {
     if (collectTxLifecycleDiagnostics() && findTxSlot(packet))
@@ -538,6 +650,27 @@ void W12BenchmarkModule::onPreCanSendDeferred(const meshtastic_MeshPacket *packe
 {
     if (collectTxLifecycleDiagnostics() && findTxSlot(packet))
         saturatingIncrement(diagnostics.preCanSendDeferred);
+}
+
+void W12BenchmarkModule::onPreCanSendDeferred(const meshtastic_MeshPacket *packet, PreSendBusyReason reason)
+{
+    if (!collectTxLifecycleDiagnostics() || !findTxSlot(packet))
+        return;
+
+    saturatingIncrement(diagnostics.preCanSendDeferred);
+    switch (reason) {
+    case PreSendBusyReason::BUSY_TX:
+        saturatingIncrement(preSendDiagnostics.busyTxDeferrals);
+        break;
+    case PreSendBusyReason::BUSY_RX_ACTIVE:
+        saturatingIncrement(preSendDiagnostics.busyRxActiveDeferrals);
+        break;
+    case PreSendBusyReason::BUSY_RX_IRQ_READ_FAILURE:
+        saturatingIncrement(preSendDiagnostics.busyRxIrqReadFailureDeferrals);
+        break;
+    case PreSendBusyReason::UNKNOWN:
+        break;
+    }
 }
 
 void W12BenchmarkModule::onCcaDecision(CcaReason reason)
@@ -855,6 +988,62 @@ bool W12BenchmarkModule::captureRxLiveness()
     return true;
 }
 
+bool W12BenchmarkModule::capturePreSendAttribution()
+{
+    preSendDiagnostics.rxSampleValid = false;
+    preSendDiagnostics.rxSampleStatus = 0;
+    preSendDiagnostics.rxDioLevel = 0;
+    preSendDiagnostics.rxBusyLevel = 0;
+    preSendDiagnostics.rxActiveReceiveStartMs = 0;
+    preSendDiagnostics.rxSampledAtMs = Time::getMillis();
+    preSendDiagnostics.rxRawIrqFlags = 0;
+    preSendDiagnostics.rxRawStatus = 0;
+    preSendDiagnostics.rxFifoLevel = 0;
+    preSendDiagnostics.rxFifoFlags = 0;
+    preSendDiagnostics.txFifoFlags = 0;
+    preSendDiagnostics.rxChipErrors = 0;
+    preSendDiagnostics.rxIrqReadResult = INT16_MIN;
+    preSendDiagnostics.rxFifoFlagsResult = INT16_MIN;
+    preSendDiagnostics.rxFifoLevelResult = INT16_MIN;
+    preSendDiagnostics.rxErrorsResult = INT16_MIN;
+    preSendDiagnostics.rxSoftwareState = 0;
+
+    RadioLibInterface *radio = RadioLibInterface::instance;
+    if (!radio)
+        return false;
+
+    W12RxRecoverySample sample;
+    if (!radio->readW12RxRecovery(sample))
+        return false;
+
+    preSendDiagnostics.rxSampleValid = true;
+    preSendDiagnostics.rxSampleStatus = 16;
+    preSendDiagnostics.rxDioLevel = sample.dioLevel;
+    preSendDiagnostics.rxBusyLevel = sample.busyLevel;
+    preSendDiagnostics.rxActiveReceiveStartMs = sample.activeReceiveStartMs;
+    preSendDiagnostics.rxSampledAtMs = sample.sampledAtMs;
+    preSendDiagnostics.rxRawIrqFlags = sample.rawIrqFlags;
+    preSendDiagnostics.rxRawStatus = sample.rawStatus;
+    preSendDiagnostics.rxFifoLevel = sample.rxFifoLevel;
+    preSendDiagnostics.rxFifoFlags = sample.fifoRxFlags;
+    preSendDiagnostics.txFifoFlags = sample.fifoTxFlags;
+    preSendDiagnostics.rxChipErrors = sample.chipErrors;
+    preSendDiagnostics.rxIrqReadResult = sample.irqReadResult;
+    preSendDiagnostics.rxFifoFlagsResult = sample.fifoFlagsResult;
+    preSendDiagnostics.rxFifoLevelResult = sample.fifoLevelResult;
+    preSendDiagnostics.rxErrorsResult = sample.errorsResult;
+    preSendDiagnostics.rxSoftwareState = sample.softwareState;
+    if (sample.irqReadResult == RADIOLIB_ERR_NONE)
+        preSendDiagnostics.rxSampleStatus |= 1;
+    if (sample.fifoFlagsResult == RADIOLIB_ERR_NONE)
+        preSendDiagnostics.rxSampleStatus |= 2;
+    if (sample.fifoLevelResult == RADIOLIB_ERR_NONE)
+        preSendDiagnostics.rxSampleStatus |= 4;
+    if (sample.errorsResult == RADIOLIB_ERR_NONE)
+        preSendDiagnostics.rxSampleStatus |= 8;
+    return true;
+}
+
 bool W12BenchmarkModule::performRxLivenessRearm()
 {
     RadioLibInterface *radio = RadioLibInterface::instance;
@@ -924,9 +1113,16 @@ void W12BenchmarkModule::resetRun(const RunConfig &config)
     diagnostics = Diagnostics{};
     radioDiagnostics = RadioDiagnostics{};
     rxLivenessDiagnostics = RxLivenessDiagnostics{};
+    preSendDiagnostics = PreSendAttributionDiagnostics{};
+    trackedTxTimerPacket = nullptr;
+    trackedTxTimerId = 0;
+    trackedTxTimerDueAtMs = 0;
+    trackedTxTimerActive = false;
     rxLivenessSnapshotRequested = false;
     rxLivenessSnapshotRunMatches = false;
     rxLivenessRearmUsed = false;
+    preSendSnapshotRequested = false;
+    preSendSnapshotRunMatches = false;
     for (auto &slot : txSlots)
         slot = TxSlot{};
     pendingTxCount = 0;
@@ -1076,6 +1272,15 @@ bool W12BenchmarkModule::handleControl(const meshtastic_MeshPacket &mp)
         rxLivenessSnapshotRunMatches = true;
         return true;
     }
+    case Op::SNAPSHOT_PRE_SEND_ATTRIBUTION:
+        if (!stats.running && !stats.complete)
+            return false;
+        if (stats.running && receiverWindowStarted && Throttle::hasElapsed(startedAtMs, activeConfig.durationMs))
+            finishRun();
+        capturePreSendAttribution();
+        preSendSnapshotRequested = true;
+        preSendSnapshotRunMatches = true;
+        return true;
     case Op::RESET:
         break;
     }
@@ -1165,7 +1370,8 @@ meshtastic_MeshPacket *W12BenchmarkModule::allocReply()
     const bool diagnosticsRequested = diagnosticSnapshotRequested && diagnosticSnapshotRunMatches;
     const bool radioDiagnosticsRequested = radioDiagnosticSnapshotRequested && radioDiagnosticSnapshotRunMatches;
     const bool rxLivenessRequested = rxLivenessSnapshotRequested && rxLivenessSnapshotRunMatches;
-    if (!reportRequested && !diagnosticsRequested && !radioDiagnosticsRequested && !rxLivenessRequested)
+    const bool preSendRequested = preSendSnapshotRequested && preSendSnapshotRunMatches;
+    if (!reportRequested && !diagnosticsRequested && !radioDiagnosticsRequested && !rxLivenessRequested && !preSendRequested)
         return nullptr;
 
     meshtastic_MeshPacket *reply = router->allocForSending();
@@ -1176,7 +1382,10 @@ meshtastic_MeshPacket *W12BenchmarkModule::allocReply()
     reply->want_ack = false;
     reply->decoded.portnum = meshtastic_PortNum_PRIVATE_APP;
     const Stats currentStats = getStats();
-    if (rxLivenessRequested) {
+    if (preSendRequested) {
+        reply->decoded.payload.size = encodePreSendAttributionReport(
+            reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes), currentStats, preSendDiagnostics, pendingTxCount);
+    } else if (rxLivenessRequested) {
         saturatingIncrement(rxLivenessDiagnostics.snapshotSequence);
         reply->decoded.payload.size = encodeRxLivenessReport(reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes),
                                                              currentStats, rxLivenessDiagnostics, pendingTxCount);
@@ -1203,6 +1412,8 @@ meshtastic_MeshPacket *W12BenchmarkModule::allocReply()
     radioDiagnosticSnapshotRunMatches = false;
     rxLivenessSnapshotRequested = false;
     rxLivenessSnapshotRunMatches = false;
+    preSendSnapshotRequested = false;
+    preSendSnapshotRunMatches = false;
     return reply;
 }
 
