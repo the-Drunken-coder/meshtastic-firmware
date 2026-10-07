@@ -425,6 +425,10 @@ size_t W12BenchmarkModule::encodePreSendAttributionReport(uint8_t *bytes, size_t
     put16(bytes + 104, static_cast<uint16_t>(d.rxErrorsResult));
     put32(bytes + 106, d.rxSoftwareState);
     put32(bytes + 110, d.txTimerDueAtMs);
+    put32(bytes + 114, d.burstArmed);
+    put32(bytes + 118, d.burstFrames);
+    put32(bytes + 122, d.burstAborted);
+    put32(bytes + 126, d.burstCount);
     return PRE_SEND_ATTRIBUTION_REPORT_BYTES;
 }
 
@@ -644,6 +648,27 @@ void W12BenchmarkModule::onTxDelayFired(const meshtastic_MeshPacket *packet)
 {
     if (collectTxLifecycleDiagnostics() && findTxSlot(packet))
         saturatingIncrement(diagnostics.txDelayFired);
+}
+
+void W12BenchmarkModule::onW12BurstArmed(bool startsBurst)
+{
+    if (collectTxLifecycleDiagnostics()) {
+        saturatingIncrement(preSendDiagnostics.burstArmed);
+        if (startsBurst)
+            saturatingIncrement(preSendDiagnostics.burstCount);
+    }
+}
+
+void W12BenchmarkModule::onW12BurstFrame()
+{
+    if (collectTxLifecycleDiagnostics())
+        saturatingIncrement(preSendDiagnostics.burstFrames);
+}
+
+void W12BenchmarkModule::onW12BurstAborted()
+{
+    if (collectTxLifecycleDiagnostics())
+        saturatingIncrement(preSendDiagnostics.burstAborted);
 }
 
 void W12BenchmarkModule::onPreCanSendDeferred(const meshtastic_MeshPacket *packet)
@@ -1170,6 +1195,10 @@ W12BenchmarkModule::TxSlot *W12BenchmarkModule::findTxSlot(const meshtastic_Mesh
 
 void W12BenchmarkModule::finishRun()
 {
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+    if (RadioLibInterface::instance)
+        RadioLibInterface::instance->abortW12BurstToNormal();
+#endif
     if (!stats.running)
         return;
 

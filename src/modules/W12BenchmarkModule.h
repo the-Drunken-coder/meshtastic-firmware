@@ -6,6 +6,10 @@
 #define MESHTASTIC_W12_BENCHMARK 0
 #endif
 
+#ifndef MESHTASTIC_W12_BENCHMARK_TX_BURST
+#define MESHTASTIC_W12_BENCHMARK_TX_BURST 0
+#endif
+
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
 
 #include "concurrency/OSThread.h"
@@ -232,6 +236,11 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
         int16_t rxFifoLevelResult = INT16_MIN;
         int16_t rxErrorsResult = INT16_MIN;
         uint32_t rxSoftwareState = 0;
+        // W12 finite-RX burst counters. These occupy the unused tail of the existing report.
+        uint32_t burstArmed = 0;
+        uint32_t burstFrames = 0;
+        uint32_t burstAborted = 0;
+        uint32_t burstCount = 0;
     };
 
     struct RunConfig {
@@ -282,6 +291,9 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     void onTxDelayScheduled(const meshtastic_MeshPacket *packet, bool accepted, uint32_t dueAtMs);
     void onTxDelayNotification(bool isTxDelay, const meshtastic_MeshPacket *packet);
     void onTxDelayFired(const meshtastic_MeshPacket *packet);
+    void onW12BurstArmed(bool startsBurst);
+    void onW12BurstFrame();
+    void onW12BurstAborted();
     void onPreCanSendDeferred(const meshtastic_MeshPacket *packet);
     void onPreCanSendDeferred(const meshtastic_MeshPacket *packet, PreSendBusyReason reason);
     void onCcaDecision(CcaReason reason);

@@ -415,6 +415,146 @@ bool RadioLibInterface::isIsrTxCallback(void (*callback)())
     return callback == isrTxLevel0;
 }
 
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+bool RadioLibInterface::isW12BurstPacket(const meshtastic_MeshPacket *packet) const
+{
+    if (!packet || !w12BenchmarkModule || !RadioMode::isFlrc() || !RadioMode::canTransmit() || disabled)
+        return false;
+
+    const W12BenchmarkModule::Stats stats = w12BenchmarkModule->getStats();
+    if (!stats.prepared || !stats.running || stats.elapsedMs >= stats.config.durationMs ||
+        nodeDB->getNodeNum() != stats.config.source || !w12BenchmarkModule->ownsTx(packet))
+        return false;
+
+    // This gate deliberately uses only the encrypted envelope and owner identity. It never decodes ciphertext.
+    return packet->which_payload_variant == meshtastic_MeshPacket_encrypted_tag && packet->pki_encrypted && !packet->want_ack &&
+           packet->hop_limit == 0 && packet->hop_start == 0 && packet->from == stats.config.source &&
+           packet->to == stats.config.destination &&
+           packet->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_INTERNAL && packet->channel == 0 &&
+           !packet->via_mqtt && packet->priority == meshtastic_MeshPacket_Priority_BACKGROUND && packet->tx_after == 0;
+}
+
+void RadioLibInterface::clearW12BurstState()
+{
+    w12Burst = W12BurstState{};
+}
+
+void RadioLibInterface::cancelW12Burst()
+{
+    w12BurstResumeAfterStale = false;
+    if (w12Burst.active || w12Burst.timerPending) {
+        if (w12BenchmarkModule)
+            w12BenchmarkModule->onW12BurstAborted();
+        clearW12BurstState();
+    }
+}
+
+void RadioLibInterface::beginW12StandbyDrain()
+{
+    if (w12BurstSuppressionDepth != UINT8_MAX)
+        ++w12BurstSuppressionDepth;
+    w12BurstArmSuppressed = true;
+    cancelW12Burst();
+}
+
+void RadioLibInterface::endW12StandbyDrain()
+{
+    if (w12BurstSuppressionDepth == 0)
+        return;
+    if (--w12BurstSuppressionDepth == 0)
+        w12BurstArmSuppressed = false;
+}
+
+void RadioLibInterface::markW12BurstNormalResumeAfterStale()
+{
+    w12BurstResumeAfterStale = true;
+}
+
+void RadioLibInterface::finishW12BurstToNormal()
+{
+    cancelW12Burst();
+    if (!disabled)
+        startReceive();
+    setTransmitDelay();
+}
+
+void RadioLibInterface::abortW12BurstToNormal()
+{
+    const bool staleGuardEventMayRemain = w12Burst.timerPending;
+    if (w12Burst.active || w12Burst.timerPending) {
+        finishW12BurstToNormal();
+        // finishW12BurstToNormal() schedules the ordinary timer after the
+        // dedicated one-slot event has been cancelled from state. The event
+        // itself cannot be cancelled, so let its later stale dispatch restore
+        // that ordinary timer. Explicit standby never enters this helper and
+        // therefore cannot wake the radio through a stale event.
+        if (staleGuardEventMayRemain)
+            w12BurstResumeAfterStale = true;
+    }
+}
+
+bool RadioLibInterface::armW12BurstAfterSuccess(bool currentPacketEligible)
+{
+    const bool priorActive = w12Burst.active;
+    if (!currentPacketEligible) {
+        if (priorActive)
+            cancelW12Burst();
+        return false;
+    }
+
+    const uint8_t completedFrames = priorActive ? static_cast<uint8_t>(w12Burst.completedFrames + 1) : 1;
+    if (priorActive && w12BenchmarkModule)
+        w12BenchmarkModule->onW12BurstFrame();
+
+    if (completedFrames >= W12_BURST_MAX_FRAMES) {
+        clearW12BurstState();
+        return false;
+    }
+
+    meshtastic_MeshPacket *next = txQueue.getFront();
+    const bool nextEligible = isW12BurstPacket(next);
+    const bool nextHoldsRadio = next && RadioTxHooks::holdsRadio(next);
+    if (!next) {
+        clearW12BurstState();
+        return false;
+    }
+    if (!nextEligible || nextHoldsRadio) {
+        if (priorActive)
+            cancelW12Burst();
+        else
+            clearW12BurstState();
+        return false;
+    }
+
+    const bool scheduled = notifyLater(W12_BURST_GUARD_MS, W12_BURST_DELAY_COMPLETED, false);
+    if (!scheduled) {
+        if (w12BenchmarkModule)
+            w12BenchmarkModule->onW12BurstAborted();
+        clearW12BurstState();
+        return false;
+    }
+
+    w12Burst.active = true;
+    w12Burst.timerPending = true;
+    w12Burst.completedFrames = completedFrames;
+    w12Burst.nextPacket = next;
+    w12Burst.nextPacketId = next->id;
+    // A newly accepted guarded event proves that no displaced stale event is
+    // occupying the notification slot, so an old abort/reconfigure resume
+    // marker cannot affect this fresh sequence.
+    w12BurstResumeAfterStale = false;
+    if (w12BenchmarkModule) {
+        // The initial accepted guard owns completion of the first frame. Each
+        // later successful guarded send is counted exactly once at its ISR_TX
+        // completion above.
+        if (!priorActive)
+            w12BenchmarkModule->onW12BurstFrame();
+        w12BenchmarkModule->onW12BurstArmed(!priorActive);
+    }
+    return true;
+}
+#endif
+
 void RadioLibInterface::scheduleIrqPollTick()
 {
     // Never overwrite a pending notification (especially TRANSMIT_DELAY_COMPLETED),
@@ -438,13 +578,49 @@ void RadioLibInterface::onNotify(uint32_t notification)
 {
 
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+#if !(MESHTASTIC_W12_BENCHMARK_TX_BURST)
     if (w12BenchmarkModule)
         w12BenchmarkModule->onTxDelayNotification(notification == TRANSMIT_DELAY_COMPLETED, txQueue.getFront());
+#else
+    if (w12BenchmarkModule && notification != W12_BURST_DELAY_COMPLETED)
+        w12BenchmarkModule->onTxDelayNotification(notification == TRANSMIT_DELAY_COMPLETED, txQueue.getFront());
+#endif
 #endif
 
     switch (notification) {
-    case ISR_TX:
+    case ISR_TX: {
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+        // A poll-generated TX notification can remain latched while standby drains another
+        // notification. With no active packet it is stale. If it displaced a live guarded
+        // event, restore the ordinary RX/CCA handoff immediately because that one-slot event
+        // is gone. Explicit standby keeps the inert behavior by suppressing this handoff.
+        if (!sendingPacket) {
+            const bool normalHandoffRequired = w12Burst.active || w12Burst.timerPending || w12BurstResumeAfterStale;
+            const bool ordinaryHandoffRequired = isReceiving && !txQueue.empty();
+            if (w12BurstArmSuppressed)
+                cancelW12Burst();
+            else if (normalHandoffRequired)
+                finishW12BurstToNormal();
+            else if (ordinaryHandoffRequired)
+                setTransmitDelay();
+            else
+                cancelW12Burst();
+            break;
+        }
+        // ownsTx() must run before handleTransmitInterrupt(), because completion releases the packet and its owner slot.
+        const bool completedPacketEligible = isW12BurstPacket(sendingPacket);
+        const bool transmitSucceeded = handleTransmitInterrupt(); // completeSending() restored the home config
+        if (transmitSucceeded && !w12BurstArmSuppressed && armW12BurstAfterSuccess(completedPacketEligible))
+            break;
+        cancelW12Burst();
+        // Explicit standby drains the completion but must leave the next
+        // packet queued. Do not replace the drained TX_DONE with an ordinary
+        // timer that could wake the radio after standby returns.
+        if (w12BurstArmSuppressed)
+            break;
+#else
         handleTransmitInterrupt(); // completeSending() already restored the radio to the home config
+#endif
         // Let the hooks pre-stage the radio for the NEXT queued packet. Not required for correctness -
         // TRANSMIT_DELAY_COMPLETED asks again before the scan, which is where the answer is acted on -
         // but it keeps the post-TX listen window on the channel we are about to transmit on.
@@ -452,15 +628,101 @@ void RadioLibInterface::onNotify(uint32_t notification)
         startReceive();
         setTransmitDelay();
         break;
+    }
     case ISR_RX:
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+        cancelW12Burst();
+#endif
         handleReceiveInterrupt();
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+        if (w12BurstArmSuppressed)
+            break;
+#endif
         startReceive();
         setTransmitDelay();
         break;
     case ISR_POLL_TICK:
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+        if (w12Burst.timerPending) {
+            finishW12BurstToNormal();
+            break;
+        }
+#endif
         handleSoftwareLoraIrqPoll();
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+        // The poll can discover TX_DONE and replace its own notification with ISR_TX.
+        // Drain that completion while suppression is still active so ISR_TX cannot
+        // schedule an ordinary timer after standby has released the packet.
+        if (w12BurstArmSuppressed)
+            checkNotification();
+#endif
         break;
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+    case W12_BURST_DELAY_COMPLETED: {
+        if (!w12Burst.timerPending) {
+            // Reconfigure cannot remove the one-slot timer. Once it has armed ordinary RX,
+            // let a displaced ordinary sender recover its normal timer. Standby explicitly
+            // leaves this flag clear so a stale event cannot wake the radio.
+            const bool resumeNormalTx = w12BurstResumeAfterStale;
+            w12BurstResumeAfterStale = false;
+            if (resumeNormalTx && !disabled && RadioMode::canTransmit() && isReceiving && !sendingPacket && !txQueue.empty())
+                setTransmitDelay();
+            break;
+        }
+
+        w12Burst.timerPending = false;
+        meshtastic_MeshPacket *next = txQueue.getFront();
+        const bool samePacket = next && next == w12Burst.nextPacket && next->id == w12Burst.nextPacketId;
+        if (!samePacket || !isW12BurstPacket(next) || RadioTxHooks::holdsRadio(next)) {
+            finishW12BurstToNormal();
+            break;
+        }
+
+        const RadioTxHook::PreTxAction action = RadioTxHooks::beforeTransmit(this, next);
+        if (action == RadioTxHook::PRETX_DEFER) {
+            finishW12BurstToNormal();
+            break;
+        }
+        if (action == RadioTxHook::PRETX_DROP) {
+            meshtastic_MeshPacket *bad = txQueue.dequeue();
+            if (bad) {
+                notifyTxFinished(bad, TxState::Dropped);
+                RadioTxHooks::packetReleased(this, bad);
+                packetPool.release(bad);
+            }
+            finishW12BurstToNormal();
+            break;
+        }
+
+        next = txQueue.getFront();
+        if (!next || next != w12Burst.nextPacket || next->id != w12Burst.nextPacketId || !isW12BurstPacket(next) ||
+            RadioTxHooks::holdsRadio(next)) {
+            finishW12BurstToNormal();
+            break;
+        }
+
+        if (!prepareW12BurstSend()) {
+            finishW12BurstToNormal();
+            break;
+        }
+
+        meshtastic_MeshPacket *txp = txQueue.dequeue();
+        if (!txp || !startSend(txp)) {
+            cancelW12Burst();
+            if (!disabled && !isReceiving)
+                startReceive();
+            setTransmitDelay();
+        }
+        break;
+    }
+#endif
     case TRANSMIT_DELAY_COMPLETED:
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+        // A regular event displaced the guarded event. Resume through ordinary CCA/backoff.
+        cancelW12Burst();
+        if (w12BurstArmSuppressed)
+            break;
+#endif
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
         if (w12BenchmarkModule && !txQueue.empty())
             w12BenchmarkModule->onTxDelayFired(txQueue.getFront());
@@ -661,13 +923,17 @@ bool RadioLibInterface::removePendingTXPacket(NodeNum from, PacketId id, uint32_
     return false;
 }
 
-void RadioLibInterface::handleTransmitInterrupt()
+bool RadioLibInterface::handleTransmitInterrupt()
 {
     // This can be null if we forced the device to enter standby mode.  In that case
     // ignore the transmit interrupt
-    if (sendingPacket)
-        completeSending(validTransmitIrq());
+    bool success = false;
+    if (sendingPacket) {
+        success = validTransmitIrq();
+        completeSending(success);
+    }
     powerMon->clearState(meshtastic_PowerMon_State_Lora_TXOn); // But our transmitter is definitely off now
+    return success;
 }
 
 void RadioLibInterface::completeSending(bool success)

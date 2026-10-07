@@ -60,6 +60,10 @@ class PreSendAttribution:
     rx_errors_result: int
     rx_software_state: int
     tx_timer_due_at_ms: int
+    burst_armed: int
+    burst_frames: int
+    burst_aborted: int
+    burst_count: int
 
 
 def _u32(data: bytes, offset: int) -> int:
@@ -81,7 +85,7 @@ def decode_report(data: bytes | bytearray | memoryview) -> PreSendAttribution:
     magic, version, kind, run_id, source, destination, elapsed_ms = _HEADER.unpack_from(raw)
     if magic != MAGIC or version != VERSION or kind != KIND:
         raise ValueError("invalid kind 7 report header")
-    if raw[22:24] != b"\0\0" or raw[77] != 0 or any(raw[114:]):
+    if raw[22:24] != b"\0\0" or raw[77] != 0 or any(raw[130:]):
         raise ValueError("nonzero reserved or unused kind 7 bytes")
     status = raw[20]
     if status & ~0x37:
@@ -131,6 +135,12 @@ def decode_report(data: bytes | bytearray | memoryview) -> PreSendAttribution:
     software_state = _u32(raw, 106)
     if software_state & ~0x1F:
         raise ValueError("unknown kind 7 software-state bits")
+    burst_armed = _u32(raw, 114)
+    burst_frames = _u32(raw, 118)
+    burst_aborted = _u32(raw, 122)
+    burst_count = _u32(raw, 126)
+    if burst_count > burst_armed or burst_armed > burst_frames:
+        raise ValueError("kind 7 burst counters are inconsistent")
     return PreSendAttribution(
         run_id=run_id,
         source=source,
@@ -169,6 +179,10 @@ def decode_report(data: bytes | bytearray | memoryview) -> PreSendAttribution:
         rx_errors_result=_i16(raw, 104),
         rx_software_state=_u32(raw, 106),
         tx_timer_due_at_ms=_u32(raw, 110),
+        burst_armed=burst_armed,
+        burst_frames=burst_frames,
+        burst_aborted=burst_aborted,
+        burst_count=burst_count,
     )
 
 

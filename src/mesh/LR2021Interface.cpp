@@ -61,6 +61,9 @@ bool LR2021Interface::init()
 
 bool LR2021Interface::beginFlrc()
 {
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+    cancelW12Burst();
+#endif
     // Full profile setup stops RX; recovery callers must rearm it even if setup fails.
     isReceiving = false;
     activeReceiveStart = 0;
@@ -85,11 +88,33 @@ bool LR2021Interface::beginFlrc()
 
 bool LR2021Interface::reconfigure()
 {
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+    const bool standbySuppressed = isW12StandbyDrainActive();
+    const bool staleGuardEventMayRemain = w12BurstEventPendingForReconfigure();
+    // Drain a pending software poll before reconfigure tears down an in-flight TX. This
+    // keeps the ordinary timer below from being rejected by the single notification slot.
+    if (!staleGuardEventMayRemain) {
+        beginW12StandbyDrain();
+        checkNotification();
+        endW12StandbyDrain();
+    }
+    cancelW12Burst();
+#endif
     if (!RadioMode::isFlrc())
         return LR20x0Interface::reconfigure();
     RadioLibInterface::reconfigure();
     // Mode writes are pending until reboot; logical-channel edits retain the active fixed waveform.
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+    if (!standbySuppressed) {
+        startReceive();
+        if (staleGuardEventMayRemain)
+            markW12BurstNormalResumeAfterStale();
+        else
+            scheduleW12NormalTxAfterReconfigure();
+    }
+#else
     startReceive();
+#endif
     return !rxOffline;
 }
 
@@ -110,14 +135,31 @@ int16_t LR2021Interface::standbyFlrc()
     return result;
 }
 
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+bool LR2021Interface::prepareW12BurstSend()
+{
+    return !RadioMode::isFlrc() || standbyFlrc() == RADIOLIB_ERR_NONE;
+}
+#endif
+
 void LR2021Interface::setStandby()
 {
     if (!RadioMode::isFlrc()) {
         LR20x0Interface::setStandby();
         return;
     }
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+    // Do not let checkNotification dispatch a guarded timer while maintenance or STOP is taking the radio down.
+    beginW12StandbyDrain();
+#endif
     checkNotification(); // Preserve a completed TX before an explicit standby request aborts it.
-    if (standbyFlrc() != RADIOLIB_ERR_NONE)
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+    const int16_t result = standbyFlrc();
+    endW12StandbyDrain();
+#else
+    const int16_t result = standbyFlrc();
+#endif
+    if (result != RADIOLIB_ERR_NONE)
         rxOffline = true;
 }
 
@@ -127,6 +169,9 @@ void LR2021Interface::startReceive()
         LR20x0Interface::startReceive();
         return;
     }
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+    cancelW12Burst();
+#endif
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
 #if defined(MESHTASTIC_W12_BENCHMARK_SINGLE_RX) && MESHTASTIC_W12_BENCHMARK_SINGLE_RX
     constexpr uint32_t rxTimeout = RADIOLIB_LR2021_RX_TIMEOUT_NONE;
@@ -474,7 +519,10 @@ void LR2021Interface::handleSoftwareLoraIrqPoll()
         // Timeout uses the normal completion path, which verifies TX_DONE before counting success.
         deliverPendingIrqFromPoll(ISR_TX);
     } else {
-        scheduleIrqPollTick();
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+        if (!isW12StandbyDrainActive())
+#endif
+            scheduleIrqPollTick();
     }
 }
 
@@ -482,6 +530,9 @@ bool LR2021Interface::sleep()
 {
     if (!RadioMode::isFlrc())
         return LR20x0Interface::sleep();
+#if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
+    cancelW12Burst();
+#endif
     (void)standbyFlrc();
     int16_t result = lora.sleep(false, 0);
     RadioMode::markInitialized(false);

@@ -42,13 +42,36 @@ class PreSendAttributionProtocolTest(unittest.TestCase):
         self.assertEqual(report.tx_timer_late_sum_ms, 9)
         self.assertEqual(report.tx_timer_late_max_ms, 5)
         self.assertEqual(report.rx_fifo_level, 0x4567)
+        self.assertEqual(report.burst_armed, 0)
+        self.assertEqual(report.burst_frames, 0)
+        self.assertEqual(report.burst_aborted, 0)
+        self.assertEqual(report.burst_count, 0)
+
+    def test_decodes_burst_counters_and_keeps_reserved_tail_strict(self):
+        report = self.report()
+        struct.pack_into("<IIII", report, 114, 3, 4, 1, 1)
+        decoded = decode_report(report)
+        self.assertEqual(decoded.burst_armed, 3)
+        self.assertEqual(decoded.burst_frames, 4)
+        self.assertEqual(decoded.burst_aborted, 1)
+        self.assertEqual(decoded.burst_count, 1)
+
+        invalid = bytearray(report)
+        invalid[130] = 1
+        with self.assertRaises(ValueError):
+            decode_report(invalid)
+
+        invalid = bytearray(report)
+        struct.pack_into("<I", invalid, 126, 4)
+        with self.assertRaises(ValueError):
+            decode_report(invalid)
 
     def test_rejects_length_header_reserved_and_tail_changes(self):
         report = self.report()
         for mutated in (report[:-1], report + b"\0"):
             with self.assertRaises(ValueError):
                 decode_report(mutated)
-        for offset in (0, 2, 3, 22, 77, 114):
+        for offset in (0, 2, 3, 22, 77, 130):
             mutated = bytearray(report)
             mutated[offset] = 0xFF
             with self.assertRaises(ValueError):
