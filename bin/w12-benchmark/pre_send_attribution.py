@@ -64,6 +64,25 @@ class PreSendAttribution:
     burst_frames: int
     burst_aborted: int
     burst_count: int
+    phase_timing_available: bool
+    producer_us_count: int
+    producer_us_sum: int
+    producer_us_max: int
+    burst_prepare_us_count: int
+    burst_prepare_us_sum: int
+    burst_prepare_us_max: int
+    burst_guard_request_late_ms_count: int
+    burst_guard_request_late_ms_sum: int
+    burst_guard_request_late_ms_max: int
+    rx_gate_decode_us_count: int
+    rx_gate_decode_us_sum: int
+    rx_gate_decode_us_max: int
+    failed_tx_count: int
+    failed_tx_last_packet_id: int
+    failed_tx_last_sequence: int
+    failed_tx_last_at_ms: int
+    failed_tx_last_stage: int
+    failed_tx_last_radio_result: int
 
 
 def _u32(data: bytes, offset: int) -> int:
@@ -85,7 +104,7 @@ def decode_report(data: bytes | bytearray | memoryview) -> PreSendAttribution:
     magic, version, kind, run_id, source, destination, elapsed_ms = _HEADER.unpack_from(raw)
     if magic != MAGIC or version != VERSION or kind != KIND:
         raise ValueError("invalid kind 7 report header")
-    if raw[22:24] != b"\0\0" or raw[77] != 0 or any(raw[130:]):
+    if raw[22:24] != b"\0\0" or raw[77] != 0 or any(raw[198:]):
         raise ValueError("nonzero reserved or unused kind 7 bytes")
     status = raw[20]
     if status & ~0x37:
@@ -141,6 +160,46 @@ def decode_report(data: bytes | bytearray | memoryview) -> PreSendAttribution:
     burst_count = _u32(raw, 126)
     if burst_count > burst_armed or burst_armed > burst_frames:
         raise ValueError("kind 7 burst counters are inconsistent")
+    phase_available = raw[178]
+    if phase_available > 1:
+        raise ValueError("invalid kind 7 phase timing availability")
+    phase_offsets = (
+        (130, "producer_us"),
+        (142, "burst_prepare_us"),
+        (154, "burst_guard_request_late_ms"),
+        (166, "rx_gate_decode_us"),
+    )
+    phase_values = {}
+    for offset, name in phase_offsets:
+        count = _u32(raw, offset)
+        total = _u32(raw, offset + 4)
+        maximum = _u32(raw, offset + 8)
+        if not phase_available and (count or total or maximum):
+            raise ValueError("kind 7 unavailable phase timing has values")
+        if count == 0 and (total or maximum):
+            raise ValueError(f"kind 7 {name} counters are inconsistent")
+        if total < maximum:
+            raise ValueError(f"kind 7 {name} sum is below max")
+        phase_values[f"{name}_count"] = count
+        phase_values[f"{name}_sum"] = total
+        phase_values[f"{name}_max"] = maximum
+    failed_tx_count = _u32(raw, 179)
+    failed_tx_last_packet_id = _u32(raw, 183)
+    failed_tx_last_sequence = _u32(raw, 187)
+    failed_tx_last_at_ms = _u32(raw, 191)
+    failed_tx_last_stage = raw[195]
+    failed_tx_last_radio_result = _i16(raw, 196)
+    if not phase_available and any(raw[179:198]):
+        raise ValueError("kind 7 unavailable failure summary has values")
+    if failed_tx_count == 0 and any(
+        (failed_tx_last_packet_id, failed_tx_last_sequence, failed_tx_last_at_ms, failed_tx_last_stage,
+         failed_tx_last_radio_result)
+    ):
+        raise ValueError("kind 7 failure summary has a value without a failure")
+    if failed_tx_last_stage > 5:
+        raise ValueError("unknown kind 7 failure stage")
+    if failed_tx_count and failed_tx_last_stage == 0 and failed_tx_last_radio_result != INT16_MIN:
+        raise ValueError("unknown kind 7 failure stage must have an unknown radio result")
     return PreSendAttribution(
         run_id=run_id,
         source=source,
@@ -183,6 +242,14 @@ def decode_report(data: bytes | bytearray | memoryview) -> PreSendAttribution:
         burst_frames=burst_frames,
         burst_aborted=burst_aborted,
         burst_count=burst_count,
+        phase_timing_available=bool(phase_available),
+        **phase_values,
+        failed_tx_count=failed_tx_count,
+        failed_tx_last_packet_id=failed_tx_last_packet_id,
+        failed_tx_last_sequence=failed_tx_last_sequence,
+        failed_tx_last_at_ms=failed_tx_last_at_ms,
+        failed_tx_last_stage=failed_tx_last_stage,
+        failed_tx_last_radio_result=failed_tx_last_radio_result,
     )
 
 

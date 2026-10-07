@@ -256,6 +256,7 @@ class TestableW12Adapter : public LR2021Interface
     bool burstTimerPendingForTest() const { return w12Burst.timerPending; }
     bool notifyForTest(uint32_t notification, bool overwrite) { return notify(notification, overwrite); }
     meshtastic_MeshPacket *frontForTest() { return txQueue.getFront(); }
+    meshtastic_MeshPacket *sendingForTest() const { return sendingPacket; }
 #endif
     bool queueTransmission(meshtastic_MeshPacket *packet)
     {
@@ -378,6 +379,7 @@ class AdapterBurstNodeDB : public NodeDB
 
 static constexpr NodeNum adapterBurstSource = 0x31313131;
 static constexpr NodeNum adapterBurstDestination = 0x42424242;
+static uint8_t adapterBurstDestinationPrivateKey[32] = {};
 
 static W12BenchmarkModule::RunConfig adapterBurstRun()
 {
@@ -426,10 +428,12 @@ static void makeW12BurstOwnerFixture()
     uint8_t destinationPrivate[32] = {};
     crypto->generateKeyPair(localPublic, localPrivate);
     crypto->generateKeyPair(destinationPublic, destinationPrivate);
+    memcpy(adapterBurstDestinationPrivateKey, destinationPrivate, sizeof(destinationPrivate));
     memcpy(config.security.private_key.bytes, localPrivate, sizeof(localPrivate));
     memcpy(config.security.public_key.bytes, localPublic, sizeof(localPublic));
     crypto->setDHPrivateKey(localPrivate);
     adapterBurstOwnedNodeDB->addPublicKey(adapterBurstDestination, destinationPublic);
+    adapterBurstOwnedNodeDB->addPublicKey(adapterBurstSource, localPublic);
 
     makeW12Adapter();
     initRegion();
@@ -657,6 +661,12 @@ static void deleteW12Adapter()
 #endif
 #if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
     if (adapterBurstOwnedRouter) {
+        // A receive-only auth test intentionally leaves its producer packet queued. Retire
+        // physical ownership before destroying the diagnostic slots, also after Unity longjmp.
+        while (adapter && adapter->frontForTest()) {
+            const auto *queued = adapter->frontForTest();
+            adapter->cancelSending(queued->from, queued->id);
+        }
         if (adapterDiagnostics) {
             delete adapterDiagnostics;
             adapterDiagnostics = nullptr;
@@ -1781,8 +1791,101 @@ static void test_w12_burst_production_four_frame_sequence_counts_and_rearms()
     TEST_ASSERT_FALSE(adapter->isSending());
     TEST_ASSERT_TRUE(adapter->receiving());
     TEST_ASSERT_GREATER_THAN_UINT32(rxBeforeFirst, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    const auto phaseTiming = diagnostics.phaseTiming;
+    TEST_ASSERT_TRUE(phaseTiming.available);
+    TEST_ASSERT_EQUAL_UINT32(4, phaseTiming.producerSendToMeshUs.count);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(phaseTiming.producerSendToMeshUs.max, phaseTiming.producerSendToMeshUs.sum);
+    TEST_ASSERT_EQUAL_UINT32(3, phaseTiming.burstPrepareUs.count);
+    TEST_ASSERT_EQUAL_UINT32(3, phaseTiming.burstPrepareSuccesses);
+    TEST_ASSERT_EQUAL_UINT32(0, phaseTiming.burstPrepareFailures);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(phaseTiming.burstPrepareUs.max, phaseTiming.burstPrepareUs.sum);
+    TEST_ASSERT_LESS_OR_EQUAL_UINT32(3, phaseTiming.burstGuardLateMs.count);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(phaseTiming.burstGuardLateMs.max, phaseTiming.burstGuardLateMs.sum);
+    TEST_ASSERT_EQUAL_UINT32(0, phaseTiming.failedTxCount);
+#endif
     TEST_ASSERT_EQUAL_INT32(liveBefore, packetPoolLiveBytes());
 }
+
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+// The production Router auth gate receives the actual encrypted packet emitted by MeshService.
+// This proves the decode timer is around perhapsDecode and remains gated by the exact W12 identity,
+// rather than being a counter-only call or a timer around arbitrary decoded input.
+static void test_w12_burst_production_router_auth_gate_records_rx_decode()
+{
+    makeW12BurstOwnerFixture();
+    TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+    auto *queued = adapter->frontForTest();
+    TEST_ASSERT_NOT_NULL(queued);
+    TEST_ASSERT_EQUAL_UINT8(meshtastic_MeshPacket_encrypted_tag, queued->which_payload_variant);
+    TEST_ASSERT_TRUE(queued->pki_encrypted);
+
+    meshtastic_MeshPacket received = *queued;
+    received.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA;
+    received.via_mqtt = false;
+    myNodeInfo.my_node_num = adapterBurstDestination;
+    crypto->setDHPrivateKey(adapterBurstDestinationPrivateKey);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(RoutingAuthVerdict::ACCEPT), static_cast<int>(passesRoutingAuthGate(&received)));
+
+    const auto diagnostics = adapterDiagnostics->getPreSendAttributionDiagnostics();
+    TEST_ASSERT_TRUE(diagnostics.phaseTiming.available);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.phaseTiming.rxGateDecodeUs.count);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(diagnostics.phaseTiming.rxGateDecodeUs.max, diagnostics.phaseTiming.rxGateDecodeUs.sum);
+    TEST_ASSERT_EQUAL_UINT32(0, diagnostics.phaseTiming.failedTxCount);
+}
+#endif
+
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+static void test_w12_burst_owned_irq_failure_records_validation_stage_without_invented_result()
+{
+    makeW12BurstOwnerFixture();
+    TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+    const PacketId failedId = adapter->frontForTest()->id;
+    adapterHal->irqOnSetTx = RADIOLIB_LR2021_IRQ_TIMEOUT;
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->isSending());
+    adapter->serviceNotifications();
+    adapter->serviceNotifications();
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_EQUAL_UINT32(1, adapterDiagnostics->getStats().txFailures);
+    const auto failed = adapterDiagnostics->getPreSendAttributionDiagnostics().phaseTiming;
+    TEST_ASSERT_EQUAL_UINT32(1, failed.failedTxCount);
+    TEST_ASSERT_EQUAL_UINT32(failedId, failed.failedTxLastPacketId);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(W12BenchmarkModule::TxFailureStage::TX_IRQ), failed.failedTxLastStage);
+    TEST_ASSERT_EQUAL_INT16(INT16_MIN, failed.failedTxLastRadioResult);
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->packetsInTxQueue());
+}
+
+static void test_w12_burst_owned_start_failure_records_exact_stage_and_success_keeps_summary()
+{
+    makeW12BurstOwnerFixture();
+    TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+    const PacketId failedId = adapter->frontForTest()->id;
+    adapterHal->failCommand = RADIOLIB_LR2021_CMD_SET_TX;
+    adapter->serviceNotifications();
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_EQUAL_UINT32(1, adapterDiagnostics->getStats().txFailures);
+    auto failed = adapterDiagnostics->getPreSendAttributionDiagnostics().phaseTiming;
+    TEST_ASSERT_EQUAL_UINT32(1, failed.failedTxCount);
+    TEST_ASSERT_EQUAL_UINT32(failedId, failed.failedTxLastPacketId);
+    TEST_ASSERT_EQUAL_UINT32(0, failed.failedTxLastSequence);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(W12BenchmarkModule::TxFailureStage::START_TRANSMIT), failed.failedTxLastStage);
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_SPI_CMD_INVALID, failed.failedTxLastRadioResult);
+
+    adapterHal->failCommand = 0;
+    adapterHal->irqOnSetTx = RADIOLIB_LR2021_IRQ_TX_DONE;
+    TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->isSending());
+    adapter->serviceNotifications();
+    TEST_ASSERT_EQUAL_UINT32(1, adapterDiagnostics->getStats().txSucceeded);
+    const auto after = adapterDiagnostics->getPreSendAttributionDiagnostics().phaseTiming;
+    TEST_ASSERT_EQUAL_UINT32(1, after.failedTxCount);
+    TEST_ASSERT_EQUAL_UINT32(failedId, after.failedTxLastPacketId);
+    TEST_ASSERT_EQUAL_UINT8(failed.failedTxLastStage, after.failedTxLastStage);
+    TEST_ASSERT_EQUAL_INT16(failed.failedTxLastRadioResult, after.failedTxLastRadioResult);
+}
+#endif
 
 // Use a real W12 owner slot while TX_DONE is already pending, then enter the
 // LR2021 standby path. The drain must complete the packet under the
@@ -1854,6 +1957,7 @@ static void test_w12_burst_production_reconfigure_inflight_frame_resumes_ordinar
     adapter->serviceNotifications();
     TEST_ASSERT_TRUE(adapter->isSending());
     TEST_ASSERT_FALSE(adapter->burstTimerPendingForTest());
+    const PacketId failedPacketId = adapter->sendingForTest()->id;
     TEST_ASSERT_TRUE(adapter->reconfigureForTest());
     TEST_ASSERT_FALSE(adapter->isSending());
     TEST_ASSERT_TRUE(adapter->receiving());
@@ -1876,6 +1980,16 @@ static void test_w12_burst_production_reconfigure_inflight_frame_resumes_ordinar
     TEST_ASSERT_EQUAL_UINT32(0, adapter->packetsInTxQueue());
     TEST_ASSERT_EQUAL_UINT32(3, adapterDiagnostics->getStats().txSucceeded);
     TEST_ASSERT_EQUAL_UINT32(4, adapterDiagnostics->getDiagnostics().txTerminal);
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    const auto phaseTiming = adapterDiagnostics->getPreSendAttributionDiagnostics().phaseTiming;
+    TEST_ASSERT_EQUAL_UINT32(1, phaseTiming.failedTxCount);
+    TEST_ASSERT_EQUAL_UINT32(failedPacketId, phaseTiming.failedTxLastPacketId);
+    TEST_ASSERT_EQUAL_UINT32(1, phaseTiming.failedTxLastSequence);
+    TEST_ASSERT_NOT_EQUAL_UINT32(0, phaseTiming.failedTxLastAtMs);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(W12BenchmarkModule::TxFailureStage::FORCED_COMPLETE_FALSE),
+                            phaseTiming.failedTxLastStage);
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_NONE, phaseTiming.failedTxLastRadioResult);
+#endif
 }
 
 // An ISR_TX notification can overwrite the single guarded notification slot
@@ -2290,6 +2404,11 @@ static void runW12AdapterTests()
     RUN_TEST(test_w12_adapter_terminal_send_error_and_start_failure_release_without_success);
 #if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
     RUN_TEST(test_w12_burst_production_four_frame_sequence_counts_and_rearms);
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    RUN_TEST(test_w12_burst_production_router_auth_gate_records_rx_decode);
+    RUN_TEST(test_w12_burst_owned_start_failure_records_exact_stage_and_success_keeps_summary);
+    RUN_TEST(test_w12_burst_owned_irq_failure_records_validation_stage_without_invented_result);
+#endif
     RUN_TEST(test_w12_burst_production_pending_tx_done_standby_does_not_arm);
     RUN_TEST(test_w12_burst_production_reconfigure_inflight_frame_resumes_ordinary_queue);
     RUN_TEST(test_w12_burst_null_tx_overwrite_restores_live_handoffs);

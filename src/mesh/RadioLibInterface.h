@@ -16,6 +16,10 @@
 #define MESHTASTIC_W12_BENCHMARK_TX_BURST_GUARD_MS 6
 #endif
 
+#ifndef MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+#define MESHTASTIC_W12_BENCHMARK_PHASE_TIMING 0
+#endif
+
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
 #include <atomic>
 static_assert(std::atomic<uint32_t>::is_always_lock_free, "W12 radio diagnostic state requires lock-free 32-bit atomics");
@@ -470,6 +474,9 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
         uint8_t completedFrames = 0;
         const meshtastic_MeshPacket *nextPacket = nullptr;
         PacketId nextPacketId = 0;
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+        uint32_t guardDueAtMs = 0;
+#endif
     } w12Burst;
     bool w12BurstArmSuppressed = false;
     uint8_t w12BurstSuppressionDepth = 0;

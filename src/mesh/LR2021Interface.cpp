@@ -130,6 +130,10 @@ int16_t LR2021Interface::standbyFlrc()
     activeReceiveStart = 0;
     disableInterrupt();
     // Forced standby cannot claim success for an incomplete transmission.
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
+    if (sendingPacket && w12BenchmarkModule)
+        w12BenchmarkModule->onTxFailureObserved(sendingPacket, W12BenchmarkModule::TxFailureStage::FORCED_COMPLETE_FALSE, result);
+#endif
     completeSending(false);
     RadioLibInterface::setStandby();
     return result;
