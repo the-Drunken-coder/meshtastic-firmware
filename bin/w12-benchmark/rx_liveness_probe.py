@@ -420,9 +420,13 @@ def validate_pre_send_report(report: Any, config: Any, label: str) -> Any:
 
 
 def pre_send_record(
-    report: Any, role: str, request_id: int, sent_monotonic: float
+    report: Any,
+    role: str,
+    request_id: int,
+    sent_monotonic: float,
+    raw_payload_hex: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    record = {
         "role": role,
         "report_kind": PRE_SEND_KIND,
         "request_id": request_id,
@@ -430,6 +434,32 @@ def pre_send_record(
         "host_monotonic": time.monotonic(),
         "report": pre_send_report_dict(report),
     }
+    if raw_payload_hex is not None:
+        record["raw_payload_hex"] = raw_payload_hex
+    return record
+
+
+def capture_receiver_pre_send_baseline(
+    session: LivenessSession, config: Any, timeout: float, role: str
+) -> dict[str, Any]:
+    """Capture the mandatory receiver baseline before sender START."""
+
+    report, sent_monotonic, request_id = session.request_pre_send(config, timeout)
+    report = validate_pre_send_report(report, config, "receiver_pre_send_baseline")
+    record = pre_send_record(
+        report,
+        role,
+        request_id,
+        sent_monotonic,
+        getattr(session, "_last_pre_send_raw_payload_hex", None),
+    )
+    record.update(
+        {
+            "stage": "receiver_started_before_sender_started",
+            "config": dataclasses.asdict(config),
+        }
+    )
+    return record
 
 
 def optional_source_pre_send(
@@ -460,10 +490,35 @@ def optional_source_pre_send(
     state.update(
         {
             "status": "captured",
-            "record": pre_send_record(report, role, request_id, sent_monotonic),
+            "record": pre_send_record(
+                report,
+                role,
+                request_id,
+                sent_monotonic,
+                getattr(session, "_last_pre_send_raw_payload_hex", None),
+            ),
         }
     )
     return state
+
+
+def stop_started_roles(
+    sessions: Mapping[str, Any], started_roles: Sequence[str], config: Any
+) -> dict[str, Any]:
+    """Stop only roles whose START control completed successfully."""
+
+    failed_roles: list[str] = []
+    errors: dict[str, str] = {}
+    for role in started_roles:
+        session = sessions.get(role)
+        if session is None:
+            continue
+        try:
+            session.base_control(CONTROL_STOP, config)
+        except BaseException as error:
+            failed_roles.append(role)
+            errors[role] = str(error)
+    return {"failed_roles": failed_roles, "errors": errors}
 
 
 def decode_liveness_control(payload: bytes) -> tuple[int, Any]:
@@ -881,6 +936,7 @@ class LivenessSession:
         self.capture = self.base.capture
         self.interface = self.base.interface
         self.health = _ReaderHealth()
+        self._last_pre_send_raw_payload_hex: str | None = None
         self._mesh_pb2, self._portnums_pb2 = _load_meshtastic_types()
         self._original_handle = self.interface._handleFromRadio
         self.interface._handleFromRadio = self._handle_from_radio
@@ -1035,7 +1091,9 @@ class LivenessSession:
             except (KeyError, ValueError, TypeError) as error:
                 self.health.fail("parser_error", str(error))
                 raise LivenessError(f"parser_error: {error}") from error
-            return validate_pre_send_report(report, config, "pre_send_response")
+            report = validate_pre_send_report(report, config, "pre_send_response")
+            self._last_pre_send_raw_payload_hex = event["raw_payload_hex"]
+            return report
 
     def request(
         self, config: Any, operation: int, timeout: float
@@ -1047,6 +1105,7 @@ class LivenessSession:
     def request_pre_send(
         self, config: Any, timeout: float
     ) -> tuple[Any, float, int]:
+        self._last_pre_send_raw_payload_hex = None
         request_id, sent_monotonic = send_pre_send_control(self, config)
         report = self._wait_pre_send_response(
             request_id, config, sent_monotonic, timeout
@@ -1656,11 +1715,23 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
                     "support_expected": bool(args.source_pre_send),
                 },
             },
+            "receiver_pre_send_baseline": {
+                "requested": True,
+                "support_expected": True,
+                "stage": "receiver_started_before_sender_started",
+                "config": dataclasses.asdict(config),
+            },
         },
         "provenance": provenance,
         "file_digests": file_digests,
         "samples": [],
         "source_snapshots": [],
+        "receiver_pre_send_baseline": {
+            "status": "pending",
+            "requested": True,
+            "support_expected": True,
+            "stage": "receiver_started_before_sender_started",
+        },
         "rearm": {
             "attempted": False,
             "performed": False,
@@ -1680,7 +1751,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     }
     sessions: dict[str, LivenessSession] = {}
     before: dict[str, Any] = {}
-    run_started = False
+    started_roles: set[str] = set()
     closed_ok = False
     captured_events: dict[str, list[dict[str, Any]]] = {}
 
@@ -1720,10 +1791,22 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         sender = sessions[sender_role]
         receiver.base_control(CONTROL_RESET, config)
         receiver.base_control(CONTROL_START, config)
-        checkpoint("receiver_started")
+        started_roles.add(receiver_role)
+        try:
+            result["receiver_pre_send_baseline"] = capture_receiver_pre_send_baseline(
+                receiver, config, args.control_timeout, receiver_role
+            )
+            result["receiver_pre_send_baseline"]["status"] = "captured"
+        except BaseException as error:
+            result["receiver_pre_send_baseline"].update(
+                {"status": "failed", "error": str(error)}
+            )
+            raise
+        checkpoint("receiver_started_pre_send_baseline_captured")
         time.sleep(args.command_gap)
         sender.base_control(CONTROL_RESET, config)
         sender.base_control(CONTROL_START, config)
+        started_roles.add(sender_role)
         start = time.monotonic()
         result["sender_start_monotonic"] = start
         result["sender_window"].update(
@@ -1733,7 +1816,6 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
                 "anchor_note": "fixed sender wall window; independent of receiver first-auth anchor",
             }
         )
-        run_started = True
         checkpoint("sender_started")
 
         last_sample: RxLivenessReport | None = None
@@ -2150,16 +2232,17 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         result["error"] = str(error)
         result["status"] = "diagnostic_invalid"
     finally:
-        if run_started:
-            for role in (receiver_role, sender_role):
-                session = sessions.get(role)
-                if session is None:
-                    continue
-                try:
-                    session.base_control(CONTROL_STOP, config)
-                except BaseException as error:
-                    add_failure(f"{role}_stop_failed")
-                    result.setdefault("stop_errors", {})[role] = str(error)
+        stop_result = stop_started_roles(
+            sessions,
+            tuple(
+                role for role in (receiver_role, sender_role) if role in started_roles
+            ),
+            config,
+        )
+        for role in stop_result["failed_roles"]:
+            add_failure(f"{role}_stop_failed")
+        if stop_result["errors"]:
+            result.setdefault("stop_errors", {}).update(stop_result["errors"])
         try:
             checkpoint("finally_before_close")
         except BaseException as error:

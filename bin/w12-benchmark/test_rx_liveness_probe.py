@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import importlib.util
 import io
 import json
@@ -973,6 +974,117 @@ class ControlTransportTests(unittest.TestCase):
         self.assertEqual(requested_session.calls, 1)
         self.assertEqual(failed_state["status"], "failed")
         self.assertIn("response_timeout", failed_state["error"])
+
+    def test_receiver_baseline_orders_decoded_op9_before_sender_start(self):
+        run = config()
+        payload = pre_send_payload(run, elapsed_ms=0)
+        events = []
+
+        class Receiver:
+            _last_pre_send_raw_payload_hex = payload.hex()
+
+            def base_control(self, operation, _config):
+                events.append(f"receiver_{operation}")
+
+            def request_pre_send(self, _config, _timeout):
+                events.append("receiver_op9")
+                return probe.pre_send.decode_report(payload), 1.0, 8
+
+        class Sender:
+            def base_control(self, operation, _config):
+                events.append(f"sender_{operation}")
+
+        receiver = Receiver()
+        receiver.base_control(probe.CONTROL_RESET, run)
+        receiver.base_control(probe.CONTROL_START, run)
+        baseline = probe.capture_receiver_pre_send_baseline(
+            receiver, run, 0.1, "walker"
+        )
+        Sender().base_control(probe.CONTROL_START, run)
+
+        self.assertEqual(events, ["receiver_1", "receiver_2", "receiver_op9", "sender_2"])
+        self.assertEqual(baseline["report"]["elapsed_ms"], 0)
+        self.assertEqual(baseline["config"], dataclasses.asdict(run))
+        self.assertEqual(baseline["raw_payload_hex"], payload.hex())
+        self.assertEqual(baseline["stage"], "receiver_started_before_sender_started")
+
+    def test_receiver_baseline_failure_prevents_sender_start(self):
+        run = config()
+        events = []
+
+        class Receiver:
+            def request_pre_send(self, _config, _timeout):
+                events.append("receiver_op9")
+                raise probe.LivenessError("response_timeout: kind-7 response did not arrive")
+
+        with self.assertRaisesRegex(probe.LivenessError, "response_timeout"):
+            probe.capture_receiver_pre_send_baseline(Receiver(), run, 0.1, "walker")
+        self.assertEqual(events, ["receiver_op9"])
+
+    def test_baseline_failure_cleanup_stops_receiver_that_already_started(self):
+        run = config()
+        events = []
+
+        class Receiver:
+            def base_control(self, operation, _config):
+                events.append(("walker", operation))
+
+            def request_pre_send(self, _config, _timeout):
+                raise probe.LivenessError("response_timeout: kind-7 response did not arrive")
+
+        receiver = Receiver()
+        receiver.base_control(probe.CONTROL_RESET, run)
+        receiver.base_control(probe.CONTROL_START, run)
+        started = {"walker"}
+        with self.assertRaises(probe.LivenessError):
+            probe.capture_receiver_pre_send_baseline(receiver, run, 0.1, "walker")
+        stop_result = probe.stop_started_roles({"walker": receiver}, started, run)
+        self.assertEqual(stop_result["failed_roles"], [])
+        self.assertEqual(
+            events,
+            [
+                ("walker", probe.CONTROL_RESET),
+                ("walker", probe.CONTROL_START),
+                ("walker", probe.CONTROL_STOP),
+            ],
+        )
+
+    def test_sender_start_failure_cleanup_does_not_stop_unstarted_sender(self):
+        run = config()
+        events = []
+
+        class Session:
+            def __init__(self, role):
+                self.role = role
+
+            def base_control(self, operation, _config):
+                events.append((self.role, operation))
+                if self.role == "base" and operation == probe.CONTROL_START:
+                    raise probe.LivenessError("control_write_error: sender start failed")
+
+        receiver = Session("walker")
+        sender = Session("base")
+        started = set()
+        receiver.base_control(probe.CONTROL_RESET, run)
+        receiver.base_control(probe.CONTROL_START, run)
+        started.add("walker")
+        sender.base_control(probe.CONTROL_RESET, run)
+        with self.assertRaisesRegex(probe.LivenessError, "sender start failed"):
+            sender.base_control(probe.CONTROL_START, run)
+        stop_result = probe.stop_started_roles(
+            {"walker": receiver, "base": sender}, started, run
+        )
+        self.assertEqual(stop_result["failed_roles"], [])
+        self.assertEqual(
+            events,
+            [
+                ("walker", probe.CONTROL_RESET),
+                ("walker", probe.CONTROL_START),
+                ("base", probe.CONTROL_RESET),
+                ("base", probe.CONTROL_START),
+                ("walker", probe.CONTROL_STOP),
+            ],
+        )
 
 
 class CaptureHealthTests(unittest.TestCase):
