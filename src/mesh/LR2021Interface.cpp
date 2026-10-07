@@ -128,6 +128,15 @@ void LR2021Interface::startReceive()
         return;
     }
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+#if defined(MESHTASTIC_W12_BENCHMARK_SINGLE_RX) && MESHTASTIC_W12_BENCHMARK_SINGLE_RX
+    constexpr uint32_t rxTimeout = RADIOLIB_LR2021_RX_TIMEOUT_NONE;
+#else
+    constexpr uint32_t rxTimeout = RADIOLIB_LR2021_RX_TIMEOUT_INF;
+#endif
+#else
+    constexpr uint32_t rxTimeout = RADIOLIB_LR2021_RX_TIMEOUT_INF;
+#endif
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
     const uint32_t phaseStartedAt = micros();
     if (w12BenchmarkModule)
         w12BenchmarkModule->onRxArmAttempt();
@@ -141,7 +150,7 @@ void LR2021Interface::startReceive()
         if (w12BenchmarkModule)
             w12BenchmarkModule->onRxArmStage(W12BenchmarkModule::RxArmStage::STANDBY, result);
 #endif
-        result = lora.startReceive(RADIOLIB_LR2021_RX_TIMEOUT_INF);
+        result = lora.startReceive(rxTimeout);
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
         if (w12BenchmarkModule)
             w12BenchmarkModule->onRxArmStage(W12BenchmarkModule::RxArmStage::RX_START, result);
@@ -156,7 +165,7 @@ void LR2021Interface::startReceive()
 #endif
     }
     if (result != RADIOLIB_ERR_NONE && maybeRecoverChipStateLoss()) {
-        result = lora.startReceive(RADIOLIB_LR2021_RX_TIMEOUT_INF);
+        result = lora.startReceive(rxTimeout);
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
         if (w12BenchmarkModule)
             w12BenchmarkModule->onRxArmStage(W12BenchmarkModule::RxArmStage::RX_START, result, true);
