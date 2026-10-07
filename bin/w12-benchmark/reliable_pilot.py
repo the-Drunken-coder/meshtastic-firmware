@@ -22,7 +22,7 @@ import struct
 import sys
 import time
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 def _workspace_root(path: Path) -> Path:
@@ -61,6 +61,11 @@ PRIVATE_APP = 256
 ROUTING_APP = 5
 TRANSPORT_INTERNAL = 0
 TRANSPORT_LORA = 1
+ACK_HOP_CONTRACT_NOTE = (
+    "A proof-valid direct ACK may legitimately have hop_limit=0 when the request "
+    "has hop_start=0. hop_start and hop_limit are captured as metadata only and "
+    "never gate proof-valid ACK classification."
+)
 
 ROUTING_ERRORS: Mapping[int, str] = {
     0: "NONE",
@@ -181,6 +186,12 @@ class DirectionState:
     seen_queue_events: set[tuple[Any, ...]] = dataclasses.field(default_factory=set)
     seen_receipt_events: set[tuple[Any, ...]] = dataclasses.field(default_factory=set)
     seen_reply_events: set[tuple[Any, ...]] = dataclasses.field(default_factory=set)
+    cached_backpressure_observations: list[dict[str, Any]] = dataclasses.field(
+        default_factory=list
+    )
+    seen_backpressure_events: set[tuple[Any, ...]] = dataclasses.field(
+        default_factory=set
+    )
 
 
 def _u32(value: int) -> bytes:
@@ -564,6 +575,7 @@ def _install_raw_capture(session: Any) -> None:
                     request_id=(int(decoded.request_id) if decoded is not None else 0),
                     want_ack=bool(packet.want_ack),
                     pki_encrypted=bool(packet.pki_encrypted),
+                    hop_start=int(getattr(packet, "hop_start", 0)),
                     hop_limit=int(packet.hop_limit),
                     via_mqtt=bool(packet.via_mqtt),
                     transport=int(packet.transport_mechanism),
@@ -629,18 +641,106 @@ def _drop_rejected_host_entry(interface: Any, queue_status: Any) -> None:
         interface.queue.pop(packet_id, None)
 
 
-def _send_to_radio_immediate(interface: Any, to_radio: Any) -> None:
+def _backpressure_event_key(event: Mapping[str, Any]) -> tuple[Any, ...]:
+    packet_id = event.get("packet_id")
+    return (
+        event.get("role"),
+        event.get("kind"),
+        int(event.get("source", 0)),
+        int(event.get("destination", 0)),
+        int(event.get("next_sequence", 0)),
+        event.get("free"),
+        str(event.get("state", "")),
+        float(event.get("monotonic", 0.0)),
+        int(packet_id) if packet_id is not None else None,
+    )
+
+
+def _normalize_backpressure_observation(
+    event: Mapping[str, Any],
+    *,
+    role: str,
+    source: int,
+    destination: int,
+    next_sequence: int,
+    free: int | None,
+    state: str,
+) -> dict[str, Any]:
+    observed_packet_id = event.get("packet_id")
+    observation = {
+        "role": event.get("role", role),
+        "source": int(event.get("source", source)),
+        "destination": int(event.get("destination", destination)),
+        "next_sequence": int(event.get("next_sequence", next_sequence)),
+        "free": event.get("free", free),
+        "state": str(event.get("state", state)),
+        "packet_id_allocated": observed_packet_id is not None,
+        "monotonic": float(event.get("monotonic", time.monotonic())),
+    }
+    if observed_packet_id is not None:
+        observation["packet_id"] = int(observed_packet_id)
+    return observation
+
+
+def _record_host_admission_block(
+    state: DirectionState,
+    session: Any,
+    destination: int,
+    free: int | None,
+    admission_state: str,
+    packet_id: int | None = None,
+) -> None:
+    """Capture host admission pressure before a firmware write occurs."""
+
+    values: dict[str, Any] = {
+        "source": state.direction.source,
+        "destination": int(destination),
+        "next_sequence": state.next_sequence,
+        "free": free,
+        "state": admission_state,
+        "packet_id_allocated": packet_id is not None,
+    }
+    if packet_id is not None:
+        values["packet_id"] = int(packet_id)
+    event = session.capture.record("pilot_host_cached_backpressure", **values)
+    if not isinstance(event, Mapping):
+        event = values
+    observation = _normalize_backpressure_observation(
+        event,
+        role=getattr(session, "role", state.direction.source_role),
+        source=state.direction.source,
+        destination=destination,
+        next_sequence=state.next_sequence,
+        free=free,
+        state=admission_state,
+    )
+    event_key = _backpressure_event_key(observation)
+    if event_key not in state.seen_backpressure_events:
+        state.seen_backpressure_events.add(event_key)
+        state.cached_backpressure_observations.append(observation)
+
+
+def _send_to_radio_immediate(
+    interface: Any,
+    to_radio: Any,
+    *,
+    on_queue_blocked: Callable[[int | None, str, int | None], None] | None = None,
+) -> None:
     """Send one packet after a live queue check without SDK's unbounded wait."""
 
     if not to_radio.HasField("packet"):
         interface._sendToRadioImpl(to_radio)
         return
     free = _queue_free(interface)
+    packet_id = int(to_radio.packet.id)
     if free is None:
+        if on_queue_blocked is not None:
+            on_queue_blocked(None, "host_queue_status_unavailable", packet_id)
         raise _QueueFull("queue_status_unavailable")
     if free <= 0:
+        if on_queue_blocked is not None:
+            on_queue_blocked(free, "host_cached_backpressure", packet_id)
         raise _QueueFull("queue_status_full")
-    packet_id = int(to_radio.packet.id)
     interface.queue[packet_id] = to_radio
     interface._queueClaim()
     try:
@@ -654,19 +754,42 @@ def send_data_if_admitted(
     session: Any,
     payload: bytes,
     destination: int,
+    *,
+    state: DirectionState | None = None,
 ) -> Any | None:
     """Use PRIVATE_APP sendData with a bounded, nonblocking queue admission."""
 
     interface = session.interface
+
+    def observe_queue_blocked(
+        free: int | None, admission_state: str, packet_id: int | None = None
+    ) -> None:
+        if state is not None:
+            _record_host_admission_block(
+                state,
+                session,
+                destination,
+                free,
+                admission_state,
+                packet_id,
+            )
+
     with interface._command_lock:
-        if _queue_free(interface) is None:
+        free = _queue_free(interface)
+        if free is None:
+            observe_queue_blocked(None, "host_queue_status_unavailable")
             raise _QueueFull("queue_status_unavailable")
-        if _queue_free(interface) <= 0:
+        if free <= 0:
+            observe_queue_blocked(free, "host_cached_backpressure")
             raise _QueueFull("queue_status_full")
         original_send = interface._sendToRadio
 
         def bounded_send(to_radio: Any) -> None:
-            _send_to_radio_immediate(interface, to_radio)
+            _send_to_radio_immediate(
+                interface,
+                to_radio,
+                on_queue_blocked=observe_queue_blocked,
+            )
 
         interface._sendToRadio = bounded_send
         try:
@@ -789,6 +912,35 @@ TERMINAL_OUTCOMES = {
     "local_queue_rejected",
     "remote_nak_authenticated",
 }
+
+
+def _record_backpressure_events(
+    state: DirectionState, events: Iterable[Mapping[str, Any]]
+) -> None:
+    """Retain persisted host admission observations without inventing IDs."""
+
+    for event in events:
+        if (
+            event.get("kind") != "pilot_host_cached_backpressure"
+            or event.get("role") != state.direction.source_role
+            or int(event.get("source", 0)) != state.direction.source
+            or int(event.get("destination", 0)) != state.direction.destination
+        ):
+            continue
+        observation = _normalize_backpressure_observation(
+            event,
+            role=state.direction.source_role,
+            source=state.direction.source,
+            destination=state.direction.destination,
+            next_sequence=0,
+            free=None,
+            state="host_cached_backpressure",
+        )
+        event_key = _backpressure_event_key(observation)
+        if event_key in state.seen_backpressure_events:
+            continue
+        state.seen_backpressure_events.add(event_key)
+        state.cached_backpressure_observations.append(observation)
 
 
 def _record_queue_status(
@@ -1025,6 +1177,7 @@ def _update_live_states(
     for session in sessions.values():
         events.extend(session.capture.snapshot())
     for state in states:
+        _record_backpressure_events(state, events)
         _record_queue_status(state, events)
         _record_receipts(state, events)
         _record_replies(state, events)
@@ -1169,6 +1322,60 @@ def _host_goodput_summary(
     }
 
 
+def _finite_timestamp(value: float | None) -> float | None:
+    if value is None:
+        return None
+    candidate = float(value)
+    return candidate if math.isfinite(candidate) else None
+
+
+def _submitted_frame_admissions(state: DirectionState) -> list[dict[str, Any]]:
+    return [
+        {
+            "source": frame.source,
+            "destination": frame.destination,
+            "packet_id": frame.packet_id,
+            "sequence": frame.sequence,
+            "admitted_at": _finite_timestamp(frame.admitted_at),
+        }
+        for frame in state.submitted_frames.values()
+    ]
+
+
+def _run_window_metadata(
+    state: DirectionState, producer_deadline: float, drain_end: float
+) -> dict[str, Any]:
+    """Persist the exact timestamps and inclusivity used for bounded evidence."""
+
+    state_deadline = _finite_timestamp(state.producer_end)
+    supplied_deadline = _finite_timestamp(producer_deadline)
+    canonical_deadline = (
+        state_deadline if state_deadline is not None else supplied_deadline
+    )
+    return {
+        "clock": "monotonic",
+        "start_monotonic": _finite_timestamp(state.sent_at),
+        "producer_deadline_monotonic": canonical_deadline,
+        "producer_deadline_source": (
+            "state.producer_end" if state_deadline is not None else "evaluate.wall_end"
+        ),
+        "supplied_wall_end_monotonic": supplied_deadline,
+        "producer_deadline_matches_supplied": (
+            state_deadline is None or state_deadline == supplied_deadline
+        ),
+        "drain_end_monotonic": _finite_timestamp(drain_end),
+        "start_inclusive": True,
+        "end_inclusive": True,
+        "frame_admitted_at_inclusive": True,
+        "effective_lower_bound_rule": "max(start_monotonic, frame.admitted_at)",
+        "predicate": (
+            "max(start_monotonic, frame.admitted_at) <= event.monotonic "
+            "<= drain_end_monotonic; producer_deadline_monotonic separates "
+            "production from drain"
+        ),
+    }
+
+
 def evaluate_direction(
     state: DirectionState,
     events: Iterable[Mapping[str, Any]],
@@ -1180,6 +1387,7 @@ def evaluate_direction(
 
     events = list(events)
     state.drain_end = drain_end
+    _record_backpressure_events(state, events)
     _record_queue_status(state, events)
     _record_receipts(state, events)
     _record_replies(state, events, drain_end)
@@ -1289,6 +1497,21 @@ def evaluate_direction(
         "submitted": state.submissions,
         "submission_failures": state.submission_failures,
         "queue_full": state.queue_full,
+        "host_cached_backpressure": sum(
+            observation["state"] == "host_cached_backpressure"
+            for observation in state.cached_backpressure_observations
+        ),
+        "host_cached_backpressure_observations": list(
+            state.cached_backpressure_observations
+        ),
+        "host_admission_observation_note": (
+            "host_cached_backpressure is sampled from the cached host queue before "
+            "a firmware write; the outer check has no packet ID, while a race after "
+            "ToRadio construction may retain that actual host packet ID. Firmware "
+            "queue responses remain in firmware_accepted, firmware_rejected, and "
+            "firmware_unobserved"
+        ),
+        "submitted_frame_admissions": _submitted_frame_admissions(state),
         "duplicate_submission_keys": state.duplicate_submission_keys,
         "firmware_accepted": len(accepted_keys),
         "firmware_rejected": len(rejected_keys),
@@ -1362,6 +1585,8 @@ def evaluate_direction(
         "host_capture_complete": host_capture_complete,
         "queue_reconciliation_complete": queue_reconciliation_complete,
         "measurement_valid": measurement_valid,
+        "run_window": _run_window_metadata(state, wall_end, drain_end),
+        "ack_hop_contract": ACK_HOP_CONTRACT_NOTE,
         "late_or_duplicate_replies": sum(
             outcome.get("status") in {"late_or_unknown_reply", "duplicate_reply"}
             for outcome in state.outcomes
@@ -1691,6 +1916,7 @@ def run_pilot(args: argparse.Namespace) -> dict[str, Any]:
                         sessions[state.direction.source_role],
                         payload,
                         state.direction.destination,
+                        state=state,
                     )
                 except _QueueFull:
                     state.queue_full += 1

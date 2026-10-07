@@ -38,6 +38,7 @@ def event(**values):
         "via_mqtt": False,
         "want_ack": True,
         "pki_encrypted": True,
+        "hop_start": pilot.REQUESTED_HOP_LIMIT,
         "hop_limit": pilot.REQUESTED_HOP_LIMIT,
         "ack_proof_status": 0,
         "routing_error": 0,
@@ -136,6 +137,103 @@ class ReliablePilotTest(unittest.TestCase):
             ],
             1.1,
         )
+
+    def test_zero_hop_valid_ack_is_classified_by_proof_without_hop_gate(self):
+        state = state_with_frames(1)
+        receipt = event(
+            role="walker",
+            monotonic=1.5,
+            packet_id=0x1000,
+            from_node=SOURCE,
+            to=DESTINATION,
+            portnum=pilot.PRIVATE_APP,
+            payload_sha256=next(iter(state.submitted_frames.values())).payload_sha256,
+        )
+        valid_ack = event(
+            monotonic=2.0,
+            packet_id=0xB005,
+            from_node=DESTINATION,
+            to=SOURCE,
+            request_id=0x1000,
+            hop_start=0,
+            hop_limit=0,
+            ack_proof_status=pilot.ACK_PROOF_VALID,
+        )
+        result = pilot.evaluate_direction(
+            state, [receipt, valid_ack], wall_end=1.0, drain_end=2.0
+        )
+        self.assertEqual(result["authenticated_ack_valid"], 1)
+        self.assertEqual(result["status"], "complete")
+        self.assertIn("hop_start=0", result["ack_hop_contract"])
+
+    def test_serialized_run_window_preserves_exact_inclusive_boundaries(self):
+        state = state_with_frames(1)
+        state.sent_at = 100.125
+        state.producer_end = 101.25
+        state.drain_end = 102.5
+        valid_ack = event(
+            monotonic=102.5,
+            packet_id=0xB006,
+            from_node=DESTINATION,
+            to=SOURCE,
+            request_id=0x1000,
+            ack_proof_status=pilot.ACK_PROOF_VALID,
+        )
+        result = pilot.evaluate_direction(
+            state, [valid_ack], wall_end=101.25, drain_end=102.5
+        )
+        serialized = json.dumps(result, allow_nan=False)
+        restored = json.loads(serialized)["run_window"]
+        self.assertEqual(restored["start_monotonic"], 100.125)
+        self.assertEqual(restored["producer_deadline_monotonic"], 101.25)
+        self.assertEqual(restored["drain_end_monotonic"], 102.5)
+        self.assertTrue(restored["start_inclusive"])
+        self.assertTrue(restored["end_inclusive"])
+        self.assertEqual(result["authenticated_ack_valid"], 1)
+
+    def test_saved_frame_admission_explains_pre_admission_ack_and_deadline_mismatch(self):
+        state = state_with_frames(1)
+        original = next(iter(state.submitted_frames.values()))
+        admitted = pilot.PendingFrame(
+            original.source,
+            original.destination,
+            original.packet_id,
+            original.sequence,
+            original.payload_sha256,
+            101.0,
+        )
+        state.submitted_frames[original.key] = admitted
+        state.pending[original.key] = admitted
+        state.sent_at = 100.0
+        state.producer_end = 1.0
+        state.drain_end = 102.0
+        pre_admission_ack = event(
+            monotonic=100.5,
+            packet_id=0xB007,
+            from_node=DESTINATION,
+            to=SOURCE,
+            request_id=original.packet_id,
+            ack_proof_status=pilot.ACK_PROOF_VALID,
+        )
+        result = pilot.evaluate_direction(
+            state, [pre_admission_ack], wall_end=900.0, drain_end=102.0
+        )
+        saved = json.loads(json.dumps(result, allow_nan=False))
+        outcome = saved["outcomes"][0]
+        metadata = saved["run_window"]
+        frame = saved["submitted_frame_admissions"][0]
+
+        self.assertFalse(outcome["bounded"])
+        self.assertEqual(saved["authenticated_ack_valid"], 0)
+        self.assertEqual(frame["packet_id"], original.packet_id)
+        self.assertEqual(frame["sequence"], 0)
+        self.assertEqual(frame["admitted_at"], 101.0)
+        self.assertEqual(metadata["start_monotonic"], 100.0)
+        self.assertEqual(metadata["producer_deadline_monotonic"], 1.0)
+        self.assertEqual(metadata["supplied_wall_end_monotonic"], 900.0)
+        self.assertEqual(metadata["producer_deadline_source"], "state.producer_end")
+        self.assertFalse(metadata["producer_deadline_matches_supplied"])
+        self.assertIn("frame.admitted_at", metadata["effective_lower_bound_rule"])
 
     def test_foreign_and_unproven_ack_are_terminal_but_never_authenticated(self):
         state = state_with_frames(3)
@@ -1126,6 +1224,122 @@ class ReliablePilotTest(unittest.TestCase):
         with self.assertRaises(pilot._QueueFull):
             pilot._send_to_radio_immediate(interface, FakeToRadio())
         self.assertEqual(interface.queue, {})
+
+    def test_send_data_captures_cached_backpressure_before_packet_id_allocation(self):
+        import threading
+
+        events = []
+
+        class FakeCapture:
+            def record(self, kind, **values):
+                captured = {
+                    "kind": kind,
+                    "role": "base",
+                    "monotonic": 40.5,
+                    **values,
+                }
+                events.append(captured)
+                return captured
+
+        interface = SimpleNamespace(
+            _command_lock=threading.Lock(),
+            queueStatus=SimpleNamespace(free=0),
+            queue={},
+        )
+        state = pilot.DirectionState(pilot.Direction("base", "walker"), 2, 1)
+        state.next_sequence = 4
+        session = SimpleNamespace(interface=interface, role="base", capture=FakeCapture())
+        with self.assertRaises(pilot._QueueFull):
+            pilot.send_data_if_admitted(
+                session,
+                pilot.make_payload(RUN_ID, SOURCE, DESTINATION, 4),
+                DESTINATION,
+                state=state,
+            )
+
+        self.assertEqual(len(events), 1)
+        captured = events[0]
+        self.assertEqual(captured["kind"], "pilot_host_cached_backpressure")
+        self.assertEqual(captured["source"], SOURCE)
+        self.assertEqual(captured["destination"], DESTINATION)
+        self.assertEqual(captured["next_sequence"], 4)
+        self.assertEqual(captured["free"], 0)
+        self.assertEqual(captured["state"], "host_cached_backpressure")
+        self.assertFalse(captured["packet_id_allocated"])
+        self.assertNotIn("packet_id", captured)
+        self.assertEqual(state.cached_backpressure_observations[0]["monotonic"], 40.5)
+        self.assertEqual(state.submissions, 0)
+        self.assertEqual(state.firmware_rejected, {})
+
+    def test_inner_queue_race_records_actual_constructed_id_without_submission(self):
+        import threading
+
+        events = []
+
+        class FakeCapture:
+            def record(self, kind, **values):
+                captured = {
+                    "kind": kind,
+                    "role": "base",
+                    "monotonic": 41.5,
+                    **values,
+                }
+                events.append(captured)
+                return captured
+
+        class FakeToRadio:
+            packet = SimpleNamespace(id=77)
+
+            def HasField(self, name):
+                return name == "packet"
+
+        class FakePacket:
+            id = 77
+            to = DESTINATION
+            want_ack = True
+            pki_encrypted = True
+            hop_limit = pilot.REQUESTED_HOP_LIMIT
+            decoded = SimpleNamespace(
+                portnum=pilot.PRIVATE_APP,
+                payload=pilot.make_payload(RUN_ID, SOURCE, DESTINATION, 0),
+            )
+
+            def HasField(self, name):
+                return name == "decoded"
+
+        class FakeInterface:
+            def __init__(self):
+                self._command_lock = threading.Lock()
+                self.queueStatus = SimpleNamespace(free=1)
+                self.queue = {}
+                self._sendToRadio = lambda packet: None
+
+            def sendData(self, *args, **kwargs):
+                self.queueStatus.free = 0
+                self._sendToRadio(FakeToRadio())
+                return FakePacket()
+
+        state = pilot.DirectionState(pilot.Direction("base", "walker"), 1, 1)
+        session = SimpleNamespace(
+            interface=FakeInterface(), role="base", capture=FakeCapture()
+        )
+        with self.assertRaises(pilot._QueueFull):
+            pilot.send_data_if_admitted(
+                session,
+                pilot.make_payload(RUN_ID, SOURCE, DESTINATION, 0),
+                DESTINATION,
+                state=state,
+            )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["packet_id"], 77)
+        self.assertTrue(events[0]["packet_id_allocated"])
+        self.assertEqual(state.cached_backpressure_observations[0]["packet_id"], 77)
+        self.assertTrue(state.cached_backpressure_observations[0]["packet_id_allocated"])
+        self.assertEqual(state.submissions, 0)
+        self.assertEqual(state.submitted_frames, {})
+        self.assertEqual(state.firmware_accepted, set())
+        self.assertEqual(state.firmware_rejected, {})
 
     def test_send_data_requests_hop_one_direct_pair_contract(self):
         payload = pilot.make_payload(RUN_ID, SOURCE, DESTINATION, 0)
