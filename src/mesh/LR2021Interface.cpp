@@ -319,6 +319,39 @@ uint32_t LR2021Interface::getPacketTime(uint32_t length, bool received)
     return RadioMode::isFlrc() ? W12FlrcProfile::durationMs(length) : LR20x0Interface::getPacketTime(length, received);
 }
 
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+bool LR2021Interface::readW12RxLiveness(W12RxLivenessSample &sample)
+{
+    sample = W12RxLivenessSample{};
+    if (!RadioMode::isFlrc())
+        return false;
+
+    sample.softwareState = getW12DiagnosticRadioState();
+    sample.chipStatsResult = lora.getFlrcRxStats(&sample.chipRxPackets, &sample.chipCrcErrors, &sample.chipLenErrors);
+    sample.irqReadResult = W12FlrcProfile::readIrqFlags(module, sample.rawIrqFlags, &sample.rawStatus);
+
+    float rssi = 0;
+    sample.rssiReadResult = W12FlrcProfile::readRssi(module, false, rssi);
+    if (sample.rssiReadResult == RADIOLIB_ERR_NONE)
+        sample.rssiDbm = static_cast<int16_t>(lround(rssi));
+    return true;
+}
+
+bool LR2021Interface::performW12RxRearm(W12RxRearmResult &result)
+{
+    result = W12RxRearmResult{};
+    if (!RadioMode::isFlrc() || isSending() || packetsInTxQueue() != 0)
+        return false;
+    result.beforeState = getW12DiagnosticRadioState();
+    const uint32_t startedAt = micros();
+    LR2021Interface::startReceive();
+    result.durationUs = static_cast<uint32_t>(micros() - startedAt);
+    result.afterState = getW12DiagnosticRadioState();
+    result.softwareArmed = (result.afterState & 0x01u) != 0 && (result.afterState & 0x02u) == 0;
+    return true;
+}
+#endif
+
 bool LR2021Interface::receiveIrqPending()
 {
     if (!RadioMode::isFlrc())

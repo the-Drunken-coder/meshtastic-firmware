@@ -30,6 +30,10 @@ class LR2021Interface : public LR20x0Interface<LR2021>
     bool armTransmitBeforeStart() override;
     void onTransmitStarted() override;
     void handleSoftwareLoraIrqPoll() override;
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    bool readW12RxLiveness(W12RxLivenessSample &sample) override;
+    bool performW12RxRearm(W12RxRearmResult &result) override;
+#endif
 
   private:
     bool beginFlrc();

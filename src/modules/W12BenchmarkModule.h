@@ -28,6 +28,7 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     static constexpr uint16_t REPORT_BYTES = 86;
     static constexpr uint16_t DIAGNOSTIC_REPORT_BYTES = 233;
     static constexpr uint16_t RADIO_DIAGNOSTIC_REPORT_BYTES = 233;
+    static constexpr uint16_t RX_LIVENESS_REPORT_BYTES = 80;
     static constexpr uint16_t DEFAULT_SIZE = 219;
     static constexpr uint16_t MAX_SIZE = 219;
     static constexpr uint32_t MIN_COUNT = 1000;
@@ -42,6 +43,8 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
         SNAPSHOT = 4,
         SNAPSHOT_DIAGNOSTICS = 5,
         SNAPSHOT_RADIO_DIAGNOSTICS = 6,
+        SNAPSHOT_RX_LIVENESS = 7,
+        REARM_RX_LIVENESS = 8,
     };
 
     enum class Kind : uint8_t {
@@ -50,6 +53,7 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
         REPORT = 3,
         DIAGNOSTICS = 4,
         RADIO_DIAGNOSTICS = 5,
+        RX_LIVENESS = 6,
     };
 
     enum class CcaReason : uint8_t {
@@ -65,6 +69,7 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     enum class RxDecodeResult : uint8_t { Success, Reject, Opaque };
     enum class RxArmStage : uint8_t { NONE = 0, STANDBY = 1, RX_START = 2, IRQ_MAP = 3 };
     enum class RadioPhase : uint8_t { RX_START = 0, CHANNEL_ACTIVE = 1, START_SEND = 2 };
+    enum class RxLivenessRearmResult : uint8_t { NEVER_PERFORMED = 0, SOFTWARE_ARMED = 1, SOFTWARE_NOT_ARMED = 2 };
 
     struct Diagnostics {
         uint32_t txDelayScheduledAttempts = 0;
@@ -160,6 +165,30 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
         uint8_t rxArmLastStage = 255;
     };
 
+    struct RxLivenessDiagnostics {
+        uint32_t snapshotSequence = 0;
+        uint32_t snapshotTimeMs = 0;
+        uint32_t rearmCount = 0;
+        uint32_t rearmLastTimeMs = 0;
+        uint32_t rearmLastDurationUs = 0;
+        uint8_t sampleStatus = 0;
+        uint8_t sampleSource = 0;
+        uint8_t rearmResult = static_cast<uint8_t>(RxLivenessRearmResult::NEVER_PERFORMED);
+        uint8_t rearmBeforeState = 0;
+        uint8_t rearmAfterState = 0;
+        uint32_t rawIrqFlags = 0;
+        uint16_t rawStatus = 0;
+        int16_t irqReadResult = INT16_MIN;
+        uint16_t chipRxPackets = 0;
+        uint16_t chipCrcErrors = 0;
+        uint16_t chipLenErrors = 0;
+        int16_t chipStatsResult = INT16_MIN;
+        int16_t rssiDbm = INT16_MIN;
+        int16_t rssiReadResult = INT16_MIN;
+        uint32_t softwareState = 0;
+        bool rearmPerformed = false;
+    };
+
     struct RunConfig {
         uint32_t runId = 0;
         NodeNum source = 0;
@@ -239,6 +268,8 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     static size_t encodeRadioDiagnosticsReport(uint8_t *bytes, size_t capacity, const Stats &stats,
                                                const RadioDiagnostics &diagnostics, uint8_t pendingTxCount, uint32_t nowMs,
                                                uint32_t radioState);
+    static size_t encodeRxLivenessReport(uint8_t *bytes, size_t capacity, const Stats &stats,
+                                         const RxLivenessDiagnostics &diagnostics, uint8_t pendingTxCount);
     static bool validConfig(const RunConfig &config);
 
   protected:
@@ -282,6 +313,10 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     uint8_t pendingTxCount = 0;
     Diagnostics diagnostics;
     RadioDiagnostics radioDiagnostics;
+    RxLivenessDiagnostics rxLivenessDiagnostics;
+    bool rxLivenessSnapshotRequested = false;
+    bool rxLivenessSnapshotRunMatches = false;
+    bool rxLivenessRearmUsed = false;
 
     bool isLocalControl(const meshtastic_MeshPacket &mp) const;
     bool handleControl(const meshtastic_MeshPacket &mp);
@@ -306,6 +341,8 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     bool collectDiagnostics() const;
     bool collectTxLifecycleDiagnostics() const;
     bool collectRadioDiagnostics() const;
+    bool captureRxLiveness();
+    bool performRxLivenessRearm();
     static void saturatingIncrement(uint32_t &value);
     static void saturatingAdd(uint32_t &value, uint32_t amount);
 };

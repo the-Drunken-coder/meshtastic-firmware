@@ -39,6 +39,9 @@ class W12AdapterHal : public LockingArduinoHal
     bool interruptArmedAtSetTx = false;
     bool rawStatusFailed = false;
     uint8_t rawStatusMode = 0x04;
+    uint16_t rxStatsPackets = 12;
+    uint16_t rxStatsCrcErrors = 3;
+    uint16_t rxStatsLenErrors = 2;
     unsigned rssiReads = 0;
     unsigned injectIrqAtRssiRead = 0;
     uint32_t irqOnRssiRead = 0;
@@ -81,11 +84,23 @@ class W12AdapterHal : public LockingArduinoHal
     void spiTransfer(uint8_t *out, size_t length, uint8_t *in) override
     {
         recording.spiTransfer(out, length, in);
+        if (rxStatsReplyPending) {
+            rxStatsReplyPending = false;
+            in[0] = rxStatsReplyFailed ? 0x02 : 0x04;
+            in[1] = 0x04;
+            in[2] = rxStatsPackets >> 8;
+            in[3] = rxStatsPackets;
+            in[4] = rxStatsCrcErrors >> 8;
+            in[5] = rxStatsCrcErrors;
+            in[6] = rxStatsLenErrors >> 8;
+            in[7] = rxStatsLenErrors;
+            return;
+        }
         if (rssiReplyPending) {
             rssiReplyPending = false;
             if (++rssiReads == injectIrqAtRssiRead)
                 signalReceive(irqOnRssiRead);
-            in[0] = failCommand == RADIOLIB_LR2021_CMD_GET_RSSI_INST ? 0x02 : 0x04;
+            in[0] = rssiReplyFailed ? 0x02 : 0x04;
             in[1] = 0x04;
             in[2] = rssiHalfDbm >> 1;
             in[3] = (rssiHalfDbm & 1) << 7;
@@ -93,8 +108,16 @@ class W12AdapterHal : public LockingArduinoHal
         }
         if (length >= 2) {
             uint16_t command = (uint16_t(out[0]) << 8) | out[1];
-            if (command == RADIOLIB_LR2021_CMD_GET_RSSI_INST)
+            const bool commandFailed = failCommand && command == failCommand &&
+                                       (failCommandOccurrence == 0 || ++failCommandSeen == failCommandOccurrence);
+            if (command == RADIOLIB_LR2021_CMD_GET_FLRC_RX_STATS) {
+                rxStatsReplyPending = true;
+                rxStatsReplyFailed = commandFailed;
+            }
+            if (command == RADIOLIB_LR2021_CMD_GET_RSSI_INST) {
                 rssiReplyPending = true;
+                rssiReplyFailed = commandFailed;
+            }
             if (command == RADIOLIB_LR2021_CMD_CLEAR_IRQ && length >= 6) {
                 uint32_t mask = (uint32_t(out[2]) << 24) | (uint32_t(out[3]) << 16) | (uint32_t(out[4]) << 8) | out[5];
                 irq &= ~mask;
@@ -104,8 +127,7 @@ class W12AdapterHal : public LockingArduinoHal
                 // Complete during the actual command; firmware must observe the IRQ after startTransmit returns.
                 irq = irqOnSetTx;
             }
-            if (failCommand && command == failCommand &&
-                (failCommandOccurrence == 0 || ++failCommandSeen == failCommandOccurrence))
+            if (commandFailed)
                 in[0] = 0x02;
         }
         if (length == 6 && std::all_of(out, out + length, [](uint8_t b) { return b == 0; })) {
@@ -121,7 +143,10 @@ class W12AdapterHal : public LockingArduinoHal
     }
 
   private:
+    bool rxStatsReplyPending = false;
+    bool rxStatsReplyFailed = false;
     bool rssiReplyPending = false;
+    bool rssiReplyFailed = false;
     void (*interruptCallback)() = nullptr;
 };
 
@@ -171,6 +196,7 @@ static void makeW12Adapter();
 class TestableW12AdapterDiagnostics : public W12BenchmarkModule
 {
   public:
+    using W12BenchmarkModule::allocReply;
     using W12BenchmarkModule::handleReceived;
 };
 
@@ -246,6 +272,60 @@ static size_t adapterIrqStatusReadCount()
     }
     return count;
 }
+
+struct AdapterRxLivenessReply {
+    uint8_t bytes[W12BenchmarkModule::RX_LIVENESS_REPORT_BYTES] = {};
+};
+
+static uint16_t adapterRxLivenessU16(const AdapterRxLivenessReply &reply, size_t offset)
+{
+    return uint16_t(reply.bytes[offset]) | (uint16_t(reply.bytes[offset + 1]) << 8);
+}
+
+static uint32_t adapterRxLivenessU32(const AdapterRxLivenessReply &reply, size_t offset)
+{
+    return uint32_t(reply.bytes[offset]) | (uint32_t(reply.bytes[offset + 1]) << 8) | (uint32_t(reply.bytes[offset + 2]) << 16) |
+           (uint32_t(reply.bytes[offset + 3]) << 24);
+}
+
+static int16_t adapterRxLivenessI16(const AdapterRxLivenessReply &reply, size_t offset)
+{
+    return static_cast<int16_t>(adapterRxLivenessU16(reply, offset));
+}
+
+static AdapterRxLivenessReply takeAdapterRxLivenessReply()
+{
+    auto *reply = adapterDiagnostics->allocReply();
+    TEST_ASSERT_NOT_NULL(reply);
+    TEST_ASSERT_EQUAL_UINT(W12BenchmarkModule::RX_LIVENESS_REPORT_BYTES, reply->decoded.payload.size);
+    AdapterRxLivenessReply result;
+    memcpy(result.bytes, reply->decoded.payload.bytes, sizeof(result.bytes));
+    packetPool.release(reply);
+    return result;
+}
+
+static ProcessMessage sendAdapterDiagnosticData(uint32_t sequence = 0)
+{
+    meshtastic_MeshPacket data = meshtastic_MeshPacket_init_zero;
+    data.from = adapterDiagnosticSource;
+    data.to = adapterDiagnosticDestination;
+    data.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA;
+    data.pki_encrypted = true;
+    data.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    data.decoded.portnum = meshtastic_PortNum_PRIVATE_APP;
+    const auto run = adapterDiagnosticRun();
+    data.decoded.payload.size =
+        W12BenchmarkModule::encodeData(data.decoded.payload.bytes, sizeof(data.decoded.payload.bytes), run, sequence);
+    TEST_ASSERT_EQUAL_UINT(W12BenchmarkModule::DEFAULT_SIZE, data.decoded.payload.size);
+    return adapterDiagnostics->handleReceived(data);
+}
+
+static void prepareAdapterDiagnosticReceiverWindow()
+{
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE), static_cast<int>(sendAdapterDiagnosticData()));
+}
+
+static meshtastic_MeshPacket *makeAdapterTransmission();
 #endif
 
 static AirTime *savedAdapterAirTime;
@@ -329,6 +409,151 @@ static void deleteW12Adapter()
 // W12BenchmarkModule's radio page must reflect the adapter's real arm stages and RadioLib return
 // codes. These cases guard against diagnostic counters drifting away from standby/start/IRQ-map
 // failures, or the poll page requiring a second SPI read for the chip mode/status bytes.
+static void test_w12_adapter_rx_liveness_snapshot_reads_stats_irq_and_rssi_once()
+{
+    makeW12AdapterWithDiagnostics();
+    prepareAdapterDiagnosticReceiverWindow();
+    adapterHal->irq = 0x12345678;
+    adapterHal->rawStatusMode = 0x04;
+    adapterHal->rxStatsPackets = 0x1234;
+    adapterHal->rxStatsCrcErrors = 0x0023;
+    adapterHal->rxStatsLenErrors = 0x0045;
+    adapterHal->rssiHalfDbm = 220;
+    adapterHal->recording.transactions.clear();
+    TEST_ASSERT_TRUE(adapter->receiving());
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterDiagnosticControl(W12BenchmarkModule::Op::SNAPSHOT_RX_LIVENESS)));
+    const auto reply = takeAdapterRxLivenessReply();
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(W12BenchmarkModule::Kind::RX_LIVENESS), reply.bytes[3]);
+    TEST_ASSERT_EQUAL_UINT8(35, reply.bytes[20]);
+    TEST_ASSERT_EQUAL_UINT32(1, adapterRxLivenessU32(reply, 24));
+    TEST_ASSERT_EQUAL_UINT8(39, reply.bytes[32]);
+    TEST_ASSERT_EQUAL_UINT8(1, reply.bytes[33]);
+    TEST_ASSERT_EQUAL_UINT32(0x12345678, adapterRxLivenessU32(reply, 52));
+    TEST_ASSERT_EQUAL_UINT16(0x0404, adapterRxLivenessU16(reply, 56));
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_NONE, adapterRxLivenessI16(reply, 58));
+    TEST_ASSERT_EQUAL_UINT16(0x1234, adapterRxLivenessU16(reply, 60));
+    TEST_ASSERT_EQUAL_UINT16(0x0023, adapterRxLivenessU16(reply, 62));
+    TEST_ASSERT_EQUAL_UINT16(0x0045, adapterRxLivenessU16(reply, 64));
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_NONE, adapterRxLivenessI16(reply, 66));
+    TEST_ASSERT_EQUAL_INT16(-110, adapterRxLivenessI16(reply, 68));
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_NONE, adapterRxLivenessI16(reply, 70));
+    TEST_ASSERT_EQUAL_UINT32(0x15, adapterRxLivenessU32(reply, 72));
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_GET_FLRC_RX_STATS)));
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_GET_RSSI_INST)));
+    TEST_ASSERT_EQUAL_UINT32(1, adapterIrqStatusReadCount());
+    TEST_ASSERT_EQUAL_UINT32(5, adapterHal->recording.transactions.size());
+}
+
+static void test_w12_adapter_rx_liveness_snapshot_reports_chip_stats_failure()
+{
+    makeW12AdapterWithDiagnostics();
+    prepareAdapterDiagnosticReceiverWindow();
+    adapterHal->failCommand = RADIOLIB_LR2021_CMD_GET_FLRC_RX_STATS;
+    adapterHal->recording.transactions.clear();
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterDiagnosticControl(W12BenchmarkModule::Op::SNAPSHOT_RX_LIVENESS)));
+    const auto reply = takeAdapterRxLivenessReply();
+    TEST_ASSERT_EQUAL_UINT8(37, reply.bytes[32]);
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_SPI_CMD_INVALID, adapterRxLivenessI16(reply, 66));
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_NONE, adapterRxLivenessI16(reply, 58));
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_NONE, adapterRxLivenessI16(reply, 70));
+    TEST_ASSERT_EQUAL_UINT32(5, adapterHal->recording.transactions.size());
+}
+
+static void test_w12_adapter_rx_liveness_snapshot_reports_irq_status_failure()
+{
+    makeW12AdapterWithDiagnostics();
+    prepareAdapterDiagnosticReceiverWindow();
+    adapterHal->rawStatusFailed = true;
+    adapterHal->recording.transactions.clear();
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterDiagnosticControl(W12BenchmarkModule::Op::SNAPSHOT_RX_LIVENESS)));
+    const auto reply = takeAdapterRxLivenessReply();
+    TEST_ASSERT_EQUAL_UINT8(38, reply.bytes[32]);
+    TEST_ASSERT_EQUAL_UINT32(0, adapterRxLivenessU32(reply, 52));
+    TEST_ASSERT_EQUAL_UINT16(0, adapterRxLivenessU16(reply, 56));
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_SPI_CMD_INVALID, adapterRxLivenessI16(reply, 58));
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_NONE, adapterRxLivenessI16(reply, 66));
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_NONE, adapterRxLivenessI16(reply, 70));
+}
+
+static void test_w12_adapter_rx_liveness_snapshot_reports_rssi_failure()
+{
+    makeW12AdapterWithDiagnostics();
+    prepareAdapterDiagnosticReceiverWindow();
+    adapterHal->failCommand = RADIOLIB_LR2021_CMD_GET_RSSI_INST;
+    adapterHal->recording.transactions.clear();
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterDiagnosticControl(W12BenchmarkModule::Op::SNAPSHOT_RX_LIVENESS)));
+    const auto reply = takeAdapterRxLivenessReply();
+    TEST_ASSERT_EQUAL_UINT8(35, reply.bytes[32]);
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_NONE, adapterRxLivenessI16(reply, 58));
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_NONE, adapterRxLivenessI16(reply, 66));
+    TEST_ASSERT_EQUAL_INT16(INT16_MIN, adapterRxLivenessI16(reply, 68));
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_SPI_CMD_INVALID, adapterRxLivenessI16(reply, 70));
+}
+
+static void test_w12_adapter_rx_liveness_rearms_once_and_guards_active_or_queued_tx()
+{
+    makeW12AdapterWithDiagnostics();
+    prepareAdapterDiagnosticReceiverWindow();
+    adapter->stop();
+    auto *activePacket = makeAdapterTransmission();
+    TEST_ASSERT_EQUAL_UINT32(10 + sizeof(PacketHeader), adapter->takeTransmission(activePacket));
+    TEST_ASSERT_TRUE(adapter->isSending());
+    adapterHal->recording.transactions.clear();
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendAdapterDiagnosticControl(W12BenchmarkModule::Op::REARM_RX_LIVENESS)));
+    TEST_ASSERT_NULL(adapterDiagnostics->allocReply());
+    TEST_ASSERT_TRUE(adapter->isSending());
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.transactions.size());
+    adapter->stop();
+
+    TEST_ASSERT_TRUE(adapter->queueTransmission(makeAdapterTransmission()));
+    adapterHal->recording.transactions.clear();
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendAdapterDiagnosticControl(W12BenchmarkModule::Op::REARM_RX_LIVENESS)));
+    TEST_ASSERT_NULL(adapterDiagnostics->allocReply());
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.transactions.size());
+    adapter->releaseQueuedTransmissions();
+
+    adapter->armReceive();
+    adapterHal->recording.transactions.clear();
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterDiagnosticControl(W12BenchmarkModule::Op::REARM_RX_LIVENESS)));
+    const auto reply = takeAdapterRxLivenessReply();
+    TEST_ASSERT_EQUAL_UINT32(1, adapterRxLivenessU32(reply, 34));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(W12BenchmarkModule::RxLivenessRearmResult::SOFTWARE_ARMED), reply.bytes[38]);
+    TEST_ASSERT_EQUAL_UINT8(0x15, reply.bytes[39]);
+    TEST_ASSERT_EQUAL_UINT8(0x15, reply.bytes[40]);
+    TEST_ASSERT_TRUE(reply.bytes[32] & 0x08);
+    TEST_ASSERT_TRUE(reply.bytes[32] & 0x10);
+
+    adapterHal->recording.transactions.clear();
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendAdapterDiagnosticControl(W12BenchmarkModule::Op::REARM_RX_LIVENESS)));
+    TEST_ASSERT_NULL(adapterDiagnostics->allocReply());
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.transactions.size());
+}
+
+static void test_w12_adapter_rx_liveness_does_not_add_stats_or_rssi_reads_to_receive_isr()
+{
+    makeW12AdapterWithDiagnostics();
+    adapterHal->recording.transactions.clear();
+    adapterHal->irq = 0;
+    adapter->receiveInterrupt();
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_GET_FLRC_RX_STATS)));
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_GET_RSSI_INST)));
+    // The ISR reads IRQ status once. The zero-IRQ result then clears the flags, and native
+    // RadioLib's paranoid command verification performs a second existing status transaction.
+    TEST_ASSERT_EQUAL_UINT32(2, adapterIrqStatusReadCount());
+}
+
 static void test_w12_adapter_radio_diagnostics_counts_successful_arm_stages()
 {
     makeW12AdapterWithDiagnostics();
@@ -969,6 +1194,12 @@ static void runW12AdapterTests()
     RUN_TEST(test_w12_adapter_failed_observation_defers_fresh_recovery_until_rx_done_is_delivered);
     RUN_TEST(test_w12_adapter_failed_observation_preserves_active_reception_and_later_completion);
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    RUN_TEST(test_w12_adapter_rx_liveness_snapshot_reads_stats_irq_and_rssi_once);
+    RUN_TEST(test_w12_adapter_rx_liveness_snapshot_reports_chip_stats_failure);
+    RUN_TEST(test_w12_adapter_rx_liveness_snapshot_reports_irq_status_failure);
+    RUN_TEST(test_w12_adapter_rx_liveness_snapshot_reports_rssi_failure);
+    RUN_TEST(test_w12_adapter_rx_liveness_rearms_once_and_guards_active_or_queued_tx);
+    RUN_TEST(test_w12_adapter_rx_liveness_does_not_add_stats_or_rssi_reads_to_receive_isr);
     RUN_TEST(test_w12_adapter_radio_diagnostics_counts_successful_arm_stages);
     RUN_TEST(test_w12_adapter_radio_diagnostics_counts_standby_failure_and_result);
     RUN_TEST(test_w12_adapter_radio_diagnostics_counts_start_failure_retry_and_result);

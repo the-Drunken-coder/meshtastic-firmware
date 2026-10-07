@@ -24,7 +24,8 @@ bool validOperation(W12BenchmarkModule::Op op)
 {
     return op == W12BenchmarkModule::Op::RESET || op == W12BenchmarkModule::Op::START || op == W12BenchmarkModule::Op::STOP ||
            op == W12BenchmarkModule::Op::SNAPSHOT || op == W12BenchmarkModule::Op::SNAPSHOT_DIAGNOSTICS ||
-           op == W12BenchmarkModule::Op::SNAPSHOT_RADIO_DIAGNOSTICS;
+           op == W12BenchmarkModule::Op::SNAPSHOT_RADIO_DIAGNOSTICS || op == W12BenchmarkModule::Op::SNAPSHOT_RX_LIVENESS ||
+           op == W12BenchmarkModule::Op::REARM_RX_LIVENESS;
 }
 
 uint32_t diagnosticAge(bool present, uint32_t timestamp, uint32_t nowMs)
@@ -332,6 +333,47 @@ size_t W12BenchmarkModule::encodeRadioDiagnosticsReport(uint8_t *bytes, size_t c
     put32(bytes + 224, d.pollChipRxCount);
     put32(bytes + 228, d.pollChipNonRxCount);
     return RADIO_DIAGNOSTIC_REPORT_BYTES;
+}
+
+size_t W12BenchmarkModule::encodeRxLivenessReport(uint8_t *bytes, size_t capacity, const Stats &value,
+                                                  const RxLivenessDiagnostics &d, uint8_t pendingTxCount)
+{
+    if (!bytes || capacity < RX_LIVENESS_REPORT_BYTES)
+        return 0;
+
+    memset(bytes, 0, RX_LIVENESS_REPORT_BYTES);
+    put16(bytes, MAGIC);
+    bytes[2] = VERSION;
+    bytes[3] = static_cast<uint8_t>(Kind::RX_LIVENESS);
+    put32(bytes + 4, value.config.runId);
+    put32(bytes + 8, value.config.source);
+    put32(bytes + 12, value.config.destination);
+    put32(bytes + 16, value.elapsedMs);
+    bytes[20] = static_cast<uint8_t>((value.prepared ? 1 : 0) | (value.running ? 2 : 0) | (value.complete ? 4 : 0) |
+                                     (pendingTxCount ? 16 : 0) | ((value.running || pendingTxCount) ? 32 : 0));
+    bytes[21] = pendingTxCount;
+
+    put32(bytes + 24, d.snapshotSequence);
+    put32(bytes + 28, d.snapshotTimeMs);
+    bytes[32] = d.sampleStatus;
+    bytes[33] = d.sampleSource;
+    put32(bytes + 34, d.rearmCount);
+    bytes[38] = d.rearmResult;
+    bytes[39] = d.rearmBeforeState;
+    bytes[40] = d.rearmAfterState;
+    put32(bytes + 44, d.rearmLastTimeMs);
+    put32(bytes + 48, d.rearmLastDurationUs);
+    put32(bytes + 52, d.rawIrqFlags);
+    put16(bytes + 56, d.rawStatus);
+    put16(bytes + 58, static_cast<uint16_t>(d.irqReadResult));
+    put16(bytes + 60, d.chipRxPackets);
+    put16(bytes + 62, d.chipCrcErrors);
+    put16(bytes + 64, d.chipLenErrors);
+    put16(bytes + 66, static_cast<uint16_t>(d.chipStatsResult));
+    put16(bytes + 68, static_cast<uint16_t>(d.rssiDbm));
+    put16(bytes + 70, static_cast<uint16_t>(d.rssiReadResult));
+    put32(bytes + 72, d.softwareState);
+    return RX_LIVENESS_REPORT_BYTES;
 }
 
 bool W12BenchmarkModule::sameConfig(const RunConfig &a, const RunConfig &b)
@@ -767,6 +809,78 @@ bool W12BenchmarkModule::collectRadioDiagnostics() const
     return stats.prepared && (stats.running || pendingTxCount != 0);
 }
 
+bool W12BenchmarkModule::captureRxLiveness()
+{
+    rxLivenessDiagnostics.snapshotTimeMs = Time::getMillis();
+    rxLivenessDiagnostics.sampleStatus = 0;
+    rxLivenessDiagnostics.sampleSource = 0;
+    rxLivenessDiagnostics.rawIrqFlags = 0;
+    rxLivenessDiagnostics.rawStatus = 0;
+    rxLivenessDiagnostics.irqReadResult = INT16_MIN;
+    rxLivenessDiagnostics.chipRxPackets = 0;
+    rxLivenessDiagnostics.chipCrcErrors = 0;
+    rxLivenessDiagnostics.chipLenErrors = 0;
+    rxLivenessDiagnostics.chipStatsResult = INT16_MIN;
+    rxLivenessDiagnostics.rssiDbm = INT16_MIN;
+    rxLivenessDiagnostics.rssiReadResult = INT16_MIN;
+    rxLivenessDiagnostics.softwareState = 0;
+
+    RadioLibInterface *radio = RadioLibInterface::instance;
+    if (!radio)
+        return false;
+
+    rxLivenessDiagnostics.softwareState = radio->getW12DiagnosticRadioState();
+    W12RxLivenessSample sample;
+    if (!radio->readW12RxLiveness(sample))
+        return false;
+
+    rxLivenessDiagnostics.sampleSource = 1;
+    rxLivenessDiagnostics.sampleStatus |= 32;
+    rxLivenessDiagnostics.softwareState = sample.softwareState;
+    rxLivenessDiagnostics.rawIrqFlags = sample.rawIrqFlags;
+    rxLivenessDiagnostics.rawStatus = sample.rawStatus;
+    rxLivenessDiagnostics.irqReadResult = sample.irqReadResult;
+    rxLivenessDiagnostics.chipRxPackets = sample.chipRxPackets;
+    rxLivenessDiagnostics.chipCrcErrors = sample.chipCrcErrors;
+    rxLivenessDiagnostics.chipLenErrors = sample.chipLenErrors;
+    rxLivenessDiagnostics.chipStatsResult = sample.chipStatsResult;
+    rxLivenessDiagnostics.rssiDbm = sample.rssiDbm;
+    rxLivenessDiagnostics.rssiReadResult = sample.rssiReadResult;
+    if (sample.irqReadResult == RADIOLIB_ERR_NONE)
+        rxLivenessDiagnostics.sampleStatus |= 1;
+    if (sample.chipStatsResult == RADIOLIB_ERR_NONE)
+        rxLivenessDiagnostics.sampleStatus |= 2;
+    if (sample.rssiReadResult == RADIOLIB_ERR_NONE)
+        rxLivenessDiagnostics.sampleStatus |= 4;
+    return true;
+}
+
+bool W12BenchmarkModule::performRxLivenessRearm()
+{
+    RadioLibInterface *radio = RadioLibInterface::instance;
+    if (!radio)
+        return false;
+
+    W12RxRearmResult result;
+    if (!radio->performW12RxRearm(result))
+        return false;
+
+    rxLivenessRearmUsed = true;
+    saturatingIncrement(rxLivenessDiagnostics.rearmCount);
+    rxLivenessDiagnostics.rearmLastTimeMs = Time::getMillis();
+    rxLivenessDiagnostics.rearmLastDurationUs = result.durationUs;
+    rxLivenessDiagnostics.rearmBeforeState = static_cast<uint8_t>(result.beforeState);
+    rxLivenessDiagnostics.rearmAfterState = static_cast<uint8_t>(result.afterState);
+    rxLivenessDiagnostics.rearmResult = static_cast<uint8_t>(result.softwareArmed ? RxLivenessRearmResult::SOFTWARE_ARMED
+                                                                                  : RxLivenessRearmResult::SOFTWARE_NOT_ARMED);
+    rxLivenessDiagnostics.rearmPerformed = true;
+    captureRxLiveness();
+    rxLivenessDiagnostics.sampleStatus |= 8;
+    if (result.softwareArmed)
+        rxLivenessDiagnostics.sampleStatus |= 16;
+    return true;
+}
+
 void W12BenchmarkModule::producerBlocked(uint32_t &reasonCounter)
 {
     if (!collectDiagnostics())
@@ -809,6 +923,10 @@ void W12BenchmarkModule::resetRun(const RunConfig &config)
     radioDiagnosticWindowStarted = false;
     diagnostics = Diagnostics{};
     radioDiagnostics = RadioDiagnostics{};
+    rxLivenessDiagnostics = RxLivenessDiagnostics{};
+    rxLivenessSnapshotRequested = false;
+    rxLivenessSnapshotRunMatches = false;
+    rxLivenessRearmUsed = false;
     for (auto &slot : txSlots)
         slot = TxSlot{};
     pendingTxCount = 0;
@@ -935,6 +1053,29 @@ bool W12BenchmarkModule::handleControl(const meshtastic_MeshPacket &mp)
         radioDiagnosticSnapshotRequested = true;
         radioDiagnosticSnapshotRunMatches = true;
         return true;
+    case Op::SNAPSHOT_RX_LIVENESS:
+        if (!stats.running && !stats.complete)
+            return false;
+        if (stats.running && receiverWindowStarted && Throttle::hasElapsed(startedAtMs, activeConfig.durationMs))
+            finishRun();
+        captureRxLiveness();
+        rxLivenessSnapshotRequested = true;
+        rxLivenessSnapshotRunMatches = true;
+        return true;
+    case Op::REARM_RX_LIVENESS: {
+        if (!stats.running || nodeDB->getNodeNum() != activeConfig.destination || !receiverWindowStarted || rxLivenessRearmUsed)
+            return false;
+        if (Throttle::hasElapsed(startedAtMs, activeConfig.durationMs))
+            return false;
+        RadioLibInterface *radio = RadioLibInterface::instance;
+        if (!radio || radio->isSending() || radio->packetsInTxQueue() != 0)
+            return false;
+        if (!performRxLivenessRearm())
+            return false;
+        rxLivenessSnapshotRequested = true;
+        rxLivenessSnapshotRunMatches = true;
+        return true;
+    }
     case Op::RESET:
         break;
     }
@@ -1023,7 +1164,8 @@ meshtastic_MeshPacket *W12BenchmarkModule::allocReply()
     const bool reportRequested = snapshotRequested && snapshotRunMatches;
     const bool diagnosticsRequested = diagnosticSnapshotRequested && diagnosticSnapshotRunMatches;
     const bool radioDiagnosticsRequested = radioDiagnosticSnapshotRequested && radioDiagnosticSnapshotRunMatches;
-    if (!reportRequested && !diagnosticsRequested && !radioDiagnosticsRequested)
+    const bool rxLivenessRequested = rxLivenessSnapshotRequested && rxLivenessSnapshotRunMatches;
+    if (!reportRequested && !diagnosticsRequested && !radioDiagnosticsRequested && !rxLivenessRequested)
         return nullptr;
 
     meshtastic_MeshPacket *reply = router->allocForSending();
@@ -1034,15 +1176,21 @@ meshtastic_MeshPacket *W12BenchmarkModule::allocReply()
     reply->want_ack = false;
     reply->decoded.portnum = meshtastic_PortNum_PRIVATE_APP;
     const Stats currentStats = getStats();
-    reply->decoded.payload.size =
-        radioDiagnosticsRequested
-            ? encodeRadioDiagnosticsReport(reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes), currentStats,
-                                           radioDiagnostics, pendingTxCount, Time::getMillis(),
-                                           RadioLibInterface::instance ? RadioLibInterface::instance->getW12DiagnosticRadioState()
-                                                                       : 0)
-        : diagnosticsRequested ? encodeDiagnosticsReport(reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes),
-                                                         currentStats, diagnostics, pendingTxCount)
-                               : encodeReport(reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes), currentStats);
+    if (rxLivenessRequested) {
+        saturatingIncrement(rxLivenessDiagnostics.snapshotSequence);
+        reply->decoded.payload.size = encodeRxLivenessReport(reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes),
+                                                             currentStats, rxLivenessDiagnostics, pendingTxCount);
+    } else if (radioDiagnosticsRequested) {
+        reply->decoded.payload.size = encodeRadioDiagnosticsReport(
+            reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes), currentStats, radioDiagnostics, pendingTxCount,
+            Time::getMillis(), RadioLibInterface::instance ? RadioLibInterface::instance->getW12DiagnosticRadioState() : 0);
+    } else if (diagnosticsRequested) {
+        reply->decoded.payload.size = encodeDiagnosticsReport(reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes),
+                                                              currentStats, diagnostics, pendingTxCount);
+    } else {
+        reply->decoded.payload.size =
+            encodeReport(reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes), currentStats);
+    }
     if (reply->decoded.payload.size == 0) {
         packetPool.release(reply);
         return nullptr;
@@ -1053,6 +1201,8 @@ meshtastic_MeshPacket *W12BenchmarkModule::allocReply()
     diagnosticSnapshotRunMatches = false;
     radioDiagnosticSnapshotRequested = false;
     radioDiagnosticSnapshotRunMatches = false;
+    rxLivenessSnapshotRequested = false;
+    rxLivenessSnapshotRunMatches = false;
     return reply;
 }
 
