@@ -1204,6 +1204,87 @@ void test_pre_send_attribution_page_is_fixed_and_local_without_radio_sample()
     packetPool.release(reply);
 }
 
+void test_phase_timing_extension_is_bounded_and_default_off()
+{
+    W12BenchmarkModule::Stats stats;
+    stats.config = runConfig();
+    stats.prepared = true;
+    stats.complete = true;
+    W12BenchmarkModule::PreSendAttributionDiagnostics diagnostics;
+    diagnostics.phaseTiming.available = true;
+    diagnostics.phaseTiming.producerSendToMeshUs = {3, 90, 40};
+    diagnostics.phaseTiming.burstPrepareUs = {2, 12, 8};
+    diagnostics.phaseTiming.burstGuardLateMs = {1, 4, 4};
+    diagnostics.phaseTiming.rxGateDecodeUs = {4, 100, 30};
+    diagnostics.phaseTiming.failedTxCount = 1;
+    diagnostics.phaseTiming.failedTxLastPacketId = 0x1234;
+    diagnostics.phaseTiming.failedTxLastSequence = 37;
+    diagnostics.phaseTiming.failedTxLastAtMs = 99;
+    diagnostics.phaseTiming.failedTxLastRadioResult = INT16_MIN;
+
+    uint8_t wire[W12BenchmarkModule::PRE_SEND_ATTRIBUTION_REPORT_BYTES] = {};
+    TEST_ASSERT_EQUAL_UINT(W12BenchmarkModule::PRE_SEND_ATTRIBUTION_REPORT_BYTES,
+                           W12BenchmarkModule::encodePreSendAttributionReport(wire, sizeof(wire), stats, diagnostics, 0));
+    TEST_ASSERT_EQUAL_UINT8(0, wire[232]);
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    TEST_ASSERT_EQUAL_UINT8(1, wire[178]);
+    TEST_ASSERT_EQUAL_UINT32(3, read32(wire, 130));
+    TEST_ASSERT_EQUAL_UINT32(90, read32(wire, 134));
+    TEST_ASSERT_EQUAL_UINT32(40, read32(wire, 138));
+    TEST_ASSERT_EQUAL_UINT32(2, read32(wire, 142));
+    TEST_ASSERT_EQUAL_UINT32(12, read32(wire, 146));
+    TEST_ASSERT_EQUAL_UINT32(8, read32(wire, 150));
+    TEST_ASSERT_EQUAL_UINT32(1, read32(wire, 154));
+    TEST_ASSERT_EQUAL_UINT32(4, read32(wire, 158));
+    TEST_ASSERT_EQUAL_UINT32(4, read32(wire, 162));
+    TEST_ASSERT_EQUAL_UINT32(4, read32(wire, 166));
+    TEST_ASSERT_EQUAL_UINT32(100, read32(wire, 170));
+    TEST_ASSERT_EQUAL_UINT32(30, read32(wire, 174));
+    TEST_ASSERT_EQUAL_UINT32(1, read32(wire, 179));
+    TEST_ASSERT_EQUAL_UINT32(0x1234, read32(wire, 183));
+    TEST_ASSERT_EQUAL_UINT32(37, read32(wire, 187));
+    TEST_ASSERT_EQUAL_UINT32(99, read32(wire, 191));
+#else
+    for (size_t offset = 130; offset <= 197; offset++)
+        TEST_ASSERT_EQUAL_UINT8(0, wire[offset]);
+#endif
+}
+
+void test_phase_timing_aggregates_wrap_deadline_and_saturate()
+{
+    const auto run = runConfig();
+    myNodeInfo.my_node_num = run.source;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.source)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::START, run.source)));
+
+    testModule->onProducerSendToMeshDuration(UINT32_MAX);
+    testModule->onProducerSendToMeshDuration(1);
+    testModule->onW12BurstPrepareDuration(3, true);
+    testModule->onW12BurstPrepareDuration(5, false);
+    // The due time is just before the uint32 millisecond clock wraps. Five milliseconds of
+    // signed-deadline lateness must still be attributed to this live event.
+    testModule->onW12BurstGuardLateness(2, UINT32_MAX - 2);
+    testModule->onW12BurstGuardLateness(1, 2);
+    const auto diagnostics = testModule->getPreSendAttributionDiagnostics();
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    TEST_ASSERT_TRUE(diagnostics.phaseTiming.available);
+    TEST_ASSERT_EQUAL_UINT32(2, diagnostics.phaseTiming.producerSendToMeshUs.count);
+    TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, diagnostics.phaseTiming.producerSendToMeshUs.sum);
+    TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, diagnostics.phaseTiming.producerSendToMeshUs.max);
+    TEST_ASSERT_EQUAL_UINT32(2, diagnostics.phaseTiming.burstPrepareUs.count);
+    TEST_ASSERT_EQUAL_UINT32(8, diagnostics.phaseTiming.burstPrepareUs.sum);
+    TEST_ASSERT_EQUAL_UINT32(5, diagnostics.phaseTiming.burstPrepareUs.max);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.phaseTiming.burstPrepareSuccesses);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.phaseTiming.burstPrepareFailures);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.phaseTiming.burstGuardLateMs.count);
+    TEST_ASSERT_EQUAL_UINT32(5, diagnostics.phaseTiming.burstGuardLateMs.sum);
+#else
+    TEST_ASSERT_FALSE(diagnostics.phaseTiming.available);
+#endif
+}
+
 void setUp()
 {
     resetTestState();
@@ -1245,6 +1326,8 @@ void setup()
     RUN_TEST(test_diagnostic_cca_events_are_aggregated_once_and_timing_uses_existing_slots);
     RUN_TEST(test_pre_send_attribution_tracks_only_valid_timer_dispatches);
     RUN_TEST(test_pre_send_attribution_page_is_fixed_and_local_without_radio_sample);
+    RUN_TEST(test_phase_timing_extension_is_bounded_and_default_off);
+    RUN_TEST(test_phase_timing_aggregates_wrap_deadline_and_saturate);
     RUN_TEST(test_diagnostic_snapshot_accepts_zero_first_receiver_window);
     RUN_TEST(test_radio_diagnostic_page_tracks_authorization_stages_buckets_and_reset);
     RUN_TEST(test_radio_diagnostic_tail_keeps_rx_done_after_completion_with_pending_tx);

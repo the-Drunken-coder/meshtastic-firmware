@@ -10,6 +10,10 @@
 #define MESHTASTIC_W12_BENCHMARK_TX_BURST 0
 #endif
 
+#ifndef MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+#define MESHTASTIC_W12_BENCHMARK_PHASE_TIMING 0
+#endif
+
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
 
 #include "concurrency/OSThread.h"
@@ -85,6 +89,14 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     enum class RxArmStage : uint8_t { NONE = 0, STANDBY = 1, RX_START = 2, IRQ_MAP = 3, FIFO_CLEAR = 4 };
     enum class RadioPhase : uint8_t { RX_START = 0, CHANNEL_ACTIVE = 1, START_SEND = 2 };
     enum class RxLivenessRearmResult : uint8_t { NEVER_PERFORMED = 0, SOFTWARE_ARMED = 1, SOFTWARE_NOT_ARMED = 2 };
+    enum class TxFailureStage : uint8_t {
+        UNKNOWN = 0,
+        FORCED_COMPLETE_FALSE = 1,
+        PREFLIGHT = 2,
+        START_TRANSMIT = 3,
+        TX_IRQ = 4,
+        CLEAR_TX_IRQ = 5,
+    };
 
     struct Diagnostics {
         uint32_t txDelayScheduledAttempts = 0;
@@ -205,6 +217,31 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     };
 
     struct PreSendAttributionDiagnostics {
+        struct PhaseTimingMetric {
+            uint32_t count = 0;
+            uint32_t sum = 0;
+            uint32_t max = 0;
+        };
+
+        struct PhaseTimingDiagnostics {
+            bool available = false;
+            PhaseTimingMetric producerSendToMeshUs;
+            PhaseTimingMetric burstPrepareUs;
+            PhaseTimingMetric burstGuardLateMs;
+            PhaseTimingMetric rxGateDecodeUs;
+            // The fixed wire extension carries the aggregate duration triplet. Keep the
+            // prepare result split in the board-local diagnostic object so a test can prove
+            // both outcomes without spending bytes in the reserved tail.
+            uint32_t burstPrepareSuccesses = 0;
+            uint32_t burstPrepareFailures = 0;
+            uint32_t failedTxCount = 0;
+            PacketId failedTxLastPacketId = 0;
+            uint32_t failedTxLastSequence = 0;
+            uint32_t failedTxLastAtMs = 0;
+            uint8_t failedTxLastStage = static_cast<uint8_t>(TxFailureStage::UNKNOWN);
+            int16_t failedTxLastRadioResult = 0;
+        } phaseTiming;
+
         uint32_t busyTxDeferrals = 0;
         uint32_t busyRxActiveDeferrals = 0;
         uint32_t busyRxIrqReadFailureDeferrals = 0;
@@ -294,6 +331,11 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     void onW12BurstArmed(bool startsBurst);
     void onW12BurstFrame();
     void onW12BurstAborted();
+    void onProducerSendToMeshDuration(uint32_t elapsedUs);
+    void onW12BurstPrepareDuration(uint32_t elapsedUs, bool success);
+    void onW12BurstGuardLateness(uint32_t nowMs, uint32_t dueAtMs);
+    void onRxGateDecodeDuration(uint32_t elapsedUs);
+    void onTxFailureObserved(const meshtastic_MeshPacket *packet, TxFailureStage stage, int16_t radioResult);
     void onPreCanSendDeferred(const meshtastic_MeshPacket *packet);
     void onPreCanSendDeferred(const meshtastic_MeshPacket *packet, PreSendBusyReason reason);
     void onCcaDecision(CcaReason reason);
@@ -357,6 +399,10 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
         bool started = false;
         uint32_t queuedAtMs = 0;
         uint32_t startedAtMs = 0;
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+        TxFailureStage failureStage = TxFailureStage::UNKNOWN;
+        int16_t failureRadioResult = INT16_MIN;
+#endif
     };
 
     RunConfig activeConfig;
@@ -416,6 +462,7 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     bool performRxLivenessRearm();
     static void saturatingIncrement(uint32_t &value);
     static void saturatingAdd(uint32_t &value, uint32_t amount);
+    static void recordPhaseTiming(PreSendAttributionDiagnostics::PhaseTimingMetric &metric, uint32_t sample);
 };
 
 extern W12BenchmarkModule *w12BenchmarkModule;

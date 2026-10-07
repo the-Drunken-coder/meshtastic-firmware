@@ -526,6 +526,11 @@ bool RadioLibInterface::armW12BurstAfterSuccess(bool currentPacketEligible)
         return false;
     }
 
+    // Capture the deadline that notifyLater actually accepted. _cached_next_run is the protected
+    // request deadline set by notifyLater. OSThread::run later rebases the actual deadline on
+    // callback return, so this diagnostic includes that callback tail and owner dispatch delay.
+    // It is not lateness relative to the final scheduler deadline. Rejection creates no sample,
+    // and stale callbacks are filtered by timerPending in onNotify().
     const bool scheduled = notifyLater(W12_BURST_GUARD_MS, W12_BURST_DELAY_COMPLETED, false);
     if (!scheduled) {
         if (w12BenchmarkModule)
@@ -539,6 +544,9 @@ bool RadioLibInterface::armW12BurstAfterSuccess(bool currentPacketEligible)
     w12Burst.completedFrames = completedFrames;
     w12Burst.nextPacket = next;
     w12Burst.nextPacketId = next->id;
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    w12Burst.guardDueAtMs = static_cast<uint32_t>(_cached_next_run);
+#endif
     // A newly accepted guarded event proves that no displaced stale event is
     // occupying the notification slot, so an old abort/reconfigure resume
     // marker cannot affect this fresh sequence.
@@ -670,6 +678,12 @@ void RadioLibInterface::onNotify(uint32_t notification)
             break;
         }
 
+        // Only a live dedicated callback has a valid due time. Stale callbacks return above and
+        // never enter this measurement path.
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+        if (w12BenchmarkModule)
+            w12BenchmarkModule->onW12BurstGuardLateness(Time::getMillis(), w12Burst.guardDueAtMs);
+#endif
         w12Burst.timerPending = false;
         meshtastic_MeshPacket *next = txQueue.getFront();
         const bool samePacket = next && next == w12Burst.nextPacket && next->id == w12Burst.nextPacketId;
@@ -701,7 +715,19 @@ void RadioLibInterface::onNotify(uint32_t notification)
             break;
         }
 
-        if (!prepareW12BurstSend()) {
+        bool prepared;
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+        if (w12BenchmarkModule) {
+            const uint32_t prepareStartedAtUs = micros();
+            prepared = prepareW12BurstSend();
+            w12BenchmarkModule->onW12BurstPrepareDuration(static_cast<uint32_t>(micros() - prepareStartedAtUs), prepared);
+        } else {
+            prepared = prepareW12BurstSend();
+        }
+#else
+        prepared = prepareW12BurstSend();
+#endif
+        if (!prepared) {
             finishW12BurstToNormal();
             break;
         }
@@ -930,6 +956,10 @@ bool RadioLibInterface::handleTransmitInterrupt()
     bool success = false;
     if (sendingPacket) {
         success = validTransmitIrq();
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
+        if (!success && w12BenchmarkModule)
+            w12BenchmarkModule->onTxFailureObserved(sendingPacket, W12BenchmarkModule::TxFailureStage::TX_IRQ, INT16_MIN);
+#endif
         completeSending(success);
     }
     powerMon->clearState(meshtastic_PowerMon_State_Lora_TXOn); // But our transmitter is definitely off now
@@ -1247,6 +1277,10 @@ bool RadioLibInterface::startSend(meshtastic_MeshPacket *txp)
     if (disabled || !RadioMode::canTransmit()) {
         LOG_WARN("Drop Tx packet: radio Tx disabled");
         // Never reaches completeSending(), so any per-packet radio state has to be released here.
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
+        if (w12BenchmarkModule)
+            w12BenchmarkModule->onTxFailureObserved(txp, W12BenchmarkModule::TxFailureStage::PREFLIGHT, INT16_MIN);
+#endif
         notifyTxFinished(txp, TxState::Failed);
         RadioTxHooks::packetReleased(this, txp);
         packetPool.release(txp);
@@ -1264,6 +1298,9 @@ bool RadioLibInterface::startSend(meshtastic_MeshPacket *txp)
 
         const bool fastIrq = armTransmitBeforeStart();
         int res = RADIOLIB_ERR_NONE;
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
+        auto failureStage = W12BenchmarkModule::TxFailureStage::CLEAR_TX_IRQ;
+#endif
         if (fastIrq) {
             // A complete FLRC frame can finish before startTransmit() returns.
             res = iface->clearIrqFlags(UINT32_MAX);
@@ -1272,14 +1309,22 @@ bool RadioLibInterface::startSend(meshtastic_MeshPacket *txp)
         }
         // unset-sentinel-ok: sendingPacket is the armed flag, so 0 is a legal stamp.
         lastTxStart = Time::getMillis();
-        if (res == RADIOLIB_ERR_NONE)
+        if (res == RADIOLIB_ERR_NONE) {
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
+            failureStage = W12BenchmarkModule::TxFailureStage::START_TRANSMIT;
+#endif
             res = iface->startTransmit((uint8_t *)&radioBuffer, numbytes);
+        }
         if (res != RADIOLIB_ERR_NONE) {
             LOG_ERROR("startTransmit failed, error=%d", res);
             RECORD_CRITICALERROR(meshtastic_CriticalErrorCode_RADIO_SPI_BUG);
 
             // This send failed, but make sure to 'complete' it properly
             disableInterrupt();
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
+            if (w12BenchmarkModule)
+                w12BenchmarkModule->onTxFailureObserved(sendingPacket, failureStage, static_cast<int16_t>(res));
+#endif
             completeSending(false);
             powerMon->clearState(meshtastic_PowerMon_State_Lora_TXOn); // Transmitter off now
             startReceive(); // Restart receive mode (because startTransmit failed to put us in xmit mode)

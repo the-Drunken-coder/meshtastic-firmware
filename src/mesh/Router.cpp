@@ -852,7 +852,22 @@ RoutingAuthVerdict passesRoutingAuthGate(meshtastic_MeshPacket *p)
         storeRoutingAuthCache(wire, authCandidate);
         return RoutingAuthVerdict::ACCEPT;
     }
-    const DecodeState state = perhapsDecode(&authCandidate);
+    DecodeState state;
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
+    const W12BenchmarkModule::Stats phaseStats =
+        w12BenchmarkModule ? w12BenchmarkModule->getStats() : W12BenchmarkModule::Stats{};
+    const bool measureW12Decode =
+        w12BenchmarkModule && phaseStats.running && nodeDB->getNodeNum() == phaseStats.config.destination;
+    const uint32_t decodeStartedAtUs = measureW12Decode ? micros() : 0;
+    state = perhapsDecode(&authCandidate);
+    const uint32_t decodeElapsedUs = measureW12Decode ? static_cast<uint32_t>(micros() - decodeStartedAtUs) : 0;
+    // isBenchmarkData() is deliberately evaluated after the interval. It verifies the decoded
+    // run identity without charging its validation work to the decrypt/protobuf interval.
+    if (measureW12Decode && state == DecodeState::DECODE_SUCCESS && w12BenchmarkModule->isBenchmarkData(authCandidate))
+        w12BenchmarkModule->onRxGateDecodeDuration(decodeElapsedUs);
+#else
+    state = perhapsDecode(&authCandidate);
+#endif
     if (state == DecodeState::DECODE_POLICY_REJECT) {
         LOG_WARN("Packet rejected by signature policy");
         return RoutingAuthVerdict::REJECT;

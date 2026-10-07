@@ -51,6 +51,14 @@ void W12BenchmarkModule::saturatingAdd(uint32_t &value, uint32_t amount)
     value = UINT32_MAX - value < amount ? UINT32_MAX : value + amount;
 }
 
+void W12BenchmarkModule::recordPhaseTiming(PreSendAttributionDiagnostics::PhaseTimingMetric &metric, uint32_t sample)
+{
+    saturatingIncrement(metric.count);
+    saturatingAdd(metric.sum, sample);
+    if (sample > metric.max)
+        metric.max = sample;
+}
+
 void W12BenchmarkModule::put16(uint8_t *bytes, uint16_t value)
 {
     bytes[0] = static_cast<uint8_t>(value);
@@ -429,6 +437,27 @@ size_t W12BenchmarkModule::encodePreSendAttributionReport(uint8_t *bytes, size_t
     put32(bytes + 118, d.burstFrames);
     put32(bytes + 122, d.burstAborted);
     put32(bytes + 126, d.burstCount);
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    bytes[178] = static_cast<uint8_t>(d.phaseTiming.available);
+    put32(bytes + 130, d.phaseTiming.producerSendToMeshUs.count);
+    put32(bytes + 134, d.phaseTiming.producerSendToMeshUs.sum);
+    put32(bytes + 138, d.phaseTiming.producerSendToMeshUs.max);
+    put32(bytes + 142, d.phaseTiming.burstPrepareUs.count);
+    put32(bytes + 146, d.phaseTiming.burstPrepareUs.sum);
+    put32(bytes + 150, d.phaseTiming.burstPrepareUs.max);
+    put32(bytes + 154, d.phaseTiming.burstGuardLateMs.count);
+    put32(bytes + 158, d.phaseTiming.burstGuardLateMs.sum);
+    put32(bytes + 162, d.phaseTiming.burstGuardLateMs.max);
+    put32(bytes + 166, d.phaseTiming.rxGateDecodeUs.count);
+    put32(bytes + 170, d.phaseTiming.rxGateDecodeUs.sum);
+    put32(bytes + 174, d.phaseTiming.rxGateDecodeUs.max);
+    put32(bytes + 179, d.phaseTiming.failedTxCount);
+    put32(bytes + 183, d.phaseTiming.failedTxLastPacketId);
+    put32(bytes + 187, d.phaseTiming.failedTxLastSequence);
+    put32(bytes + 191, d.phaseTiming.failedTxLastAtMs);
+    bytes[195] = d.phaseTiming.failedTxLastStage;
+    put16(bytes + 196, static_cast<uint16_t>(d.phaseTiming.failedTxLastRadioResult));
+#endif
     return PRE_SEND_ATTRIBUTION_REPORT_BYTES;
 }
 
@@ -563,6 +592,20 @@ void W12BenchmarkModule::onTxFinished(const meshtastic_MeshPacket *packet, Radio
         }
     }
 
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    if (state == RadioInterface::TxState::Failed) {
+        preSendDiagnostics.phaseTiming.available = true;
+        saturatingIncrement(preSendDiagnostics.phaseTiming.failedTxCount);
+        preSendDiagnostics.phaseTiming.failedTxLastPacketId = packet->id;
+        preSendDiagnostics.phaseTiming.failedTxLastSequence = slot->sequence;
+        preSendDiagnostics.phaseTiming.failedTxLastAtMs = finishedAtMs;
+        // The exact physical slot carries an explicit observed failure site, if one exists.
+        // Generic terminal callbacks remain unknown; failure alone cannot identify a cause.
+        preSendDiagnostics.phaseTiming.failedTxLastStage = static_cast<uint8_t>(slot->failureStage);
+        preSendDiagnostics.phaseTiming.failedTxLastRadioResult = slot->failureRadioResult;
+    }
+#endif
+
     switch (state) {
     case RadioInterface::TxState::Sent:
         stats.txSucceeded++;
@@ -669,6 +712,74 @@ void W12BenchmarkModule::onW12BurstAborted()
 {
     if (collectTxLifecycleDiagnostics())
         saturatingIncrement(preSendDiagnostics.burstAborted);
+}
+
+void W12BenchmarkModule::onProducerSendToMeshDuration(uint32_t elapsedUs)
+{
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    if (!collectTxLifecycleDiagnostics())
+        return;
+    preSendDiagnostics.phaseTiming.available = true;
+    recordPhaseTiming(preSendDiagnostics.phaseTiming.producerSendToMeshUs, elapsedUs);
+#else
+    (void)elapsedUs;
+#endif
+}
+
+void W12BenchmarkModule::onW12BurstPrepareDuration(uint32_t elapsedUs, bool success)
+{
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    if (!collectTxLifecycleDiagnostics())
+        return;
+    preSendDiagnostics.phaseTiming.available = true;
+    recordPhaseTiming(preSendDiagnostics.phaseTiming.burstPrepareUs, elapsedUs);
+    saturatingIncrement(success ? preSendDiagnostics.phaseTiming.burstPrepareSuccesses
+                                : preSendDiagnostics.phaseTiming.burstPrepareFailures);
+#else
+    (void)elapsedUs;
+    (void)success;
+#endif
+}
+
+void W12BenchmarkModule::onW12BurstGuardLateness(uint32_t nowMs, uint32_t dueAtMs)
+{
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    if (!collectTxLifecycleDiagnostics() || nowMs == dueAtMs || !Throttle::deadlinePassedAt(nowMs, dueAtMs))
+        return;
+    preSendDiagnostics.phaseTiming.available = true;
+    recordPhaseTiming(preSendDiagnostics.phaseTiming.burstGuardLateMs, nowMs - dueAtMs);
+#else
+    (void)nowMs;
+    (void)dueAtMs;
+#endif
+}
+
+void W12BenchmarkModule::onRxGateDecodeDuration(uint32_t elapsedUs)
+{
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    if (!collectDiagnostics())
+        return;
+    preSendDiagnostics.phaseTiming.available = true;
+    recordPhaseTiming(preSendDiagnostics.phaseTiming.rxGateDecodeUs, elapsedUs);
+#else
+    (void)elapsedUs;
+#endif
+}
+
+void W12BenchmarkModule::onTxFailureObserved(const meshtastic_MeshPacket *packet, TxFailureStage stage, int16_t radioResult)
+{
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    if (!collectTxLifecycleDiagnostics())
+        return;
+    if (TxSlot *slot = findTxSlot(packet)) {
+        slot->failureStage = stage;
+        slot->failureRadioResult = radioResult;
+    }
+#else
+    (void)packet;
+    (void)stage;
+    (void)radioResult;
+#endif
 }
 
 void W12BenchmarkModule::onPreCanSendDeferred(const meshtastic_MeshPacket *packet)
@@ -1140,6 +1251,9 @@ void W12BenchmarkModule::resetRun(const RunConfig &config)
     radioDiagnostics = RadioDiagnostics{};
     rxLivenessDiagnostics = RxLivenessDiagnostics{};
     preSendDiagnostics = PreSendAttributionDiagnostics{};
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    preSendDiagnostics.phaseTiming.available = true;
+#endif
     trackedTxTimerPacket = nullptr;
     trackedTxTimerId = 0;
     trackedTxTimerDueAtMs = 0;
@@ -1531,7 +1645,15 @@ int32_t W12BenchmarkModule::runOnce()
         return kQueueRetryIntervalMs;
     }
 
+    // Start after allocation, payload construction, and owner-slot reservation. This isolates the
+    // producer's complete service admission call, including any synchronous work below it.
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    const uint32_t producerStartedAtUs = micros();
     const ErrorCode result = service->sendToMesh(packet, RX_SRC_LOCAL, false);
+    onProducerSendToMeshDuration(static_cast<uint32_t>(micros() - producerStartedAtUs));
+#else
+    const ErrorCode result = service->sendToMesh(packet, RX_SRC_LOCAL, false);
+#endif
     if (result == ERRNO_OK)
         stats.enqueued++;
     else {

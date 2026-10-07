@@ -46,6 +46,8 @@ class PreSendAttributionProtocolTest(unittest.TestCase):
         self.assertEqual(report.burst_frames, 0)
         self.assertEqual(report.burst_aborted, 0)
         self.assertEqual(report.burst_count, 0)
+        self.assertFalse(report.phase_timing_available)
+        self.assertEqual(report.producer_us_count, 0)
 
     def test_decodes_burst_counters_and_keeps_reserved_tail_strict(self):
         report = self.report()
@@ -66,12 +68,80 @@ class PreSendAttributionProtocolTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             decode_report(invalid)
 
+    def test_decodes_phase_timing_triplets_and_availability(self):
+        report = self.report()
+        report[178] = 1
+        struct.pack_into("<III", report, 130, 3, 90, 40)
+        struct.pack_into("<III", report, 142, 2, 12, 8)
+        struct.pack_into("<III", report, 154, 1, 4, 4)
+        struct.pack_into("<III", report, 166, 4, 100, 30)
+
+        decoded = decode_report(report)
+        self.assertTrue(decoded.phase_timing_available)
+        self.assertEqual(decoded.producer_us_count, 3)
+        self.assertEqual(decoded.producer_us_sum, 90)
+        self.assertEqual(decoded.producer_us_max, 40)
+        self.assertEqual(decoded.burst_prepare_us_count, 2)
+        self.assertEqual(decoded.burst_guard_request_late_ms_max, 4)
+        self.assertEqual(decoded.rx_gate_decode_us_sum, 100)
+        self.assertEqual(decoded.failed_tx_count, 0)
+
+        struct.pack_into("<IIII", report, 179, 1, 0x1234, 37, 99)
+        report[195] = 0
+        struct.pack_into("<h", report, 196, INT16_MIN)
+        decoded = decode_report(report)
+        self.assertEqual(decoded.failed_tx_count, 1)
+        self.assertEqual(decoded.failed_tx_last_packet_id, 0x1234)
+        self.assertEqual(decoded.failed_tx_last_sequence, 37)
+        self.assertEqual(decoded.failed_tx_last_at_ms, 99)
+
+    def test_rejects_invalid_phase_timing_availability_and_triplets(self):
+        adverse = []
+        unavailable = self.report()
+        struct.pack_into("<I", unavailable, 130, 1)
+        adverse.append(unavailable)
+
+        invalid_availability = self.report()
+        invalid_availability[178] = 2
+        adverse.append(invalid_availability)
+
+        zero_count = self.report()
+        zero_count[178] = 1
+        struct.pack_into("<I", zero_count, 134, 1)
+        adverse.append(zero_count)
+
+        sum_below_max = self.report()
+        sum_below_max[178] = 1
+        struct.pack_into("<III", sum_below_max, 130, 2, 3, 4)
+        adverse.append(sum_below_max)
+
+        failure_without_count = self.report()
+        failure_without_count[178] = 1
+        struct.pack_into("<I", failure_without_count, 183, 0x55)
+        adverse.append(failure_without_count)
+
+        invalid_stage = self.report()
+        invalid_stage[178] = 1
+        struct.pack_into("<I", invalid_stage, 179, 1)
+        invalid_stage[195] = 6
+        adverse.append(invalid_stage)
+
+        unknown_stage_with_result = self.report()
+        unknown_stage_with_result[178] = 1
+        struct.pack_into("<I", unknown_stage_with_result, 179, 1)
+        struct.pack_into("<h", unknown_stage_with_result, 196, -7)
+        adverse.append(unknown_stage_with_result)
+
+        for mutated in adverse:
+            with self.assertRaises(ValueError):
+                decode_report(mutated)
+
     def test_rejects_length_header_reserved_and_tail_changes(self):
         report = self.report()
         for mutated in (report[:-1], report + b"\0"):
             with self.assertRaises(ValueError):
                 decode_report(mutated)
-        for offset in (0, 2, 3, 22, 77, 130):
+        for offset in (0, 2, 3, 22, 77, 130, 198):
             mutated = bytearray(report)
             mutated[offset] = 0xFF
             with self.assertRaises(ValueError):
