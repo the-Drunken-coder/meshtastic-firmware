@@ -41,6 +41,20 @@ def _load_benchmark_module() -> Any:
 
 benchmark = _load_benchmark_module()
 
+
+def _load_pre_send_module() -> Any:
+    path = Path(__file__).with_name("pre_send_attribution.py")
+    spec = importlib.util.spec_from_file_location("w12_pre_send_attribution", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load pre-send attribution helper {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+pre_send = _load_pre_send_module()
+
 MAGIC = benchmark.MAGIC
 VERSION = benchmark.VERSION
 CONTROL_BYTES = benchmark.CONTROL_BYTES
@@ -53,6 +67,8 @@ CONTROL_RESET = benchmark.CONTROL_RESET
 CONTROL_SNAPSHOT_DIAGNOSTICS = benchmark.CONTROL_SNAPSHOT_DIAGNOSTICS
 CONTROL_SNAPSHOT_RX_LIVENESS = 7
 CONTROL_REARM_RX_LIVENESS = 8
+CONTROL_SNAPSHOT_PRE_SEND = pre_send.SNAPSHOT_OP
+PRE_SEND_KIND = pre_send.KIND
 DEFAULT_WALL_SECONDS = 60.0
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 1.0
 DEFAULT_REARM_AT_SECONDS = 20.0
@@ -328,6 +344,126 @@ def encode_liveness_control(config: Any, operation: int) -> bytes:
     payload = bytearray(benchmark.encode_control(config, CONTROL_SNAPSHOT))
     payload[3] = operation
     return bytes(payload)
+
+
+def encode_pre_send_control(config: Any) -> bytes:
+    """Build the exact local op9 control for this prepared run."""
+
+    payload = pre_send.encode_snapshot_control(
+        config.run_id,
+        config.source,
+        config.destination,
+        config.count,
+        config.size,
+        config.duration_ms,
+        config.window,
+        config.flags,
+    )
+    if len(payload) != pre_send.CONTROL_BYTES or payload[3] != CONTROL_SNAPSHOT_PRE_SEND:
+        raise LivenessError("pre_send_control_invalid: op9 control layout mismatch")
+    fields = (
+        int.from_bytes(payload[4:8], "little"),
+        int.from_bytes(payload[8:12], "little"),
+        int.from_bytes(payload[12:16], "little"),
+        int.from_bytes(payload[16:20], "little"),
+        int.from_bytes(payload[20:22], "little"),
+        int.from_bytes(payload[22:26], "little"),
+        int.from_bytes(payload[26:28], "little"),
+        payload[28],
+    )
+    expected = (
+        config.run_id,
+        config.source,
+        config.destination,
+        config.count,
+        config.size,
+        config.duration_ms,
+        config.window,
+        config.flags,
+    )
+    if payload[:2] != MAGIC.to_bytes(2, "little") or payload[2] != VERSION or fields != expected:
+        raise LivenessError("pre_send_control_identity_mismatch: config fields do not match")
+    if payload[29:] != b"\x00\x00\x00":
+        raise LivenessError("pre_send_control_invalid: reserved control bytes are not zero")
+    return payload
+
+
+def pre_send_report_dict(report: Any) -> dict[str, Any]:
+    value = dataclasses.asdict(report)
+    value.pop("raw", None)
+    value.update(
+        {
+            "scope": "board_local_pre_send_attribution_diagnostic",
+            "rf_delivery_authoritative": False,
+            "per_authoritative": False,
+            "capacity_claim": "not_evaluated",
+        }
+    )
+    return value
+
+
+def validate_pre_send_report(report: Any, config: Any, label: str) -> Any:
+    if not all(
+        getattr(report, field) == getattr(config, field)
+        for field in ("run_id", "source", "destination")
+    ):
+        raise LivenessError(
+            f"{label}_identity_mismatch: run/source/destination mismatch"
+        )
+    if (
+        not isinstance(report.elapsed_ms, int)
+        or isinstance(report.elapsed_ms, bool)
+        or not 0 <= report.elapsed_ms <= config.duration_ms
+    ):
+        raise LivenessError(f"{label}_time_invalid: elapsed is outside the run")
+    return report
+
+
+def pre_send_record(
+    report: Any, role: str, request_id: int, sent_monotonic: float
+) -> dict[str, Any]:
+    return {
+        "role": role,
+        "report_kind": PRE_SEND_KIND,
+        "request_id": request_id,
+        "sent_monotonic": sent_monotonic,
+        "host_monotonic": time.monotonic(),
+        "report": pre_send_report_dict(report),
+    }
+
+
+def optional_source_pre_send(
+    session: LivenessSession,
+    config: Any,
+    timeout: float,
+    role: str,
+    requested: bool,
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Request source op9 only when explicitly enabled; propagate failures."""
+
+    if state is None:
+        state = {
+            "requested": requested,
+            "support_expected": requested,
+            "status": "pending" if requested else "not_requested",
+        }
+    if not requested:
+        return state
+    try:
+        session.check_health()
+        report, sent_monotonic, request_id = session.request_pre_send(config, timeout)
+        report = validate_pre_send_report(report, config, "pre_send_source")
+    except BaseException as error:
+        state.update({"status": "failed", "error": str(error)})
+        raise
+    state.update(
+        {
+            "status": "captured",
+            "record": pre_send_record(report, role, request_id, sent_monotonic),
+        }
+    )
+    return state
 
 
 def decode_liveness_control(payload: bytes) -> tuple[int, Any]:
@@ -780,6 +916,27 @@ class LivenessSession:
                             raw_payload_hex=payload.hex(),
                             report=rx_liveness_report_dict(report),
                         )
+                    elif len(payload) >= 4 and payload[3] == PRE_SEND_KIND:
+                        try:
+                            report = pre_send.decode_report(payload)
+                        except ValueError as error:
+                            self.health.fail("parser_error", str(error))
+                            self.capture.record(
+                                "pre_send_protocol_error",
+                                error=str(error),
+                                raw_payload_hex=payload.hex(),
+                            )
+                            raise LivenessError(str(error)) from error
+                        self.capture.record(
+                            "pre_send_packet",
+                            packet_id=int(packet.id),
+                            request_id=int(packet.decoded.request_id),
+                            to=int(packet.to),
+                            from_node=int(getattr(packet, "from")),
+                            payload_size=len(payload),
+                            raw_payload_hex=payload.hex(),
+                            report=pre_send_report_dict(report),
+                        )
             self._original_handle(data)
         except BaseException as error:
             if self.health.snapshot() is None:
@@ -844,11 +1001,56 @@ class LivenessSession:
                 raise LivenessError("response_identity_mismatch: run/source/destination mismatch")
             return report
 
+    def _wait_pre_send_response(
+        self,
+        request_id: int,
+        config: Any,
+        sent_monotonic: float,
+        timeout: float,
+    ) -> Any:
+        deadline = time.monotonic() + timeout
+
+        def matches(event: Mapping[str, Any]) -> bool:
+            if event.get("kind") != "pre_send_packet":
+                return False
+            if event.get("request_id") != request_id:
+                return False
+            try:
+                return float(event.get("monotonic", -1)) >= sent_monotonic
+            except (TypeError, ValueError):
+                return False
+
+        while True:
+            self.check_health()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LivenessError("response_timeout: kind-7 response did not arrive")
+            event = self.capture.wait_for(matches, min(remaining, 0.25))
+            if event is None:
+                continue
+            if event.get("to") != self.node_num or event.get("from_node") != self.node_num:
+                raise LivenessError("response_identity_mismatch: local from/to mismatch")
+            try:
+                report = pre_send.decode_report(bytes.fromhex(event["raw_payload_hex"]))
+            except (KeyError, ValueError, TypeError) as error:
+                self.health.fail("parser_error", str(error))
+                raise LivenessError(f"parser_error: {error}") from error
+            return validate_pre_send_report(report, config, "pre_send_response")
+
     def request(
         self, config: Any, operation: int, timeout: float
     ) -> tuple[RxLivenessReport, float, int]:
         request_id, sent_monotonic = send_liveness_control(self, config, operation)
         report = self._wait_response(request_id, config, sent_monotonic, timeout)
+        return report, sent_monotonic, request_id
+
+    def request_pre_send(
+        self, config: Any, timeout: float
+    ) -> tuple[Any, float, int]:
+        request_id, sent_monotonic = send_pre_send_control(self, config)
+        report = self._wait_pre_send_response(
+            request_id, config, sent_monotonic, timeout
+        )
         return report, sent_monotonic, request_id
 
     def base_control(self, operation: int, config: Any) -> int:
@@ -963,6 +1165,79 @@ def send_liveness_control(
         session.capture.record(
             "liveness_control_intent",
             operation=operation,
+            packet_id=packet_id,
+            run_id=config.run_id,
+            source=config.source,
+            destination=config.destination,
+            payload_sha256=benchmark.sha256_bytes(payload),
+            local_destination=session.node_num,
+        )
+    return packet_id, sent_monotonic
+
+
+def send_pre_send_control(session: LivenessSession, config: Any) -> tuple[int, float]:
+    """Send only the validated local op9 control through the direct serial seam."""
+
+    payload = encode_pre_send_control(config)
+    session.check_health()
+    interface = session.interface
+    if getattr(interface, "noProto", False):
+        raise LivenessError("control_unavailable: interface protocol is disabled")
+    if not callable(getattr(interface, "_sendToRadioImpl", None)):
+        raise LivenessError("control_unavailable: direct serial sender is missing")
+    packet_id_factory = getattr(interface, "_generatePacketId", None)
+    packet_id = (
+        int(packet_id_factory())
+        if callable(packet_id_factory)
+        else secrets.randbelow(0xFFFFFFFF) + 1
+    )
+    to_radio = session._mesh_pb2.ToRadio()
+    mesh_packet = to_radio.packet
+    mesh_packet.id = packet_id
+    mesh_packet.to = session.node_num
+    setattr(mesh_packet, "from", 0)
+    mesh_packet.want_ack = False
+    mesh_packet.pki_encrypted = False
+    mesh_packet.hop_limit = 0
+    mesh_packet.decoded.portnum = int(session._portnums_pb2.PRIVATE_APP)
+    mesh_packet.decoded.payload = payload
+    mesh_packet.decoded.want_response = True
+    if (
+        int(mesh_packet.to) != session.node_num
+        or int(getattr(mesh_packet, "from")) != 0
+        or bool(mesh_packet.want_ack)
+        or bool(mesh_packet.pki_encrypted)
+        or int(mesh_packet.decoded.portnum) != int(session._portnums_pb2.PRIVATE_APP)
+        or bytes(mesh_packet.decoded.payload) != payload
+        or payload[3] != CONTROL_SNAPSHOT_PRE_SEND
+    ):
+        raise LivenessError("control_identity_mismatch: local op9 packet validation failed")
+
+    lock = getattr(interface, "_command_lock", None)
+    if lock is None:
+        raise LivenessError("control_unavailable: command lock is missing")
+    with lock:
+        session.base._pace()
+        sent_monotonic = time.monotonic()
+        session.capture.record(
+            "pre_send_control_attempt",
+            operation=CONTROL_SNAPSHOT_PRE_SEND,
+            packet_id=packet_id,
+            run_id=config.run_id,
+            source=config.source,
+            destination=config.destination,
+            payload_sha256=benchmark.sha256_bytes(payload),
+            local_destination=session.node_num,
+        )
+        try:
+            interface._sendToRadioImpl(to_radio)
+        except BaseException as error:
+            session.health.fail("control_write_error", str(error))
+            raise LivenessError(f"control_write_error: {error}") from error
+        interface.last_command = sent_monotonic
+        session.capture.record(
+            "pre_send_control_intent",
+            operation=CONTROL_SNAPSHOT_PRE_SEND,
             packet_id=packet_id,
             run_id=config.run_id,
             source=config.source,
@@ -1278,6 +1553,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         helper_digest = benchmark.sha256_file(helper_path)
     except OSError as error:
         raise LivenessError("frozen benchmark helper digest is unavailable") from error
+    pre_send_helper_path = Path(pre_send.__file__).resolve()
+    try:
+        pre_send_helper_digest = benchmark.sha256_file(pre_send_helper_path)
+    except OSError as error:
+        raise LivenessError("frozen pre-send helper digest is unavailable") from error
     protocol_path = Path(__file__).with_name("rx-liveness-protocol.json")
     if not protocol_path.is_file():
         raise LivenessError("RX liveness protocol file is required before opening hardware")
@@ -1285,6 +1565,17 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         protocol_digest = benchmark.sha256_file(protocol_path)
     except OSError as error:
         raise LivenessError("RX liveness protocol digest is unavailable") from error
+    pre_send_protocol_path = Path(__file__).with_name(
+        "pre-send-attribution-protocol.json"
+    )
+    if not pre_send_protocol_path.is_file():
+        raise LivenessError(
+            "pre-send attribution protocol file is required before opening hardware"
+        )
+    try:
+        pre_send_protocol_digest = benchmark.sha256_file(pre_send_protocol_path)
+    except OSError as error:
+        raise LivenessError("pre-send attribution protocol digest is unavailable") from error
     for image in args.image:
         if not Path(image).is_file():
             raise LivenessError(f"firmware image is not a regular file: {image}")
@@ -1306,7 +1597,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         "started_utc": _utc_now(),
         "script_sha256": script_digest,
         "benchmark_helper_sha256": helper_digest,
+        "pre_send_helper_sha256": pre_send_helper_digest,
         "protocol_sha256": protocol_digest,
+        "pre_send_protocol_sha256": pre_send_protocol_digest,
         "python": sys.executable,
         "python_version": platform.python_version(),
         "platform": platform.platform(),
@@ -1322,7 +1615,9 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     file_digests = {
         str(script_path): script_digest,
         str(helper_path): helper_digest,
+        str(pre_send_helper_path): pre_send_helper_digest,
         str(protocol_path.resolve()): protocol_digest,
+        str(pre_send_protocol_path.resolve()): pre_send_protocol_digest,
     }
     result: dict[str, Any] = {
         "status": "diagnostic_pending",
@@ -1347,12 +1642,34 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             "rearm_at_seconds": args.rearm_at_seconds,
             "stagnant_seconds": args.rearm_stagnant_seconds,
             "rearm_evidence_margin_ms": REARM_EVIDENCE_MARGIN_MS,
+            "pre_send_attribution": {
+                "operation": CONTROL_SNAPSHOT_PRE_SEND,
+                "kind": PRE_SEND_KIND,
+                "report_bytes": pre_send.REPORT_BYTES,
+                "scope": "diagnostic_only",
+                "receiver_snapshot": {
+                    "requested": True,
+                    "support_expected": True,
+                },
+                "source_snapshot": {
+                    "requested": bool(args.source_pre_send),
+                    "support_expected": bool(args.source_pre_send),
+                },
+            },
         },
         "provenance": provenance,
         "file_digests": file_digests,
         "samples": [],
         "source_snapshots": [],
-        "rearm": {"attempted": False, "performed": False},
+        "rearm": {
+            "attempted": False,
+            "performed": False,
+            "pre_send_source": {
+                "requested": bool(args.source_pre_send),
+                "support_expected": bool(args.source_pre_send),
+                "status": "pending" if args.source_pre_send else "not_requested",
+            },
+        },
         "sender_window": {
             "anchor": "sender_start",
             "duration_ms": config.duration_ms,
@@ -1516,10 +1833,69 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
                             [source_before_record, source_after_record],
                             time.monotonic(),
                         )
+                        decision_context["pre_send_source"] = copy.deepcopy(
+                            result["rearm"]["pre_send_source"]
+                        )
                         result["rearm"]["decision"] = copy.deepcopy(
                             decision_context
                         )
                         checkpoint("rearm_decision_context_saved")
+                        pre_send_receiver_report, pre_send_receiver_sent, pre_send_receiver_request = receiver.request_pre_send(
+                            config, args.control_timeout
+                        )
+                        pre_send_receiver_report = validate_pre_send_report(
+                            pre_send_receiver_report, config, "pre_send_receiver"
+                        )
+                        pre_send_receiver_record = pre_send_record(
+                            pre_send_receiver_report,
+                            receiver_role,
+                            pre_send_receiver_request,
+                            pre_send_receiver_sent,
+                        )
+                        result["rearm"]["pre_send_receiver"] = (
+                            pre_send_receiver_record
+                        )
+                        try:
+                            result["rearm"]["pre_send_source"] = optional_source_pre_send(
+                                sender,
+                                config,
+                                args.control_timeout,
+                                sender_role,
+                                args.source_pre_send,
+                                result["rearm"]["pre_send_source"],
+                            )
+                        except BaseException:
+                            decision_context["pre_send_source"] = copy.deepcopy(
+                                result["rearm"]["pre_send_source"]
+                            )
+                            result["rearm"]["decision"] = copy.deepcopy(
+                                decision_context
+                            )
+                            raise
+                        decision_context["pre_send_receiver"] = copy.deepcopy(
+                            pre_send_receiver_record
+                        )
+                        decision_context["pre_send_source"] = copy.deepcopy(
+                            result["rearm"]["pre_send_source"]
+                        )
+                        pre_op8_guard = receiver.host_rearm_guard()
+                        result["rearm"]["pre_op8_host_guard"] = pre_op8_guard
+                        decision_context["pre_op8_host_guard"] = copy.deepcopy(
+                            pre_op8_guard
+                        )
+                        result["rearm"]["decision"] = copy.deepcopy(
+                            decision_context
+                        )
+                        checkpoint("pre_send_attribution_captured")
+                        if not pre_op8_guard["eligible"]:
+                            result["rearm"]["skipped_reason"] = (
+                                "host_queue_guard_not_ready"
+                            )
+                            next_sample = max(
+                                next_sample + args.sample_interval,
+                                time.monotonic() + args.sample_interval,
+                            )
+                            continue
                         receiver_before_request_started = time.monotonic()
                         receiver_before_report = receiver.base.snapshot(
                             config, args.control_timeout
@@ -1561,9 +1937,26 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
                         decision_context["pre_op8_evidence_window_margin"] = copy.deepcopy(
                             pre_op8_evidence_margin
                         )
+                        final_pre_op8_guard = receiver.host_rearm_guard()
+                        result["rearm"]["final_pre_op8_host_guard"] = (
+                            final_pre_op8_guard
+                        )
+                        decision_context["final_pre_op8_host_guard"] = copy.deepcopy(
+                            final_pre_op8_guard
+                        )
                         result["rearm"]["decision"] = copy.deepcopy(
                             decision_context
                         )
+                        if not final_pre_op8_guard["eligible"]:
+                            result["rearm"]["skipped_reason"] = (
+                                "host_queue_guard_not_ready"
+                            )
+                            checkpoint("rearm_final_host_guard_skipped")
+                            next_sample = max(
+                                next_sample + args.sample_interval,
+                                time.monotonic() + args.sample_interval,
+                            )
+                            continue
                         if not pre_op8_evidence_margin["eligible"]:
                             result["rearm"]["skipped_reason"] = (
                                 "rearm_evidence_window_margin"
@@ -1829,6 +2222,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-interval", type=float, default=DEFAULT_SAMPLE_INTERVAL_SECONDS)
     parser.add_argument("--rearm-at-seconds", type=float, default=DEFAULT_REARM_AT_SECONDS)
     parser.add_argument("--rearm-stagnant-seconds", type=float, default=DEFAULT_STAGNANT_SECONDS)
+    parser.add_argument(
+        "--source-pre-send",
+        action="store_true",
+        help="request one source op9 snapshot; unsupported sources fail closed",
+    )
     parser.add_argument("--command-gap", type=float, default=DEFAULT_COMMAND_GAP_SECONDS)
     parser.add_argument("--control-timeout", type=float, default=DEFAULT_CONTROL_TIMEOUT_SECONDS)
     parser.add_argument("--run-id", type=int, default=None)

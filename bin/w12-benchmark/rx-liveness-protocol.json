@@ -27,6 +27,16 @@
       "admission": "local control only, exact current run, destination board, running receiver window, no active TX, no queued TX, and unused one-shot rearm budget",
       "effect": "on a supported LR2021 FLRC interface, calls the existing RadioLibInterface::startReceive() virtual exactly once at the interface boundary; consumes budget only after the call is performed; rejected guards do not mutate state",
       "read_scope": "records software state before and after, then takes one operation-time LR2021 FLRC diagnostic seam call"
+    },
+    "9": {
+      "name": "SNAPSHOT_PRE_SEND_ATTRIBUTION",
+      "reply_kind": 7,
+      "reply_bytes": 233,
+      "authority": "pre-send-attribution-protocol.json",
+      "admission": "exact local self control and prepared running or complete run; read-only board-local snapshot",
+      "probe_scope": "receiver snapshot required before eligible rearm; source snapshot only with explicit --source-pre-send and a supporting source image",
+      "recovery_authority": false,
+      "rf_delivery_authoritative": false
     }
   },
   "report": {

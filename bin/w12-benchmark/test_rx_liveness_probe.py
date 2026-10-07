@@ -6,6 +6,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import struct
 import sys
 import tempfile
 import threading
@@ -133,6 +134,100 @@ def kind3_report(run=None, **changes):
     }
     values.update(changes)
     return values
+
+
+def pre_send_payload(run=None, **changes):
+    run = config() if run is None else run
+    values = {
+        "status": 0x23,
+        "pending_tx_count": 0,
+        "busy_tx_deferrals": 2,
+        "busy_rx_active_deferrals": 3,
+        "busy_rx_irq_read_failure_deferrals": 4,
+        "tx_timer_accepted": 10,
+        "tx_timer_dispatches": 9,
+        "tx_timer_late_count": 2,
+        "tx_timer_late_sum_ms": 12,
+        "tx_timer_late_max_ms": 7,
+        "tx_timer_overwritten": 1,
+        "tx_timer_stale": 1,
+        "tx_timer_cancelled": 1,
+        "tx_timer_irq_displaced": 1,
+        "tx_timer_active": 0,
+        "rx_sample_valid": 1,
+        "rx_sample_status": 31,
+        "rx_dio_level": 1,
+        "rx_busy_level": 0,
+        "rx_active_receive_start_ms": 100,
+        "rx_sampled_at_ms": 200,
+        "rx_raw_irq_flags": 0x20,
+        "rx_raw_status": 0x524,
+        "rx_fifo_level": 4,
+        "rx_fifo_flags": 1,
+        "tx_fifo_flags": 2,
+        "rx_chip_errors": 0,
+        "rx_irq_read_result": 0,
+        "rx_fifo_flags_result": 0,
+        "rx_fifo_level_result": 0,
+        "rx_errors_result": 0,
+        "rx_software_state": 0x01,
+        "tx_timer_due_at_ms": 0,
+        "elapsed_ms": 20000,
+    }
+    values.update(changes)
+    payload = bytearray(probe.pre_send.REPORT_BYTES)
+    struct.pack_into(
+        "<HBBIIII",
+        payload,
+        0,
+        probe.pre_send.MAGIC,
+        probe.pre_send.VERSION,
+        probe.pre_send.KIND,
+        run.run_id,
+        run.source,
+        run.destination,
+        values["elapsed_ms"],
+    )
+    payload[20] = values["status"]
+    payload[21] = values["pending_tx_count"]
+    for offset, name in (
+        (24, "busy_tx_deferrals"),
+        (28, "busy_rx_active_deferrals"),
+        (32, "busy_rx_irq_read_failure_deferrals"),
+        (36, "tx_timer_accepted"),
+        (40, "tx_timer_dispatches"),
+        (44, "tx_timer_late_count"),
+        (48, "tx_timer_late_sum_ms"),
+        (52, "tx_timer_late_max_ms"),
+        (56, "tx_timer_overwritten"),
+        (60, "tx_timer_stale"),
+        (64, "tx_timer_cancelled"),
+        (68, "tx_timer_irq_displaced"),
+        (78, "rx_active_receive_start_ms"),
+        (82, "rx_sampled_at_ms"),
+        (86, "rx_raw_irq_flags"),
+        (106, "rx_software_state"),
+        (110, "tx_timer_due_at_ms"),
+    ):
+        struct.pack_into("<I", payload, offset, values[name])
+    payload[72] = values["tx_timer_active"]
+    payload[73] = values["rx_sample_valid"]
+    payload[74] = values["rx_sample_status"]
+    payload[75] = values["rx_dio_level"]
+    payload[76] = values["rx_busy_level"]
+    struct.pack_into("<H", payload, 90, values["rx_raw_status"])
+    struct.pack_into("<H", payload, 92, values["rx_fifo_level"])
+    payload[94] = values["rx_fifo_flags"]
+    payload[95] = values["tx_fifo_flags"]
+    struct.pack_into("<H", payload, 96, values["rx_chip_errors"])
+    for offset, name in (
+        (98, "rx_irq_read_result"),
+        (100, "rx_fifo_flags_result"),
+        (102, "rx_fifo_level_result"),
+        (104, "rx_errors_result"),
+    ):
+        struct.pack_into("<h", payload, offset, values[name])
+    return bytes(payload)
 
 
 class ParserTests(unittest.TestCase):
@@ -609,6 +704,46 @@ class ResponseSafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(probe.LivenessError, "response_timeout"):
             self._session(event)._wait_response(9, run, 1.0, 0.001)
 
+    def test_pre_send_response_requires_matching_request_identity_and_timestamp(self):
+        run = config()
+        valid_event = {
+            "kind": "pre_send_packet",
+            "request_id": 9,
+            "monotonic": 1.0,
+            "to": run.destination,
+            "from_node": run.destination,
+            "raw_payload_hex": pre_send_payload(run).hex(),
+        }
+        report = self._session(valid_event)._wait_pre_send_response(
+            9, run, 0.0, 0.1
+        )
+        self.assertEqual(report.run_id, run.run_id)
+
+        foreign = dict(valid_event, to=run.source)
+        with self.assertRaisesRegex(probe.LivenessError, "local from/to"):
+            self._session(foreign)._wait_pre_send_response(9, run, 0.0, 0.1)
+
+        wrong_config = dict(
+            valid_event,
+            raw_payload_hex=pre_send_payload(config(run_id=run.run_id + 1)).hex(),
+        )
+        with self.assertRaisesRegex(probe.LivenessError, "run/source/destination"):
+            self._session(wrong_config)._wait_pre_send_response(9, run, 0.0, 0.1)
+
+        stale = dict(valid_event, monotonic=-1.0)
+        with self.assertRaisesRegex(probe.LivenessError, "response_timeout"):
+            self._session(stale)._wait_pre_send_response(9, run, 0.0, 0.001)
+
+        late_request = dict(valid_event, request_id=8)
+        with self.assertRaisesRegex(probe.LivenessError, "response_timeout"):
+            self._session(late_request)._wait_pre_send_response(9, run, 0.0, 0.001)
+
+        malformed = dict(valid_event, raw_payload_hex=pre_send_payload(run)[:-1].hex())
+        malformed_session = self._session(malformed)
+        with self.assertRaisesRegex(probe.LivenessError, "parser_error"):
+            malformed_session._wait_pre_send_response(9, run, 0.0, 0.1)
+        self.assertEqual(malformed_session.health.snapshot()["reason"], "parser_error")
+
     def test_receiver_window_keeps_first_auth_anchor_and_elapsed_state(self):
         report = probe.decode_rx_liveness_report(
             liveness_payload(status=0x23, elapsed_ms=0, snapshot_time_ms=1000)
@@ -748,6 +883,97 @@ class ControlTransportTests(unittest.TestCase):
         self.assertEqual(packet.decoded.payload[3], probe.CONTROL_SNAPSHOT_RX_LIVENESS)
         self.assertEqual(len(session.interface.sent), 1)
 
+    def test_pre_send_control_is_exact_local_self_no_ack_no_pki(self):
+        mesh_pb2, portnums_pb2 = probe._load_meshtastic_types()
+
+        class Capture:
+            def record(self, _kind, **_values):
+                return None
+
+        class FakeInterface:
+            def __init__(self):
+                self._command_lock = threading.Lock()
+                self.noProto = False
+                self.last_command = 0.0
+                self.sent = []
+
+            def _generatePacketId(self):
+                return 456
+
+            def _sendToRadioImpl(self, packet):
+                self.sent.append(packet)
+
+        session = object.__new__(probe.LivenessSession)
+        session.node_num = probe.benchmark.BOARD_IDENTITIES["walker"][1]
+        session.interface = FakeInterface()
+        session._mesh_pb2 = mesh_pb2
+        session._portnums_pb2 = portnums_pb2
+        session.capture = Capture()
+        session.health = probe._ReaderHealth()
+        session.base = SimpleNamespace(_pace=lambda: None)
+
+        request_id, _ = probe.send_pre_send_control(session, config())
+        packet = session.interface.sent[0].packet
+        self.assertEqual(request_id, 456)
+        self.assertEqual(packet.to, session.node_num)
+        self.assertEqual(getattr(packet, "from"), 0)
+        self.assertFalse(packet.want_ack)
+        self.assertFalse(packet.pki_encrypted)
+        self.assertEqual(packet.decoded.portnum, int(portnums_pb2.PRIVATE_APP))
+        self.assertEqual(packet.decoded.payload[3], probe.CONTROL_SNAPSHOT_PRE_SEND)
+        self.assertEqual(bytes(packet.decoded.payload), probe.encode_pre_send_control(config()))
+        self.assertEqual(len(session.interface.sent), 1)
+
+    def test_source_pre_send_is_opt_in_and_requested_failure_propagates(self):
+        run = config()
+
+        class FakeSession:
+            def __init__(self, fail=False):
+                self.fail = fail
+                self.calls = 0
+
+            def check_health(self):
+                return None
+
+            def request_pre_send(self, _config, _timeout):
+                self.calls += 1
+                if self.fail:
+                    raise probe.LivenessError("response_timeout: kind-7 response did not arrive")
+                return probe.pre_send.decode_report(pre_send_payload(run)), 2.0, 7
+
+        default_session = FakeSession()
+        default_state = probe.optional_source_pre_send(
+            default_session, run, 0.1, "base", False
+        )
+        self.assertEqual(default_session.calls, 0)
+        self.assertFalse(default_state["requested"])
+        self.assertFalse(default_state["support_expected"])
+        self.assertEqual(default_state["status"], "not_requested")
+
+        captured_session = FakeSession()
+        captured_state = probe.optional_source_pre_send(
+            captured_session, run, 0.1, "base", True
+        )
+        self.assertEqual(captured_session.calls, 1)
+        self.assertTrue(captured_state["requested"])
+        self.assertTrue(captured_state["support_expected"])
+        self.assertEqual(captured_state["status"], "captured")
+        self.assertEqual(captured_state["record"]["report_kind"], probe.PRE_SEND_KIND)
+
+        requested_session = FakeSession(fail=True)
+        failed_state = {
+            "requested": True,
+            "support_expected": True,
+            "status": "pending",
+        }
+        with self.assertRaisesRegex(probe.LivenessError, "response_timeout"):
+            probe.optional_source_pre_send(
+                requested_session, run, 0.1, "base", True, failed_state
+            )
+        self.assertEqual(requested_session.calls, 1)
+        self.assertEqual(failed_state["status"], "failed")
+        self.assertIn("response_timeout", failed_state["error"])
+
 
 class CaptureHealthTests(unittest.TestCase):
     def test_kind6_wrapper_records_raw_payload_and_matching_identity(self):
@@ -784,6 +1010,56 @@ class CaptureHealthTests(unittest.TestCase):
         event = next(item for item in session.capture.events if item["kind"] == "liveness_packet")
         self.assertEqual(event["request_id"], 123)
         self.assertEqual(bytes.fromhex(event["raw_payload_hex"]), liveness_payload())
+
+    def test_kind7_wrapper_records_raw_report_and_parser_errors_are_sticky(self):
+        mesh_pb2, portnums_pb2 = probe._load_meshtastic_types()
+
+        class Capture:
+            def __init__(self):
+                self.events = []
+
+            def record(self, kind, **values):
+                event = {"kind": kind, "monotonic": 1.0, **values}
+                self.events.append(event)
+                return event
+
+        session = object.__new__(probe.LivenessSession)
+        session._mesh_pb2 = mesh_pb2
+        session._portnums_pb2 = portnums_pb2
+        session.capture = Capture()
+        session.health = probe._ReaderHealth()
+        session._original_handle = lambda _data: None
+        session.node_num = probe.benchmark.BOARD_IDENTITIES["walker"][1]
+        incoming = mesh_pb2.FromRadio()
+        packet = incoming.packet
+        packet.id = 43
+        packet.to = session.node_num
+        setattr(packet, "from", session.node_num)
+        packet.decoded.portnum = int(portnums_pb2.PRIVATE_APP)
+        packet.decoded.request_id = 124
+        packet.decoded.payload = pre_send_payload()
+
+        probe.LivenessSession._handle_from_radio(session, incoming.SerializeToString())
+        event = next(item for item in session.capture.events if item["kind"] == "pre_send_packet")
+        self.assertEqual(event["request_id"], 124)
+        self.assertEqual(bytes.fromhex(event["raw_payload_hex"]), pre_send_payload())
+        self.assertEqual(event["report"]["run_id"], config().run_id)
+        decoded = probe.pre_send.decode_report(pre_send_payload())
+        serialized = probe.pre_send_record(decoded, "walker", 124, 1.0)
+        self.assertEqual(serialized["report"], probe.pre_send_report_dict(decoded))
+        self.assertNotIn("raw_payload_hex", serialized)
+        self.assertEqual(event["raw_payload_hex"], pre_send_payload().hex())
+
+        malformed = mesh_pb2.FromRadio()
+        malformed.packet.to = session.node_num
+        setattr(malformed.packet, "from", session.node_num)
+        malformed.packet.decoded.portnum = int(portnums_pb2.PRIVATE_APP)
+        malformed.packet.decoded.payload = pre_send_payload()[:-1]
+        with self.assertRaises(probe.LivenessError):
+            probe.LivenessSession._handle_from_radio(
+                session, malformed.SerializeToString()
+            )
+        self.assertEqual(session.health.snapshot()["reason"], "parser_error")
 
     def test_parser_error_marks_health_and_raises(self):
         mesh_pb2, portnums_pb2 = probe._load_meshtastic_types()
@@ -897,6 +1173,8 @@ class MetadataTests(unittest.TestCase):
     def test_window_knob_defaults_to_eight_and_rejects_other_values(self):
         args = probe.build_parser().parse_args([])
         self.assertEqual(args.window, 8)
+        self.assertFalse(args.source_pre_send)
+        self.assertTrue(probe.build_parser().parse_args(["--source-pre-send"]).source_pre_send)
         for value in (0, 4, 12, 32):
             with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
