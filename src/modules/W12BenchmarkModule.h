@@ -29,6 +29,7 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     static constexpr uint16_t DIAGNOSTIC_REPORT_BYTES = 233;
     static constexpr uint16_t RADIO_DIAGNOSTIC_REPORT_BYTES = 233;
     static constexpr uint16_t RX_LIVENESS_REPORT_BYTES = 80;
+    static constexpr uint16_t PRE_SEND_ATTRIBUTION_REPORT_BYTES = 233;
     static constexpr uint16_t DEFAULT_SIZE = 219;
     static constexpr uint16_t MAX_SIZE = 219;
     static constexpr uint32_t MIN_COUNT = 1000;
@@ -45,6 +46,7 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
         SNAPSHOT_RADIO_DIAGNOSTICS = 6,
         SNAPSHOT_RX_LIVENESS = 7,
         REARM_RX_LIVENESS = 8,
+        SNAPSHOT_PRE_SEND_ATTRIBUTION = 9,
     };
 
     enum class Kind : uint8_t {
@@ -54,6 +56,7 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
         DIAGNOSTICS = 4,
         RADIO_DIAGNOSTICS = 5,
         RX_LIVENESS = 6,
+        PRE_SEND_ATTRIBUTION = 7,
     };
 
     enum class CcaReason : uint8_t {
@@ -64,6 +67,14 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
         RSSI_INVALID = 4,
         ENERGY_BUSY = 5,
         FREE = 6,
+    };
+
+    enum class PreSendBusyReason : uint8_t {
+        UNKNOWN = 0,
+        // This is one primary reason per deferral. BUSY_TX wins when TX and RX are both busy.
+        BUSY_TX = 1,
+        BUSY_RX_ACTIVE = 2,
+        BUSY_RX_IRQ_READ_FAILURE = 3,
     };
 
     enum class RxDecodeResult : uint8_t { Success, Reject, Opaque };
@@ -189,6 +200,40 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
         bool rearmPerformed = false;
     };
 
+    struct PreSendAttributionDiagnostics {
+        uint32_t busyTxDeferrals = 0;
+        uint32_t busyRxActiveDeferrals = 0;
+        uint32_t busyRxIrqReadFailureDeferrals = 0;
+        uint32_t txTimerAccepted = 0;
+        uint32_t txTimerDispatches = 0;
+        uint32_t txTimerLateCount = 0;
+        uint32_t txTimerLateSumMs = 0;
+        uint32_t txTimerLateMaxMs = 0;
+        uint32_t txTimerOverwritten = 0;
+        uint32_t txTimerStale = 0;
+        uint32_t txTimerCancelled = 0;
+        uint32_t txTimerIrqDisplaced = 0;
+        bool txTimerActive = false;
+        uint32_t txTimerDueAtMs = 0;
+        bool rxSampleValid = false;
+        uint8_t rxSampleStatus = 0;
+        uint8_t rxDioLevel = 0;
+        uint8_t rxBusyLevel = 0;
+        uint32_t rxActiveReceiveStartMs = 0;
+        uint32_t rxSampledAtMs = 0;
+        uint32_t rxRawIrqFlags = 0;
+        uint16_t rxRawStatus = 0;
+        uint16_t rxFifoLevel = 0;
+        uint8_t rxFifoFlags = 0;
+        uint8_t txFifoFlags = 0;
+        uint16_t rxChipErrors = 0;
+        int16_t rxIrqReadResult = INT16_MIN;
+        int16_t rxFifoFlagsResult = INT16_MIN;
+        int16_t rxFifoLevelResult = INT16_MIN;
+        int16_t rxErrorsResult = INT16_MIN;
+        uint32_t rxSoftwareState = 0;
+    };
+
     struct RunConfig {
         uint32_t runId = 0;
         NodeNum source = 0;
@@ -234,8 +279,11 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     void onTxStarted(const meshtastic_MeshPacket *packet);
     void onTxFinished(const meshtastic_MeshPacket *packet, RadioInterface::TxState state);
     void onTxDelayScheduled(const meshtastic_MeshPacket *packet, bool accepted);
+    void onTxDelayScheduled(const meshtastic_MeshPacket *packet, bool accepted, uint32_t dueAtMs);
+    void onTxDelayNotification(bool isTxDelay, const meshtastic_MeshPacket *packet);
     void onTxDelayFired(const meshtastic_MeshPacket *packet);
     void onPreCanSendDeferred(const meshtastic_MeshPacket *packet);
+    void onPreCanSendDeferred(const meshtastic_MeshPacket *packet, PreSendBusyReason reason);
     void onCcaDecision(CcaReason reason);
     void onCcaRssiSample(int16_t rssiDbm);
     void onRxIrq(bool readOk, bool rxDone, bool crcError, bool lenError, bool headerCrcError, bool timeout, bool otherError);
@@ -256,6 +304,7 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     Stats getStats() const;
     Diagnostics getDiagnostics() const { return diagnostics; }
     RadioDiagnostics getRadioDiagnostics() const { return radioDiagnostics; }
+    PreSendAttributionDiagnostics getPreSendAttributionDiagnostics() const { return preSendDiagnostics; }
 
     // Public pure wire helpers keep host harnesses independent of object/thread setup.
     static bool decodeControl(const uint8_t *bytes, size_t size, Op &op, RunConfig &config);
@@ -270,6 +319,8 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
                                                uint32_t radioState);
     static size_t encodeRxLivenessReport(uint8_t *bytes, size_t capacity, const Stats &stats,
                                          const RxLivenessDiagnostics &diagnostics, uint8_t pendingTxCount);
+    static size_t encodePreSendAttributionReport(uint8_t *bytes, size_t capacity, const Stats &stats,
+                                                 const PreSendAttributionDiagnostics &diagnostics, uint8_t pendingTxCount);
     static bool validConfig(const RunConfig &config);
 
   protected:
@@ -314,9 +365,16 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     Diagnostics diagnostics;
     RadioDiagnostics radioDiagnostics;
     RxLivenessDiagnostics rxLivenessDiagnostics;
+    PreSendAttributionDiagnostics preSendDiagnostics;
+    const meshtastic_MeshPacket *trackedTxTimerPacket = nullptr;
+    PacketId trackedTxTimerId = 0;
+    uint32_t trackedTxTimerDueAtMs = 0;
+    bool trackedTxTimerActive = false;
     bool rxLivenessSnapshotRequested = false;
     bool rxLivenessSnapshotRunMatches = false;
     bool rxLivenessRearmUsed = false;
+    bool preSendSnapshotRequested = false;
+    bool preSendSnapshotRunMatches = false;
 
     bool isLocalControl(const meshtastic_MeshPacket &mp) const;
     bool handleControl(const meshtastic_MeshPacket &mp);
@@ -342,6 +400,7 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     bool collectTxLifecycleDiagnostics() const;
     bool collectRadioDiagnostics() const;
     bool captureRxLiveness();
+    bool capturePreSendAttribution();
     bool performRxLivenessRearm();
     static void saturatingIncrement(uint32_t &value);
     static void saturatingAdd(uint32_t &value, uint32_t amount);

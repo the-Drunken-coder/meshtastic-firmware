@@ -109,7 +109,12 @@ bool RadioLibInterface::canSendImmediately()
     // To do otherwise would be doubly bad because not only would we drop the packet that was on the way in,
     // we almost certainly guarantee no one outside will like the packet we are sending.
     bool busyTx = sendingPacket != NULL;
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    const W12ActiveReceiveState activeReceiveState = isReceiving ? readW12ActiveReceiveState() : W12ActiveReceiveState::INACTIVE;
+    bool busyRx = activeReceiveState != W12ActiveReceiveState::INACTIVE;
+#else
     bool busyRx = isReceiving && isActivelyReceiving();
+#endif
 
     if (busyTx || busyRx) {
         if (busyTx) {
@@ -127,8 +132,16 @@ bool RadioLibInterface::canSendImmediately()
             LOG_WARN("Can not send yet, busyRx");
         }
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
-        if (w12BenchmarkModule)
-            w12BenchmarkModule->onPreCanSendDeferred(txQueue.getFront());
+        if (w12BenchmarkModule) {
+            if (busyTx)
+                w12BenchmarkModule->onPreCanSendDeferred(txQueue.getFront(), W12BenchmarkModule::PreSendBusyReason::BUSY_TX);
+            else if (activeReceiveState == W12ActiveReceiveState::IRQ_READ_FAILURE)
+                w12BenchmarkModule->onPreCanSendDeferred(txQueue.getFront(),
+                                                         W12BenchmarkModule::PreSendBusyReason::BUSY_RX_IRQ_READ_FAILURE);
+            else
+                w12BenchmarkModule->onPreCanSendDeferred(txQueue.getFront(),
+                                                         W12BenchmarkModule::PreSendBusyReason::BUSY_RX_ACTIVE);
+        }
 #endif
         return false;
     } else
@@ -424,6 +437,11 @@ void RadioLibInterface::deliverPendingIrqFromPoll(PendingISR cause)
 void RadioLibInterface::onNotify(uint32_t notification)
 {
 
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    if (w12BenchmarkModule)
+        w12BenchmarkModule->onTxDelayNotification(notification == TRANSMIT_DELAY_COMPLETED, txQueue.getFront());
+#endif
+
     switch (notification) {
     case ISR_TX:
         handleTransmitInterrupt(); // completeSending() already restored the radio to the home config
@@ -464,7 +482,7 @@ void RadioLibInterface::onNotify(uint32_t notification)
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
                     const bool scheduled = notifyLater(txp->tx_after - now, TRANSMIT_DELAY_COMPLETED, txTimerOverwrite);
                     if (w12BenchmarkModule)
-                        w12BenchmarkModule->onTxDelayScheduled(txp, scheduled);
+                        w12BenchmarkModule->onTxDelayScheduled(txp, scheduled, txp->tx_after);
 #else
                     notifyLater(txp->tx_after - now, TRANSMIT_DELAY_COMPLETED, txTimerOverwrite);
 #endif
@@ -547,7 +565,7 @@ void RadioLibInterface::setTransmitDelay()
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
         const bool scheduled = notifyLater(p->tx_after - now, TRANSMIT_DELAY_COMPLETED, txTimerOverwrite);
         if (w12BenchmarkModule)
-            w12BenchmarkModule->onTxDelayScheduled(p, scheduled);
+            w12BenchmarkModule->onTxDelayScheduled(p, scheduled, p->tx_after);
 #else
         notifyLater(p->tx_after - now, TRANSMIT_DELAY_COMPLETED, txTimerOverwrite);
 #endif
@@ -570,9 +588,10 @@ void RadioLibInterface::startTransmitTimer(bool withDelay)
     if (!txQueue.empty()) {
         uint32_t delay = !withDelay ? 1 : getTxDelayMsec();
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+        const uint32_t dueAtMs = Time::timerEndsAtMillis(delay);
         const bool scheduled = notifyLater(delay, TRANSMIT_DELAY_COMPLETED, txTimerOverwrite); // This will implicitly enable
         if (w12BenchmarkModule)
-            w12BenchmarkModule->onTxDelayScheduled(txQueue.getFront(), scheduled);
+            w12BenchmarkModule->onTxDelayScheduled(txQueue.getFront(), scheduled, dueAtMs);
 #else
         notifyLater(delay, TRANSMIT_DELAY_COMPLETED, txTimerOverwrite); // This will implicitly enable
 #endif
@@ -585,9 +604,10 @@ void RadioLibInterface::startTransmitTimerRebroadcast(meshtastic_MeshPacket *p)
     if (!txQueue.empty()) {
         uint32_t delay = getTxDelayMsecWeighted(p);
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+        const uint32_t dueAtMs = Time::timerEndsAtMillis(delay);
         const bool scheduled = notifyLater(delay, TRANSMIT_DELAY_COMPLETED, txTimerOverwrite); // This will implicitly enable
         if (w12BenchmarkModule)
-            w12BenchmarkModule->onTxDelayScheduled(p, scheduled);
+            w12BenchmarkModule->onTxDelayScheduled(p, scheduled, dueAtMs);
 #else
         notifyLater(delay, TRANSMIT_DELAY_COMPLETED, txTimerOverwrite); // This will implicitly enable
 #endif

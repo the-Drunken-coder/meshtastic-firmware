@@ -1123,6 +1123,87 @@ void test_behavior_mesh_service_rejects_matching_api_data_but_accepts_registered
     TEST_ASSERT_EQUAL_UINT(1, testRadio->pendingCount());
 }
 
+void test_pre_send_attribution_tracks_only_valid_timer_dispatches()
+{
+    const auto run = runConfig();
+    myNodeInfo.my_node_num = run.source;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.source)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::START, run.source)));
+    TEST_ASSERT_EQUAL_INT(0, testModule->runOnce());
+    const auto *packet = testRadio->pendingAt(0);
+
+    // The due timestamp crosses the 32-bit clock wrap. The wrap-safe deadline helper records 3 ms late.
+    Time::setTestMillis(UINT32_MAX - 1);
+    testModule->onTxDelayScheduled(packet, true, 1);
+    testModule->onTxDelayScheduled(packet, false, 7);
+    Time::setTestMillis(4);
+    testModule->onTxDelayNotification(true, packet);
+    auto diagnostics = testModule->getPreSendAttributionDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.txTimerAccepted);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.txTimerDispatches);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.txTimerLateCount);
+    TEST_ASSERT_EQUAL_UINT32(3, diagnostics.txTimerLateSumMs);
+    TEST_ASSERT_EQUAL_UINT32(3, diagnostics.txTimerLateMaxMs);
+    TEST_ASSERT_FALSE(diagnostics.txTimerActive);
+
+    // A second accepted schedule overwrites the tracked slot. A null notification is stale and cannot be late.
+    testModule->onTxDelayScheduled(packet, true, 10);
+    testModule->onTxDelayScheduled(packet, true, 20);
+    Time::setTestMillis(30);
+    testModule->onTxDelayNotification(true, nullptr);
+    diagnostics = testModule->getPreSendAttributionDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(3, diagnostics.txTimerAccepted);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.txTimerOverwritten);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.txTimerStale);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.txTimerLateCount);
+
+    // Cancellation and IRQ displacement clear tracking without producing a late dispatch.
+    testModule->onTxDelayScheduled(packet, true, 40);
+    testModule->onTxFinished(packet, RadioInterface::TxState::Cancelled);
+    diagnostics = testModule->getPreSendAttributionDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.txTimerCancelled);
+    TEST_ASSERT_FALSE(diagnostics.txTimerActive);
+    testRadio->releaseAt(0);
+
+    TEST_ASSERT_EQUAL_INT(0, testModule->runOnce());
+    const auto *nextPacket = testRadio->pendingAt(0);
+    testModule->onTxDelayScheduled(nextPacket, true, 50);
+    testModule->onTxDelayNotification(false, nextPacket);
+    diagnostics = testModule->getPreSendAttributionDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.txTimerIrqDisplaced);
+    TEST_ASSERT_FALSE(diagnostics.txTimerActive);
+
+    testModule->onPreCanSendDeferred(nextPacket, W12BenchmarkModule::PreSendBusyReason::BUSY_TX);
+    testModule->onPreCanSendDeferred(nextPacket, W12BenchmarkModule::PreSendBusyReason::BUSY_RX_ACTIVE);
+    testModule->onPreCanSendDeferred(nextPacket, W12BenchmarkModule::PreSendBusyReason::BUSY_RX_IRQ_READ_FAILURE);
+    diagnostics = testModule->getPreSendAttributionDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.busyTxDeferrals);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.busyRxActiveDeferrals);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.busyRxIrqReadFailureDeferrals);
+}
+
+void test_pre_send_attribution_page_is_fixed_and_local_without_radio_sample()
+{
+    const auto run = runConfig();
+    myNodeInfo.my_node_num = run.source;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.source)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::START, run.source)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::SNAPSHOT_PRE_SEND_ATTRIBUTION, run.source)));
+    meshtastic_MeshPacket *reply = testModule->allocReply();
+    TEST_ASSERT_NOT_NULL(reply);
+    TEST_ASSERT_EQUAL_UINT(W12BenchmarkModule::PRE_SEND_ATTRIBUTION_REPORT_BYTES, reply->decoded.payload.size);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(W12BenchmarkModule::Kind::PRE_SEND_ATTRIBUTION),
+                            reply->decoded.payload.bytes[3]);
+    TEST_ASSERT_EQUAL_UINT8(0, reply->decoded.payload.bytes[73]);
+    TEST_ASSERT_EQUAL_INT16(INT16_MIN, read16s(reply->decoded.payload.bytes, 98));
+    packetPool.release(reply);
+}
+
 void setUp()
 {
     resetTestState();
@@ -1162,6 +1243,8 @@ void setup()
     RUN_TEST(test_report_has_fixed_offsets_for_all_diagnostic_counters);
     RUN_TEST(test_diagnostic_snapshot_is_local_asof_and_keeps_existing_wire_formats);
     RUN_TEST(test_diagnostic_cca_events_are_aggregated_once_and_timing_uses_existing_slots);
+    RUN_TEST(test_pre_send_attribution_tracks_only_valid_timer_dispatches);
+    RUN_TEST(test_pre_send_attribution_page_is_fixed_and_local_without_radio_sample);
     RUN_TEST(test_diagnostic_snapshot_accepts_zero_first_receiver_window);
     RUN_TEST(test_radio_diagnostic_page_tracks_authorization_stages_buckets_and_reset);
     RUN_TEST(test_radio_diagnostic_tail_keeps_rx_done_after_completion_with_pending_tx);

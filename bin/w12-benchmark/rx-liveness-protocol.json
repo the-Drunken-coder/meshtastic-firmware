@@ -27,6 +27,17 @@
       "admission": "local control only, exact current run, destination board, running receiver window, no active TX, no queued TX, and unused one-shot rearm budget",
       "effect": "on a supported LR2021 FLRC interface, calls the existing RadioLibInterface::startReceive() virtual exactly once at the interface boundary; consumes budget only after the call is performed; rejected guards do not mutate state",
       "read_scope": "records software state before and after, then takes one operation-time LR2021 FLRC diagnostic seam call"
+    },
+    "9": {
+      "name": "SNAPSHOT_PRE_SEND_ATTRIBUTION",
+      "reply_kind": 7,
+      "reply_bytes": 233,
+      "authority": "pre-send-attribution-protocol.json",
+      "admission": "exact local self control and prepared running or complete run; read-only board-local snapshot",
+      "probe_scope": "mandatory read-only receiver baseline after receiver RESET/START and before sender START; receiver snapshot required before eligible rearm; source snapshot only with explicit --source-pre-send and a supporting source image",
+      "recovery_authority": false,
+      "rf_delivery_authoritative": false,
+      "baseline_failure": "abort producer startup, retain failed baseline record and stop every successfully started role before closing sessions"
     }
   },
   "report": {
@@ -42,28 +53,160 @@
       "as_of_incomplete": 32
     },
     "fields": [
-      [24, 4, "snapshot_sequence", "u32", "monotonic report sequence reset by RESET"],
-      [28, 4, "snapshot_time_ms", "u32", "owner Time::getMillis() when the operation-time seam sample begins"],
-      [32, 1, "sample_status", "u8", "bit flags below"],
-      [33, 1, "sample_source", "u8", "0 unavailable, 1 LR2021 FLRC seam"],
-      [34, 4, "rearm_count", "u32", "saturating count of performed op8 calls"],
-      [38, 1, "rearm_result", "u8", "0 never performed, 1 software armed after call, 2 software not armed after call"],
-      [39, 1, "rearm_before_state", "u8", "software state bits: isReceiving bit0, rxOffline bit1, IRQ attachment bits2..3, attachment-valid bit4"],
-      [40, 1, "rearm_after_state", "u8", "same software state encoding"],
-      [41, 3, "reserved_rearm", "bytes", "zero"],
-      [44, 4, "rearm_last_time_ms", "u32", "absolute owner millis timestamp, zero if never performed"],
-      [48, 4, "rearm_last_duration_us", "u32", "unsigned micros delta for the performed call, zero if never performed"],
-      [52, 4, "raw_irq_flags", "u32", "fresh IRQ flags from the diagnostic seam when read succeeds"],
-      [56, 2, "raw_status", "u16", "fresh LR2021 status bytes data[0..1], zero if IRQ read fails"],
-      [58, 2, "irq_read_result", "i16", "existing RadioLib result; INT16_MIN means seam unavailable"],
-      [60, 2, "chip_rx_packets", "u16", "cumulative getFlrcRxStats packet counter, no reset"],
-      [62, 2, "chip_crc_errors", "u16", "cumulative getFlrcRxStats CRC counter, no reset"],
-      [64, 2, "chip_len_errors", "u16", "cumulative getFlrcRxStats length counter, no reset"],
-      [66, 2, "chip_stats_result", "i16", "existing RadioLib result; INT16_MIN means seam unavailable"],
-      [68, 2, "rssi_dbm", "i16", "fresh instantaneous RSSI; INT16_MIN means invalid/unavailable"],
-      [70, 2, "rssi_read_result", "i16", "existing RadioLib result; INT16_MIN means seam unavailable"],
-      [72, 4, "software_state", "u32", "owner software state with atomic IRQ attachment; not a hardware RX assertion"],
-      [76, 4, "reserved_tail", "bytes", "zero"]
+      [
+        24,
+        4,
+        "snapshot_sequence",
+        "u32",
+        "monotonic report sequence reset by RESET"
+      ],
+      [
+        28,
+        4,
+        "snapshot_time_ms",
+        "u32",
+        "owner Time::getMillis() when the operation-time seam sample begins"
+      ],
+      [
+        32,
+        1,
+        "sample_status",
+        "u8",
+        "bit flags below"
+      ],
+      [
+        33,
+        1,
+        "sample_source",
+        "u8",
+        "0 unavailable, 1 LR2021 FLRC seam"
+      ],
+      [
+        34,
+        4,
+        "rearm_count",
+        "u32",
+        "saturating count of performed op8 calls"
+      ],
+      [
+        38,
+        1,
+        "rearm_result",
+        "u8",
+        "0 never performed, 1 software armed after call, 2 software not armed after call"
+      ],
+      [
+        39,
+        1,
+        "rearm_before_state",
+        "u8",
+        "software state bits: isReceiving bit0, rxOffline bit1, IRQ attachment bits2..3, attachment-valid bit4"
+      ],
+      [
+        40,
+        1,
+        "rearm_after_state",
+        "u8",
+        "same software state encoding"
+      ],
+      [
+        41,
+        3,
+        "reserved_rearm",
+        "bytes",
+        "zero"
+      ],
+      [
+        44,
+        4,
+        "rearm_last_time_ms",
+        "u32",
+        "absolute owner millis timestamp, zero if never performed"
+      ],
+      [
+        48,
+        4,
+        "rearm_last_duration_us",
+        "u32",
+        "unsigned micros delta for the performed call, zero if never performed"
+      ],
+      [
+        52,
+        4,
+        "raw_irq_flags",
+        "u32",
+        "fresh IRQ flags from the diagnostic seam when read succeeds"
+      ],
+      [
+        56,
+        2,
+        "raw_status",
+        "u16",
+        "fresh LR2021 status bytes data[0..1], zero if IRQ read fails"
+      ],
+      [
+        58,
+        2,
+        "irq_read_result",
+        "i16",
+        "existing RadioLib result; INT16_MIN means seam unavailable"
+      ],
+      [
+        60,
+        2,
+        "chip_rx_packets",
+        "u16",
+        "cumulative getFlrcRxStats packet counter, no reset"
+      ],
+      [
+        62,
+        2,
+        "chip_crc_errors",
+        "u16",
+        "cumulative getFlrcRxStats CRC counter, no reset"
+      ],
+      [
+        64,
+        2,
+        "chip_len_errors",
+        "u16",
+        "cumulative getFlrcRxStats length counter, no reset"
+      ],
+      [
+        66,
+        2,
+        "chip_stats_result",
+        "i16",
+        "existing RadioLib result; INT16_MIN means seam unavailable"
+      ],
+      [
+        68,
+        2,
+        "rssi_dbm",
+        "i16",
+        "fresh instantaneous RSSI; INT16_MIN means invalid/unavailable"
+      ],
+      [
+        70,
+        2,
+        "rssi_read_result",
+        "i16",
+        "existing RadioLib result; INT16_MIN means seam unavailable"
+      ],
+      [
+        72,
+        4,
+        "software_state",
+        "u32",
+        "owner software state with atomic IRQ attachment; not a hardware RX assertion"
+      ],
+      [
+        76,
+        4,
+        "reserved_tail",
+        "bytes",
+        "zero"
+      ]
     ],
     "sample_status_bits": {
       "irq_read_ok": 1,

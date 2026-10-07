@@ -31,6 +31,26 @@ struct W12RxLivenessSample {
     uint32_t softwareState = 0;
 };
 
+enum class W12ActiveReceiveState : uint8_t { INACTIVE = 0, ACTIVE = 1, IRQ_READ_FAILURE = 2 };
+
+struct W12RxRecoverySample {
+    uint32_t rawIrqFlags = 0;
+    uint16_t rawStatus = 0;
+    uint16_t rxFifoLevel = 0;
+    uint8_t fifoRxFlags = 0;
+    uint8_t fifoTxFlags = 0;
+    uint16_t chipErrors = 0;
+    int16_t irqReadResult = INT16_MIN;
+    int16_t fifoFlagsResult = INT16_MIN;
+    int16_t fifoLevelResult = INT16_MIN;
+    int16_t errorsResult = INT16_MIN;
+    uint8_t dioLevel = 0;
+    uint8_t busyLevel = 0;
+    uint32_t activeReceiveStartMs = 0;
+    uint32_t sampledAtMs = 0;
+    uint32_t softwareState = 0;
+};
+
 struct W12RxRearmResult {
     uint32_t beforeState = 0;
     uint32_t afterState = 0;
@@ -237,6 +257,11 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     bool isW12DiagnosticPollContext() const { return w12DiagnosticPollContext; }
     void setW12DiagnosticPollContext(bool active) { w12DiagnosticPollContext = active; }
     virtual bool readW12RxLiveness(W12RxLivenessSample &sample) { return false; }
+    virtual W12ActiveReceiveState readW12ActiveReceiveState()
+    {
+        return isActivelyReceiving() ? W12ActiveReceiveState::ACTIVE : W12ActiveReceiveState::INACTIVE;
+    }
+    virtual bool readW12RxRecovery(W12RxRecoverySample &sample) { return false; }
     virtual bool performW12RxRearm(W12RxRearmResult &result);
 #endif
 

@@ -18,6 +18,7 @@ import dataclasses
 import datetime as _dt
 import hashlib
 import json
+import math
 import os
 import platform
 import secrets
@@ -1732,6 +1733,7 @@ class BoardSession:
         packet_id: int,
         response_key: str,
         config: RunConfig,
+        deadline: float | None = None,
     ) -> bool:
         """Accept only the addressed, identity-matching local board response."""
 
@@ -1741,6 +1743,16 @@ class BoardSession:
             or event.get("to") != self.node_num
             or event.get("from") != self.node_num
         ):
+            return False
+        sent_at = self._last_control.get(packet_id)
+        observed_at = event.get("monotonic")
+        upper_bound = time.monotonic() if deadline is None else deadline
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in (sent_at, observed_at, upper_bound)
+        ) or not sent_at <= observed_at <= upper_bound:
             return False
         response = event.get(response_key)
         if not isinstance(response, Mapping):
@@ -1752,11 +1764,12 @@ class BoardSession:
 
     def snapshot(self, config: RunConfig, timeout: float) -> FirmwareReport:
         packet_id = self.control(CONTROL_SNAPSHOT, config, want_response=True)
+        deadline = self._last_control[packet_id] + timeout
         event = self.capture.wait_for(
             lambda item: self._response_event_matches(
-                item, packet_id, "report", config
+                item, packet_id, "report", config, deadline
             ),
-            timeout,
+            max(0.0, deadline - time.monotonic()),
         )
         if event is None:
             raise BenchmarkError(f"{self.role}: snapshot response timed out")
@@ -1768,11 +1781,12 @@ class BoardSession:
         packet_id = self.control(
             CONTROL_SNAPSHOT_DIAGNOSTICS, config, want_response=True
         )
+        deadline = self._last_control[packet_id] + timeout
         event = self.capture.wait_for(
             lambda item: self._response_event_matches(
-                item, packet_id, "diagnostics", config
+                item, packet_id, "diagnostics", config, deadline
             ),
-            timeout,
+            max(0.0, deadline - time.monotonic()),
         )
         if event is None:
             raise BenchmarkError(f"{self.role}: diagnostic response timed out")
@@ -1784,11 +1798,12 @@ class BoardSession:
         packet_id = self.control(
             CONTROL_SNAPSHOT_RADIO_DIAGNOSTICS, config, want_response=True
         )
+        deadline = self._last_control[packet_id] + timeout
         event = self.capture.wait_for(
             lambda item: self._response_event_matches(
-                item, packet_id, "radio_diagnostics", config
+                item, packet_id, "radio_diagnostics", config, deadline
             ),
-            timeout,
+            max(0.0, deadline - time.monotonic()),
         )
         if event is None:
             raise BenchmarkError(f"{self.role}: radio diagnostic response timed out")
