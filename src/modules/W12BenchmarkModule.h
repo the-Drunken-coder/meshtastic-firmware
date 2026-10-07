@@ -27,6 +27,7 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     static constexpr uint16_t DATA_HEADER_BYTES = 24;
     static constexpr uint16_t REPORT_BYTES = 86;
     static constexpr uint16_t DIAGNOSTIC_REPORT_BYTES = 233;
+    static constexpr uint16_t RADIO_DIAGNOSTIC_REPORT_BYTES = 233;
     static constexpr uint16_t DEFAULT_SIZE = 219;
     static constexpr uint16_t MAX_SIZE = 219;
     static constexpr uint32_t MIN_COUNT = 1000;
@@ -40,6 +41,7 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
         STOP = 3,
         SNAPSHOT = 4,
         SNAPSHOT_DIAGNOSTICS = 5,
+        SNAPSHOT_RADIO_DIAGNOSTICS = 6,
     };
 
     enum class Kind : uint8_t {
@@ -47,6 +49,7 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
         DATA = 2,
         REPORT = 3,
         DIAGNOSTICS = 4,
+        RADIO_DIAGNOSTICS = 5,
     };
 
     enum class CcaReason : uint8_t {
@@ -60,6 +63,8 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     };
 
     enum class RxDecodeResult : uint8_t { Success, Reject, Opaque };
+    enum class RxArmStage : uint8_t { NONE = 0, STANDBY = 1, RX_START = 2, IRQ_MAP = 3 };
+    enum class RadioPhase : uint8_t { RX_START = 0, CHANNEL_ACTIVE = 1, START_SEND = 2 };
 
     struct Diagnostics {
         uint32_t txDelayScheduledAttempts = 0;
@@ -102,6 +107,57 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
         uint32_t moduleReceiveHandlerCount = 0;
         uint32_t moduleReceiveHandlerSumMs = 0;
         uint32_t moduleReceiveHandlerMaxMs = 0;
+    };
+
+    struct RadioDiagnostics {
+        uint32_t rxArmAttempts = 0;
+        uint32_t rxArmSuccesses = 0;
+        uint32_t rxArmFailures = 0;
+        uint32_t rxStandbyCalls = 0;
+        uint32_t rxStandbyFailures = 0;
+        int16_t rxStandbyLastResult = 0;
+        uint32_t rxStartCalls = 0;
+        uint32_t rxStartFailures = 0;
+        int16_t rxStartLastResult = 0;
+        uint32_t rxStartRetryCalls = 0;
+        uint32_t rxIrqMapCalls = 0;
+        uint32_t rxIrqMapFailures = 0;
+        int16_t rxIrqMapLastResult = 0;
+        int16_t rxArmLastResult = 0;
+        uint32_t rxStartDurationCountUs = 0;
+        uint32_t rxStartDurationSumUs = 0;
+        uint32_t rxStartDurationMaxUs = 0;
+        uint32_t channelActiveDurationCountUs = 0;
+        uint32_t channelActiveDurationSumUs = 0;
+        uint32_t channelActiveDurationMaxUs = 0;
+        uint32_t startSendDurationCountUs = 0;
+        uint32_t startSendDurationSumUs = 0;
+        uint32_t startSendDurationMaxUs = 0;
+        uint32_t pollCalls = 0;
+        uint32_t pollRxChecks = 0;
+        uint32_t pollRxReadSuccess = 0;
+        uint32_t pollRxReadFailure = 0;
+        uint32_t pollRxPending = 0;
+        uint32_t pollRxLastFlags = 0;
+        int16_t pollRxLastResult = 0;
+        uint32_t pollRxFlagsOr = 0;
+        uint32_t pollTxChecks = 0;
+        uint32_t pollTxPending = 0;
+        uint8_t pollTxLastDone = 255;
+        uint8_t pollChipStatus0 = 0;
+        uint8_t pollChipStatus1 = 0;
+        uint8_t pollChipStatusObserved = 0;
+        uint32_t pollChipStatusAtMs = 0;
+        uint32_t pollChipRxCount = 0;
+        uint32_t pollChipNonRxCount = 0;
+        uint32_t rxDoneBy5sBucket[12] = {};
+        uint32_t lastRxDoneAtMs = 0;
+        uint32_t lastRxReadAtMs = 0;
+        uint32_t lastRxAuthAtMs = 0;
+        bool hasLastRxDone = false;
+        bool hasLastRxRead = false;
+        bool hasLastRxAuth = false;
+        uint8_t rxArmLastStage = 255;
     };
 
     struct RunConfig {
@@ -160,9 +216,17 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     void onRxDecode(RxDecodeResult result);
     void onRxAuthenticated();
     void onModuleReceiveHandlerDuration(uint32_t elapsedMs);
+    void onRxArmAttempt();
+    void onRxArmStage(RxArmStage stage, int16_t result, bool retry = false);
+    void onRxArmFinished(int16_t result, RxArmStage failureStage);
+    void onRadioPhase(RadioPhase phase, uint32_t elapsedUs);
+    void onRadioPoll();
+    void onRadioPollRx(int16_t result, uint32_t flags, bool pending, uint16_t rawStatus = 0);
+    void onRadioPollTx(bool pending);
 
     Stats getStats() const;
     Diagnostics getDiagnostics() const { return diagnostics; }
+    RadioDiagnostics getRadioDiagnostics() const { return radioDiagnostics; }
 
     // Public pure wire helpers keep host harnesses independent of object/thread setup.
     static bool decodeControl(const uint8_t *bytes, size_t size, Op &op, RunConfig &config);
@@ -172,6 +236,9 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     static size_t encodeReport(uint8_t *bytes, size_t capacity, const Stats &stats);
     static size_t encodeDiagnosticsReport(uint8_t *bytes, size_t capacity, const Stats &stats, const Diagnostics &diagnostics,
                                           uint8_t pendingTxCount);
+    static size_t encodeRadioDiagnosticsReport(uint8_t *bytes, size_t capacity, const Stats &stats,
+                                               const RadioDiagnostics &diagnostics, uint8_t pendingTxCount, uint32_t nowMs,
+                                               uint32_t radioState);
     static bool validConfig(const RunConfig &config);
 
   protected:
@@ -207,9 +274,14 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     bool snapshotRunMatches = false;
     bool diagnosticSnapshotRequested = false;
     bool diagnosticSnapshotRunMatches = false;
+    bool radioDiagnosticSnapshotRequested = false;
+    bool radioDiagnosticSnapshotRunMatches = false;
+    uint32_t radioDiagnosticStartMs = 0;
+    bool radioDiagnosticWindowStarted = false;
     TxSlot txSlots[TX_SLOT_COUNT] = {};
     uint8_t pendingTxCount = 0;
     Diagnostics diagnostics;
+    RadioDiagnostics radioDiagnostics;
 
     bool isLocalControl(const meshtastic_MeshPacket &mp) const;
     bool handleControl(const meshtastic_MeshPacket &mp);
@@ -233,6 +305,7 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     void producerBlocked(uint32_t &reasonCounter);
     bool collectDiagnostics() const;
     bool collectTxLifecycleDiagnostics() const;
+    bool collectRadioDiagnostics() const;
     static void saturatingIncrement(uint32_t &value);
     static void saturatingAdd(uint32_t &value, uint32_t amount);
 };

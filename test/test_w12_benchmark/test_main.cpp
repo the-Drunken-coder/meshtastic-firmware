@@ -42,6 +42,11 @@ uint32_t read32(const uint8_t *bytes, size_t offset)
            static_cast<uint32_t>(bytes[offset + 2]) << 16 | static_cast<uint32_t>(bytes[offset + 3]) << 24;
 }
 
+int16_t read16s(const uint8_t *bytes, size_t offset)
+{
+    return static_cast<int16_t>(static_cast<uint16_t>(bytes[offset]) | static_cast<uint16_t>(bytes[offset + 1]) << 8);
+}
+
 class BenchmarkNodeDB : public NodeDB
 {
   public:
@@ -579,6 +584,134 @@ void test_diagnostic_snapshot_accepts_zero_first_receiver_window()
                           static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.destination)));
 }
 
+void test_radio_diagnostic_page_tracks_authorization_stages_buckets_and_reset()
+{
+    const auto run = runConfig();
+    myNodeInfo.my_node_num = run.destination;
+    Time::setTestMillis(1000);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.destination)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::START, run.destination)));
+
+    TEST_ASSERT_EQUAL_INT(
+        static_cast<int>(ProcessMessage::STOP),
+        static_cast<int>(sendControl(run, W12BenchmarkModule::Op::SNAPSHOT_RADIO_DIAGNOSTICS, run.destination)));
+    meshtastic_MeshPacket *initialReply = testModule->allocReply();
+    TEST_ASSERT_NOT_NULL(initialReply);
+    TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, read32(initialReply->decoded.payload.bytes, 204));
+    TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, read32(initialReply->decoded.payload.bytes, 208));
+    TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, read32(initialReply->decoded.payload.bytes, 212));
+    TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, read32(initialReply->decoded.payload.bytes, 220));
+    packetPool.release(initialReply);
+
+    W12BenchmarkModule::RadioDiagnostics signedDiagnostics;
+    signedDiagnostics.rxStandbyLastResult = -7;
+    W12BenchmarkModule::Stats signedStats;
+    signedStats.config = run;
+    uint8_t signedWire[W12BenchmarkModule::RADIO_DIAGNOSTIC_REPORT_BYTES] = {};
+    TEST_ASSERT_EQUAL_UINT(W12BenchmarkModule::RADIO_DIAGNOSTIC_REPORT_BYTES,
+                           W12BenchmarkModule::encodeRadioDiagnosticsReport(signedWire, sizeof(signedWire), signedStats,
+                                                                            signedDiagnostics, 0, 0, 0));
+    TEST_ASSERT_EQUAL_INT16(-7, read16s(signedWire, 44));
+
+    auto wrongRun = run;
+    wrongRun.runId++;
+    TEST_ASSERT_EQUAL_INT(
+        static_cast<int>(ProcessMessage::CONTINUE),
+        static_cast<int>(sendControl(wrongRun, W12BenchmarkModule::Op::SNAPSHOT_RADIO_DIAGNOSTICS, run.destination)));
+    TEST_ASSERT_NULL(testModule->allocReply());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::SNAPSHOT_RADIO_DIAGNOSTICS, run.destination,
+                                                       meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA, run.source)));
+
+    testModule->onRxArmAttempt();
+    testModule->onRxArmStage(W12BenchmarkModule::RxArmStage::STANDBY, -7);
+    testModule->onRxArmFinished(-7, W12BenchmarkModule::RxArmStage::STANDBY);
+    testModule->onRxArmAttempt();
+    testModule->onRxArmStage(W12BenchmarkModule::RxArmStage::STANDBY, 0);
+    testModule->onRxArmStage(W12BenchmarkModule::RxArmStage::RX_START, -8);
+    testModule->onRxArmFinished(-8, W12BenchmarkModule::RxArmStage::RX_START);
+    testModule->onRxArmAttempt();
+    testModule->onRxArmStage(W12BenchmarkModule::RxArmStage::STANDBY, 0);
+    testModule->onRxArmStage(W12BenchmarkModule::RxArmStage::RX_START, 0);
+    testModule->onRxArmStage(W12BenchmarkModule::RxArmStage::IRQ_MAP, -9);
+    testModule->onRxArmFinished(-9, W12BenchmarkModule::RxArmStage::IRQ_MAP);
+    testModule->onRxArmAttempt();
+    testModule->onRxArmStage(W12BenchmarkModule::RxArmStage::STANDBY, 0);
+    testModule->onRxArmStage(W12BenchmarkModule::RxArmStage::RX_START, 0);
+    testModule->onRxArmStage(W12BenchmarkModule::RxArmStage::IRQ_MAP, 0);
+    testModule->onRxArmFinished(0, W12BenchmarkModule::RxArmStage::NONE);
+    testModule->onRadioPhase(W12BenchmarkModule::RadioPhase::RX_START, 11);
+    testModule->onRadioPhase(W12BenchmarkModule::RadioPhase::CHANNEL_ACTIVE, 22);
+    testModule->onRadioPhase(W12BenchmarkModule::RadioPhase::START_SEND, 33);
+    testModule->onRadioPoll();
+    testModule->onRadioPollRx(0, 0x01020304, true, 0x0404);
+    testModule->onRadioPollRx(-8, 0, false);
+    testModule->onRadioPollRx(0, 0x00000001, false, 0x0402);
+    testModule->onRadioPollTx(false);
+    testModule->onRadioPollTx(true);
+
+    testModule->onRxIrq(true, true, false, false, false, false, false);
+    Time::setTestMillis(6000);
+    testModule->onRxIrq(true, true, false, false, false, false, false);
+    testModule->onRxRead(true);
+    testModule->onRxAuthenticated();
+    Time::setTestMillis(7000);
+
+    TEST_ASSERT_EQUAL_INT(
+        static_cast<int>(ProcessMessage::STOP),
+        static_cast<int>(sendControl(run, W12BenchmarkModule::Op::SNAPSHOT_RADIO_DIAGNOSTICS, run.destination)));
+    meshtastic_MeshPacket *reply = testModule->allocReply();
+    TEST_ASSERT_NOT_NULL(reply);
+    const uint8_t *wire = reply->decoded.payload.bytes;
+    TEST_ASSERT_EQUAL_UINT(W12BenchmarkModule::RADIO_DIAGNOSTIC_REPORT_BYTES, reply->decoded.payload.size);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(W12BenchmarkModule::Kind::RADIO_DIAGNOSTICS), wire[3]);
+    TEST_ASSERT_EQUAL_UINT8(1 | 2 | 32, wire[20]);
+    TEST_ASSERT_EQUAL_UINT8(0, wire[21]);
+    TEST_ASSERT_EQUAL_UINT32(4, read32(wire, 24));
+    TEST_ASSERT_EQUAL_UINT32(1, read32(wire, 28));
+    TEST_ASSERT_EQUAL_UINT32(3, read32(wire, 32));
+    TEST_ASSERT_EQUAL_UINT32(1, read32(wire, 40));
+    TEST_ASSERT_EQUAL_INT16(0, read16s(wire, 44));
+    TEST_ASSERT_EQUAL_UINT32(3, read32(wire, 46));
+    TEST_ASSERT_EQUAL_UINT32(1, read32(wire, 50));
+    TEST_ASSERT_EQUAL_UINT32(1, read32(wire, 64));
+    TEST_ASSERT_EQUAL_UINT32(2, read32(wire, 60));
+    TEST_ASSERT_EQUAL_UINT32(11, read32(wire, 76));
+    TEST_ASSERT_EQUAL_UINT32(1, read32(wire, 108));
+    TEST_ASSERT_EQUAL_UINT32(3, read32(wire, 112));
+    TEST_ASSERT_EQUAL_UINT32(2, read32(wire, 116));
+    TEST_ASSERT_EQUAL_UINT32(1, read32(wire, 120));
+    TEST_ASSERT_EQUAL_UINT32(1, read32(wire, 124));
+    TEST_ASSERT_EQUAL_UINT32(0x01020305, read32(wire, 134));
+    TEST_ASSERT_EQUAL_UINT32(1, read32(wire, 156));
+    TEST_ASSERT_EQUAL_UINT32(1, read32(wire, 160));
+    TEST_ASSERT_EQUAL_UINT32(1000, read32(wire, 204));
+    TEST_ASSERT_EQUAL_UINT32(1000, read32(wire, 208));
+    TEST_ASSERT_EQUAL_UINT32(1000, read32(wire, 212));
+    TEST_ASSERT_EQUAL_UINT8(0, wire[147]);
+    TEST_ASSERT_EQUAL_UINT8(255, wire[151]);
+    TEST_ASSERT_EQUAL_UINT8(4, wire[217]);
+    TEST_ASSERT_EQUAL_UINT8(2, wire[218]);
+    TEST_ASSERT_EQUAL_UINT8(1, wire[219]);
+    TEST_ASSERT_EQUAL_UINT32(6000, read32(wire, 220));
+    TEST_ASSERT_EQUAL_UINT32(1, read32(wire, 224));
+    TEST_ASSERT_EQUAL_UINT32(1, read32(wire, 228));
+    packetPool.release(reply);
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.destination)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::STOP, run.destination)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.destination)));
+    const auto radioDiagnostics = testModule->getRadioDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(0, radioDiagnostics.rxArmAttempts);
+    TEST_ASSERT_EQUAL_UINT8(255, radioDiagnostics.rxArmLastStage);
+    TEST_ASSERT_EQUAL_UINT8(255, radioDiagnostics.pollTxLastDone);
+}
+
 void test_behavior_control_is_local_authorized_and_reset_is_not_mid_run()
 {
     const auto run = runConfig();
@@ -617,6 +750,42 @@ void test_behavior_control_is_local_authorized_and_reset_is_not_mid_run()
     TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
                           static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.source)));
     TEST_ASSERT_TRUE(testModule->getStats().running);
+}
+
+void test_radio_diagnostic_tail_keeps_rx_done_after_completion_with_pending_tx()
+{
+    const auto run = runConfig();
+    myNodeInfo.my_node_num = run.source;
+    Time::setTestMillis(0);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.source)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::START, run.source)));
+    TEST_ASSERT_EQUAL_INT(0, testModule->runOnce());
+    TEST_ASSERT_EQUAL_UINT(1, testRadio->pendingCount());
+
+    testModule->onRxIrq(true, true, false, false, false, false, false);
+    Time::setTestMillis(5);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::STOP, run.source)));
+    testModule->onRxIrq(true, true, false, false, false, false, false);
+    TEST_ASSERT_EQUAL_UINT32(1, testModule->getDiagnostics().rxIrqDone);
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::SNAPSHOT_RADIO_DIAGNOSTICS, run.source)));
+    meshtastic_MeshPacket *reply = testModule->allocReply();
+    TEST_ASSERT_NOT_NULL(reply);
+    const uint8_t *wire = reply->decoded.payload.bytes;
+    TEST_ASSERT_EQUAL_UINT8(1 | 4 | 16 | 32, wire[20]);
+    TEST_ASSERT_EQUAL_UINT8(1, wire[21]);
+    TEST_ASSERT_EQUAL_UINT32(2, read32(wire, 156));
+    TEST_ASSERT_EQUAL_UINT32(0, read32(wire, 204));
+    packetPool.release(reply);
+
+    testRadio->finishAt(0, RadioInterface::TxState::Sent);
+    TEST_ASSERT_EQUAL_UINT(static_cast<unsigned>(0), testRadio->pendingCount());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.source)));
 }
 
 void test_behavior_producer_uses_real_service_and_terminal_slots()
@@ -801,6 +970,8 @@ void setup()
     RUN_TEST(test_diagnostic_snapshot_is_local_asof_and_keeps_existing_wire_formats);
     RUN_TEST(test_diagnostic_cca_events_are_aggregated_once_and_timing_uses_existing_slots);
     RUN_TEST(test_diagnostic_snapshot_accepts_zero_first_receiver_window);
+    RUN_TEST(test_radio_diagnostic_page_tracks_authorization_stages_buckets_and_reset);
+    RUN_TEST(test_radio_diagnostic_tail_keeps_rx_done_after_completion_with_pending_tx);
     RUN_TEST(test_behavior_control_is_local_authorized_and_reset_is_not_mid_run);
     RUN_TEST(test_behavior_producer_uses_real_service_and_terminal_slots);
     RUN_TEST(test_behavior_receiver_requires_direct_authenticated_rf_and_validates_pattern);

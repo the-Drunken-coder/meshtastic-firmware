@@ -127,24 +127,75 @@ void LR2021Interface::startReceive()
         LR20x0Interface::startReceive();
         return;
     }
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    const uint32_t phaseStartedAt = micros();
+    if (w12BenchmarkModule)
+        w12BenchmarkModule->onRxArmAttempt();
+#endif
     int16_t result = standbyFlrc();
-    if (result == RADIOLIB_ERR_NONE)
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    W12BenchmarkModule::RxArmStage failureStage = W12BenchmarkModule::RxArmStage::STANDBY;
+#endif
+    if (result == RADIOLIB_ERR_NONE) {
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+        if (w12BenchmarkModule)
+            w12BenchmarkModule->onRxArmStage(W12BenchmarkModule::RxArmStage::STANDBY, result);
+#endif
         result = lora.startReceive(RADIOLIB_LR2021_RX_TIMEOUT_INF);
-    if (result != RADIOLIB_ERR_NONE && maybeRecoverChipStateLoss())
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+        if (w12BenchmarkModule)
+            w12BenchmarkModule->onRxArmStage(W12BenchmarkModule::RxArmStage::RX_START, result);
+#endif
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+        failureStage = W12BenchmarkModule::RxArmStage::RX_START;
+#endif
+    } else {
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+        if (w12BenchmarkModule)
+            w12BenchmarkModule->onRxArmStage(W12BenchmarkModule::RxArmStage::STANDBY, result);
+#endif
+    }
+    if (result != RADIOLIB_ERR_NONE && maybeRecoverChipStateLoss()) {
         result = lora.startReceive(RADIOLIB_LR2021_RX_TIMEOUT_INF);
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+        if (w12BenchmarkModule)
+            w12BenchmarkModule->onRxArmStage(W12BenchmarkModule::RxArmStage::RX_START, result, true);
+        failureStage = W12BenchmarkModule::RxArmStage::RX_START;
+#endif
+    }
     // The generic IRQ map misses terminal FLRC LEN_ERROR and command errors.
-    if (result == RADIOLIB_ERR_NONE)
+    if (result == RADIOLIB_ERR_NONE) {
         result = lora.setIrqFlags(W12FlrcProfile::RECEIVE_IRQS);
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+        if (w12BenchmarkModule)
+            w12BenchmarkModule->onRxArmStage(W12BenchmarkModule::RxArmStage::IRQ_MAP, result);
+        failureStage = W12BenchmarkModule::RxArmStage::IRQ_MAP;
+#endif
+    }
     if (result != RADIOLIB_ERR_NONE) {
         rxOffline = true;
         RadioMode::markInitialized(false);
         LOG_ERROR("FLRC RX offline %s%d", radioLibErr, result);
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+        if (w12BenchmarkModule) {
+            w12BenchmarkModule->onRxArmFinished(result, failureStage);
+            w12BenchmarkModule->onRadioPhase(W12BenchmarkModule::RadioPhase::RX_START,
+                                             static_cast<uint32_t>(micros() - phaseStartedAt));
+        }
+#endif
         return;
     }
     RadioLibInterface::startReceive();
     RadioMode::markInitialized(true);
     enableInterrupt(isrRxLevel0);
     checkRxDoneIrqFlag();
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    if (w12BenchmarkModule) {
+        w12BenchmarkModule->onRxArmFinished(RADIOLIB_ERR_NONE, W12BenchmarkModule::RxArmStage::NONE);
+        w12BenchmarkModule->onRadioPhase(W12BenchmarkModule::RadioPhase::RX_START,
+                                         static_cast<uint32_t>(micros() - phaseStartedAt));
+    }
+#endif
 }
 
 bool LR2021Interface::isChannelActive()
@@ -273,7 +324,22 @@ bool LR2021Interface::receiveIrqPending()
     if (!RadioMode::isFlrc())
         return RadioLibInterface::receiveIrqPending();
     uint32_t flags = 0;
-    return W12FlrcProfile::readIrqFlags(module, flags) != RADIOLIB_ERR_NONE || (flags & W12FlrcProfile::RECEIVE_IRQS);
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    const bool diagnosticPoll = w12BenchmarkModule && isW12DiagnosticPollContext();
+    uint16_t rawStatus = 0;
+#endif
+    const int16_t result =
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+        diagnosticPoll ? W12FlrcProfile::readIrqFlags(module, flags, &rawStatus) : W12FlrcProfile::readIrqFlags(module, flags);
+#else
+        W12FlrcProfile::readIrqFlags(module, flags);
+#endif
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    if (diagnosticPoll)
+        w12BenchmarkModule->onRadioPollRx(result, flags, result != RADIOLIB_ERR_NONE || (flags & W12FlrcProfile::RECEIVE_IRQS),
+                                          rawStatus);
+#endif
+    return result != RADIOLIB_ERR_NONE || (flags & W12FlrcProfile::RECEIVE_IRQS);
 }
 
 bool LR2021Interface::validReceiveIrq()

@@ -45,17 +45,21 @@ DEFAULT_DRAIN_SECONDS = 10.0
 DEFAULT_COMMAND_GAP_SECONDS = 0.20
 DEFAULT_CONTROL_TIMEOUT_SECONDS = 15.0
 DEFAULT_COMPLETION_TIMEOUT_SECONDS = 60.0
+DEFAULT_CLOSE_TIMEOUT_SECONDS = 5.0
 HOST_CLOCK_DISCONTINUITY_TOLERANCE_SECONDS = 2.0
 CONTROL_RESET = 1
 CONTROL_START = 2
 CONTROL_STOP = 3
 CONTROL_SNAPSHOT = 4
 CONTROL_SNAPSHOT_DIAGNOSTICS = 5
+CONTROL_SNAPSHOT_RADIO_DIAGNOSTICS = 6
 DATA_KIND = 2
 REPORT_KIND = 3
 DIAGNOSTIC_KIND = 4
 FLAG_NONE = 0
 DIAGNOSTIC_STATUS_MASK = 0x3F
+RADIO_DIAGNOSTIC_STATUS_MASK = 0x37
+UINT32_MAX = 0xFFFFFFFF
 
 BOARD_IDENTITIES: dict[str, tuple[str, int]] = {
     "base": ("44:B1:76:AE:19:14", 2686237816),
@@ -208,6 +212,100 @@ class DiagnosticReport:
 
 
 @dataclasses.dataclass(frozen=True)
+class RadioDiagnosticReport:
+    """Strictly decoded kind-5 board-local radio phase diagnostics."""
+
+    run_id: int
+    source: int
+    destination: int
+    elapsed_ms: int
+    status: int
+    pending_tx_count: int
+    rx_arm_attempts: int
+    rx_arm_successes: int
+    rx_arm_failures: int
+    rx_standby_calls: int
+    rx_standby_failures: int
+    rx_standby_last_result: int
+    rx_start_calls: int
+    rx_start_failures: int
+    rx_start_last_result: int
+    rx_start_retry_calls: int
+    rx_irq_map_calls: int
+    rx_irq_map_failures: int
+    rx_irq_map_last_result: int
+    rx_arm_last_result: int
+    rx_start_duration_count_us: int
+    rx_start_duration_sum_us: int
+    rx_start_duration_max_us: int
+    channel_active_duration_count_us: int
+    channel_active_duration_sum_us: int
+    channel_active_duration_max_us: int
+    start_send_duration_count_us: int
+    start_send_duration_sum_us: int
+    start_send_duration_max_us: int
+    poll_calls: int
+    poll_rx_checks: int
+    poll_rx_read_success: int
+    poll_rx_read_failure: int
+    poll_rx_pending: int
+    poll_rx_last_flags: int
+    poll_rx_last_result: int
+    poll_rx_flags_or: int
+    poll_tx_checks: int
+    poll_tx_pending: int
+    poll_tx_last_done: int
+    snapshot_is_receiving: int
+    snapshot_rx_offline: int
+    snapshot_irq_attachment: int
+    snapshot_state_valid: int
+    irq_gpio_level: int
+    irq_gpio_source: int
+    poll_chip_status0: int
+    poll_chip_status1: int
+    poll_chip_status_observed: int
+    poll_chip_status_age_ms: int
+    poll_chip_rx_count: int
+    poll_chip_nonrx_count: int
+    rx_done_by_5s_bucket: tuple[int, ...]
+    last_rx_done_age_ms: int
+    last_rx_read_age_ms: int
+    last_rx_auth_age_ms: int
+    rx_arm_last_stage: int
+    raw: bytes = dataclasses.field(repr=False, compare=False, default=b"")
+
+    @property
+    def prepared(self) -> bool:
+        return bool(self.status & 0x01)
+
+    @property
+    def running(self) -> bool:
+        return bool(self.status & 0x02)
+
+    @property
+    def complete(self) -> bool:
+        return bool(self.status & 0x04)
+
+    @property
+    def as_of_incomplete(self) -> bool:
+        return bool(self.status & 0x20)
+
+    @property
+    def snapshot_terminal(self) -> bool:
+        return (
+            self.prepared
+            and self.complete
+            and not self.running
+            and self.pending_tx_count == 0
+            and not self.as_of_incomplete
+        )
+
+    @property
+    def coverage_complete(self) -> bool:
+        return self.snapshot_terminal and self.elapsed_ms == int(DEFAULT_WALL_SECONDS * 1000)
+
+
+@dataclasses.dataclass(frozen=True)
 class CompletionResult:
     report: FirmwareReport | None
     polls: int
@@ -268,6 +366,7 @@ def encode_control(config: RunConfig, operation: int) -> bytes:
         CONTROL_STOP,
         CONTROL_SNAPSHOT,
         CONTROL_SNAPSHOT_DIAGNOSTICS,
+        CONTROL_SNAPSHOT_RADIO_DIAGNOSTICS,
     ):
         raise BenchmarkError(f"unsupported control operation {operation}")
     payload = bytearray(CONTROL_BYTES)
@@ -307,6 +406,7 @@ def decode_control(payload: bytes) -> tuple[int, RunConfig]:
         CONTROL_STOP,
         CONTROL_SNAPSHOT,
         CONTROL_SNAPSHOT_DIAGNOSTICS,
+        CONTROL_SNAPSHOT_RADIO_DIAGNOSTICS,
     ):
         raise BenchmarkError("invalid control operation")
     validate_config(config)
@@ -599,6 +699,246 @@ def _diagnostic_dict(report: DiagnosticReport) -> dict[str, Any]:
         else "prepared"
         if report.prepared
         else "unprepared"
+    )
+    return values
+
+
+def decode_radio_diagnostics(payload: bytes) -> RadioDiagnosticReport:
+    """Decode the frozen 233-byte kind-5 radio phase report strictly."""
+
+    if len(payload) != DIAGNOSTIC_REPORT_BYTES:
+        raise BenchmarkError(
+            f"radio diagnostic payload must be exactly {DIAGNOSTIC_REPORT_BYTES} bytes"
+        )
+    if (
+        _read16(payload, 0) != MAGIC
+        or payload[2] != VERSION
+        or payload[3] != 5
+    ):
+        raise BenchmarkError("invalid radio diagnostic magic, version, or kind")
+    if payload[22:24] != b"\x00\x00":
+        raise BenchmarkError("radio diagnostic header reserved bytes are not zero")
+    if payload[153:156] != b"\x00\x00\x00" or payload[232] != 0:
+        raise BenchmarkError("radio diagnostic reserved bytes are not zero")
+    status = payload[20]
+    pending_tx_count = payload[21]
+    if status & ~RADIO_DIAGNOSTIC_STATUS_MASK:
+        raise BenchmarkError("radio diagnostic contains unknown status bits")
+    prepared = bool(status & 0x01)
+    running = bool(status & 0x02)
+    complete = bool(status & 0x04)
+    if not prepared:
+        raise BenchmarkError("radio diagnostic report is not prepared")
+    if running and complete:
+        raise BenchmarkError("radio diagnostic cannot be running and complete")
+    if bool(status & 0x10) != bool(pending_tx_count):
+        raise BenchmarkError("radio diagnostic pending status does not match count")
+    if bool(status & 0x20) != (running or bool(pending_tx_count)):
+        raise BenchmarkError("radio diagnostic as-of status does not match state")
+    if (running or complete or pending_tx_count) and not prepared:
+        raise BenchmarkError("radio diagnostic state is active without prepared status")
+    poll_tx_last_done = payload[146]
+    if poll_tx_last_done not in (0, 1, 0xFF):
+        raise BenchmarkError("radio diagnostic poll TX state is invalid")
+    snapshot_irq_attachment = payload[149]
+    if snapshot_irq_attachment not in (0, 1, 2, 3):
+        raise BenchmarkError("radio diagnostic IRQ attachment state is invalid")
+    snapshot_state_valid = payload[150]
+    if snapshot_state_valid not in (0, 1):
+        raise BenchmarkError("radio diagnostic state-valid flag is invalid")
+    if payload[147] not in (0, 1) or payload[148] not in (0, 1):
+        raise BenchmarkError("radio diagnostic software state is invalid")
+    poll_chip_status_observed = payload[219]
+    if poll_chip_status_observed not in (0, 1):
+        raise BenchmarkError("radio diagnostic chip-status flag is invalid")
+    irq_gpio_source = payload[152]
+    if irq_gpio_source != 0:
+        raise BenchmarkError("radio diagnostic GPIO source is unsupported")
+    rx_arm_last_stage = payload[216]
+    if rx_arm_last_stage not in (0, 1, 2, 3, 0xFF):
+        raise BenchmarkError("radio diagnostic arm stage is invalid")
+    return RadioDiagnosticReport(
+        run_id=_diagnostic_u32(payload, 4),
+        source=_diagnostic_u32(payload, 8),
+        destination=_diagnostic_u32(payload, 12),
+        elapsed_ms=_diagnostic_u32(payload, 16),
+        status=status,
+        pending_tx_count=pending_tx_count,
+        rx_arm_attempts=_diagnostic_u32(payload, 24),
+        rx_arm_successes=_diagnostic_u32(payload, 28),
+        rx_arm_failures=_diagnostic_u32(payload, 32),
+        rx_standby_calls=_diagnostic_u32(payload, 36),
+        rx_standby_failures=_diagnostic_u32(payload, 40),
+        rx_standby_last_result=_diagnostic_u16_signed(payload, 44),
+        rx_start_calls=_diagnostic_u32(payload, 46),
+        rx_start_failures=_diagnostic_u32(payload, 50),
+        rx_start_last_result=_diagnostic_u16_signed(payload, 54),
+        rx_start_retry_calls=_diagnostic_u32(payload, 56),
+        rx_irq_map_calls=_diagnostic_u32(payload, 60),
+        rx_irq_map_failures=_diagnostic_u32(payload, 64),
+        rx_irq_map_last_result=_diagnostic_u16_signed(payload, 68),
+        rx_arm_last_result=_diagnostic_u16_signed(payload, 70),
+        rx_start_duration_count_us=_diagnostic_u32(payload, 72),
+        rx_start_duration_sum_us=_diagnostic_u32(payload, 76),
+        rx_start_duration_max_us=_diagnostic_u32(payload, 80),
+        channel_active_duration_count_us=_diagnostic_u32(payload, 84),
+        channel_active_duration_sum_us=_diagnostic_u32(payload, 88),
+        channel_active_duration_max_us=_diagnostic_u32(payload, 92),
+        start_send_duration_count_us=_diagnostic_u32(payload, 96),
+        start_send_duration_sum_us=_diagnostic_u32(payload, 100),
+        start_send_duration_max_us=_diagnostic_u32(payload, 104),
+        poll_calls=_diagnostic_u32(payload, 108),
+        poll_rx_checks=_diagnostic_u32(payload, 112),
+        poll_rx_read_success=_diagnostic_u32(payload, 116),
+        poll_rx_read_failure=_diagnostic_u32(payload, 120),
+        poll_rx_pending=_diagnostic_u32(payload, 124),
+        poll_rx_last_flags=_diagnostic_u32(payload, 128),
+        poll_rx_last_result=_diagnostic_u16_signed(payload, 132),
+        poll_rx_flags_or=_diagnostic_u32(payload, 134),
+        poll_tx_checks=_diagnostic_u32(payload, 138),
+        poll_tx_pending=_diagnostic_u32(payload, 142),
+        poll_tx_last_done=poll_tx_last_done,
+        snapshot_is_receiving=payload[147],
+        snapshot_rx_offline=payload[148],
+        snapshot_irq_attachment=snapshot_irq_attachment,
+        snapshot_state_valid=snapshot_state_valid,
+        irq_gpio_level=payload[151],
+        irq_gpio_source=irq_gpio_source,
+        poll_chip_status0=payload[217],
+        poll_chip_status1=payload[218],
+        poll_chip_status_observed=poll_chip_status_observed,
+        poll_chip_status_age_ms=_diagnostic_u32(payload, 220),
+        poll_chip_rx_count=_diagnostic_u32(payload, 224),
+        poll_chip_nonrx_count=_diagnostic_u32(payload, 228),
+        rx_done_by_5s_bucket=tuple(
+            _diagnostic_u32(payload, 156 + index * 4) for index in range(12)
+        ),
+        last_rx_done_age_ms=_diagnostic_u32(payload, 204),
+        last_rx_read_age_ms=_diagnostic_u32(payload, 208),
+        last_rx_auth_age_ms=_diagnostic_u32(payload, 212),
+        rx_arm_last_stage=rx_arm_last_stage,
+        raw=bytes(payload),
+    )
+
+
+def _radio_diagnostic_dict(report: RadioDiagnosticReport) -> dict[str, Any]:
+    """Serialize kind-5 diagnostics with software-state and coverage labels."""
+
+    stage_labels = {
+        0: "success",
+        1: "standby",
+        2: "rx_start",
+        3: "irq_map",
+        0xFF: "no_attempt",
+    }
+    attachment_labels = {
+        0: "none",
+        1: "rx_callback",
+        2: "tx_callback",
+        3: "unknown",
+    }
+    def age(value: int) -> int | None:
+        return None if value == UINT32_MAX else value
+
+    values: dict[str, Any] = {
+        "scope": "board_local_radio_phase",
+        "run_id": report.run_id,
+        "source": report.source,
+        "destination": report.destination,
+        "elapsed_ms": report.elapsed_ms,
+        "status_bits": report.status,
+        "prepared": report.prepared,
+        "running": report.running,
+        "complete": report.complete,
+        "as_of_incomplete": report.as_of_incomplete,
+        "snapshot_terminal": report.snapshot_terminal,
+        "coverage_complete": report.coverage_complete,
+        "rf_coverage_authoritative": False,
+        "coverage_note": "board-local radio phase counters do not establish RF delivery coverage",
+        "pending_tx_count": report.pending_tx_count,
+        "rx_arm_attempts": report.rx_arm_attempts,
+        "rx_arm_successes": report.rx_arm_successes,
+        "rx_arm_failures": report.rx_arm_failures,
+        "rx_standby_calls": report.rx_standby_calls,
+        "rx_standby_failures": report.rx_standby_failures,
+        "rx_standby_last_result": report.rx_standby_last_result,
+        "rx_start_calls": report.rx_start_calls,
+        "rx_start_failures": report.rx_start_failures,
+        "rx_start_last_result": report.rx_start_last_result,
+        "rx_start_retry_calls": report.rx_start_retry_calls,
+        "rx_irq_map_calls": report.rx_irq_map_calls,
+        "rx_irq_map_failures": report.rx_irq_map_failures,
+        "rx_irq_map_last_result": report.rx_irq_map_last_result,
+        "rx_arm_last_result": report.rx_arm_last_result,
+        "rx_start_duration_count_us": report.rx_start_duration_count_us,
+        "rx_start_duration_sum_us": report.rx_start_duration_sum_us,
+        "rx_start_duration_max_us": report.rx_start_duration_max_us,
+        "channel_active_duration_count_us": report.channel_active_duration_count_us,
+        "channel_active_duration_sum_us": report.channel_active_duration_sum_us,
+        "channel_active_duration_max_us": report.channel_active_duration_max_us,
+        "start_send_duration_count_us": report.start_send_duration_count_us,
+        "start_send_duration_sum_us": report.start_send_duration_sum_us,
+        "start_send_duration_max_us": report.start_send_duration_max_us,
+        "poll_calls": report.poll_calls,
+        "poll_rx_checks": report.poll_rx_checks,
+        "poll_rx_read_success": report.poll_rx_read_success,
+        "poll_rx_read_failure": report.poll_rx_read_failure,
+        "poll_rx_pending": report.poll_rx_pending,
+        "poll_rx_last_flags": report.poll_rx_last_flags,
+        "poll_rx_last_result": report.poll_rx_last_result,
+        "poll_rx_flags_or": report.poll_rx_flags_or,
+        "poll_tx_checks": report.poll_tx_checks,
+        "poll_tx_pending": report.poll_tx_pending,
+        "poll_tx_last_done": None if report.poll_tx_last_done == 0xFF else bool(report.poll_tx_last_done),
+        "poll_tx_last_done_unknown": report.poll_tx_last_done == 0xFF,
+        "snapshot_is_receiving": bool(report.snapshot_is_receiving),
+        "snapshot_rx_offline": bool(report.snapshot_rx_offline),
+        "snapshot_irq_attachment": attachment_labels[report.snapshot_irq_attachment],
+        "snapshot_state_valid": bool(report.snapshot_state_valid),
+        "irq_gpio_level": None if report.irq_gpio_level == 0xFF else report.irq_gpio_level,
+        "irq_gpio_unavailable": report.irq_gpio_level == 0xFF,
+        "irq_gpio_source": "unavailable" if report.irq_gpio_source == 0 else report.irq_gpio_source,
+        "poll_chip_status0": report.poll_chip_status0,
+        "poll_chip_status1": report.poll_chip_status1,
+        "poll_chip_status_observed": bool(report.poll_chip_status_observed),
+        "poll_chip_status_age_ms": age(report.poll_chip_status_age_ms),
+        "poll_chip_status_age_unknown": report.poll_chip_status_age_ms == UINT32_MAX,
+        "poll_chip_rx_count": report.poll_chip_rx_count,
+        "poll_chip_nonrx_count": report.poll_chip_nonrx_count,
+        "poll_chip_mode_source": "poll_chip_status1 low three bits",
+        "rx_done_by_5s_bucket": list(report.rx_done_by_5s_bucket),
+        "rx_done_bucket_anchor": "local_START",
+        "rx_done_bucket_labels": [
+            "0..4s",
+            "5..9s",
+            "10..14s",
+            "15..19s",
+            "20..24s",
+            "25..29s",
+            "30..34s",
+            "35..39s",
+            "40..44s",
+            "45..49s",
+            "50..54s",
+            "55..60s+",
+        ],
+        "last_rx_done_age_ms": age(report.last_rx_done_age_ms),
+        "last_rx_done_age_unknown": report.last_rx_done_age_ms == UINT32_MAX,
+        "last_rx_read_age_ms": age(report.last_rx_read_age_ms),
+        "last_rx_read_age_unknown": report.last_rx_read_age_ms == UINT32_MAX,
+        "last_rx_auth_age_ms": age(report.last_rx_auth_age_ms),
+        "last_rx_auth_age_unknown": report.last_rx_auth_age_ms == UINT32_MAX,
+        "rx_arm_last_stage": stage_labels[report.rx_arm_last_stage],
+        "software_state_note": "is_receiving and rx_offline are published software state; they do not assert physical RX",
+    }
+    values["status"] = (
+        "complete"
+        if report.coverage_complete
+        else "as_of_incomplete"
+        if report.as_of_incomplete
+        else "snapshot_terminal"
+        if report.snapshot_terminal
+        else "prepared"
     )
     return values
 
@@ -986,6 +1326,8 @@ encode_control_frame = encode_control
 decode_control_frame = decode_control
 decode_report_frame = decode_report
 decode_diagnostics_frame = decode_diagnostics
+decode_radio_diagnostics_frame = decode_radio_diagnostics
+decode_phase_diagnostics = decode_radio_diagnostics
 evaluate_report = evaluate_reports
 
 
@@ -1227,10 +1569,15 @@ def _make_capture_serial_classes() -> tuple[Any, Any, Any, Any]:
                             )
                         except BenchmarkError:
                             try:
-                                identity, _ = decode_data(payload)
-                                event["data_identity"] = dataclasses.asdict(identity)
+                                event["radio_diagnostics"] = _radio_diagnostic_dict(
+                                    decode_radio_diagnostics(payload)
+                                )
                             except BenchmarkError:
-                                pass
+                                try:
+                                    identity, _ = decode_data(payload)
+                                    event["data_identity"] = dataclasses.asdict(identity)
+                                except BenchmarkError:
+                                    pass
                 self.capture.record("packet", **event)
             elif incoming.HasField("queueStatus"):
                 self.capture.record(
@@ -1287,15 +1634,44 @@ class BoardSession:
         )
         self._interface.board = role
         self._interface.serial_write_lock = threading.Lock()
-        self._interface.connect()
-        self._interface.waitForConfig()
-        actual = int(self._interface.myInfo.my_node_num)
-        if actual != expected_node:
-            self.close()
-            raise BenchmarkError(
-                f"{role}: node identity mismatch ({actual} != {expected_node})"
-            )
-        self.node_num = actual
+        try:
+            self._interface.connect()
+            self._interface.waitForConfig()
+            actual = int(self._interface.myInfo.my_node_num)
+            if actual != expected_node:
+                raise BenchmarkError(
+                    f"{role}: node identity mismatch ({actual} != {expected_node})"
+                )
+            self.node_num = actual
+        except BaseException as error:
+            with contextlib.suppress(Exception):
+                self.capture.record(
+                    "session_construction_failed",
+                    error_type=type(error).__name__,
+                    error=str(error),
+                )
+            cleanup_error: BaseException | None = None
+            closed = False
+            try:
+                closed = self.close(timeout=DEFAULT_CLOSE_TIMEOUT_SECONDS)
+            except BaseException as close_error:
+                cleanup_error = close_error
+            finally:
+                # close() persists normally; repeat this protected write so a
+                # failure in reader or stream shutdown cannot erase evidence.
+                with contextlib.suppress(Exception):
+                    self.capture.persist()
+            if cleanup_error is not None:
+                raise BenchmarkError(
+                    f"{role}: session construction cleanup raised "
+                    f"{type(cleanup_error).__name__}; port reuse prohibited"
+                ) from error
+            if closed is False:
+                raise BenchmarkError(
+                    f"{role}: session construction cleanup timed out; "
+                    "port reuse prohibited"
+                ) from error
+            raise
 
     @property
     def interface(self) -> Any:
@@ -1350,12 +1726,36 @@ class BoardSession:
             )
             return int(packet.id)
 
+    def _response_event_matches(
+        self,
+        event: Mapping[str, Any],
+        packet_id: int,
+        response_key: str,
+        config: RunConfig,
+    ) -> bool:
+        """Accept only the addressed, identity-matching local board response."""
+
+        if (
+            event.get("kind") != "packet"
+            or event.get("request_id") != packet_id
+            or event.get("to") != self.node_num
+            or event.get("from") != self.node_num
+        ):
+            return False
+        response = event.get(response_key)
+        if not isinstance(response, Mapping):
+            return False
+        return all(
+            response.get(field) == getattr(config, field)
+            for field in ("run_id", "source", "destination")
+        )
+
     def snapshot(self, config: RunConfig, timeout: float) -> FirmwareReport:
         packet_id = self.control(CONTROL_SNAPSHOT, config, want_response=True)
         event = self.capture.wait_for(
-            lambda item: item["kind"] == "packet"
-            and item.get("request_id") == packet_id
-            and item.get("report") is not None,
+            lambda item: self._response_event_matches(
+                item, packet_id, "report", config
+            ),
             timeout,
         )
         if event is None:
@@ -1369,14 +1769,30 @@ class BoardSession:
             CONTROL_SNAPSHOT_DIAGNOSTICS, config, want_response=True
         )
         event = self.capture.wait_for(
-            lambda item: item["kind"] == "packet"
-            and item.get("request_id") == packet_id
-            and item.get("diagnostics") is not None,
+            lambda item: self._response_event_matches(
+                item, packet_id, "diagnostics", config
+            ),
             timeout,
         )
         if event is None:
             raise BenchmarkError(f"{self.role}: diagnostic response timed out")
         return dict(event["diagnostics"])
+
+    def snapshot_radio_diagnostics(
+        self, config: RunConfig, timeout: float
+    ) -> dict[str, Any]:
+        packet_id = self.control(
+            CONTROL_SNAPSHOT_RADIO_DIAGNOSTICS, config, want_response=True
+        )
+        event = self.capture.wait_for(
+            lambda item: self._response_event_matches(
+                item, packet_id, "radio_diagnostics", config
+            ),
+            timeout,
+        )
+        if event is None:
+            raise BenchmarkError(f"{self.role}: radio diagnostic response timed out")
+        return dict(event["radio_diagnostics"])
 
     def snapshot_config(self, output: Path, label: str) -> dict[str, Any]:
         node = self._interface.localNode
@@ -1411,7 +1827,7 @@ class BoardSession:
             ),
         }
 
-    def close(self, timeout: float = 5.0) -> bool:
+    def close(self, timeout: float = DEFAULT_CLOSE_TIMEOUT_SECONDS) -> bool:
         """Stop the reader and close USB without entering the SDK queue drain."""
 
         interface = self._interface
@@ -1771,7 +2187,7 @@ def run_hardware(args: argparse.Namespace) -> dict[str, Any]:
         "file_digests": file_digests,
         "diagnostics": {
             "requested": diagnostics_requested,
-            "scope": "per_board_local_aggregate",
+            "scope": "per_board_local_diagnostics",
             "status": "not_requested" if not diagnostics_requested else "pending",
             "validity": "not_requested" if not diagnostics_requested else "pending",
             "rf_coverage_authoritative": False,
@@ -1853,9 +2269,12 @@ def run_hardware(args: argparse.Namespace) -> dict[str, Any]:
         diagnostics_captured = True
         summary: dict[str, Any] = {
             "requested": True,
-            "scope": "per_board_local_aggregate",
-            "operation": CONTROL_SNAPSHOT_DIAGNOSTICS,
-            "response_kind": DIAGNOSTIC_KIND,
+            "scope": "per_board_local_diagnostics",
+            "operations": {
+                "aggregate": CONTROL_SNAPSHOT_DIAGNOSTICS,
+                "radio_phase": CONTROL_SNAPSHOT_RADIO_DIAGNOSTICS,
+            },
+            "response_kinds": {"aggregate": DIAGNOSTIC_KIND, "radio_phase": 5},
             "response_bytes": DIAGNOSTIC_REPORT_BYTES,
             "status": "pending",
             "validity": "parsed_identity_match_only",
@@ -1865,46 +2284,74 @@ def run_hardware(args: argparse.Namespace) -> dict[str, Any]:
         }
         for role in (sender_role, receiver_role):
             session = sessions.get(role)
+            board: dict[str, Any] = {}
             if session is None:
-                summary["boards"][role] = {
+                board["aggregate"] = {
                     "status": "invalid",
                     "error": "session_unavailable",
                 }
+                board["radio_phase"] = {
+                    "status": "invalid",
+                    "error": "session_unavailable",
+                }
+                summary["boards"][role] = board
                 checkpoint(f"diagnostics_{role}_unavailable")
                 continue
-            try:
-                diagnostic = session.snapshot_diagnostics(
-                    config, args.control_timeout
-                )
-                if any(
-                    int(diagnostic.get(field, 0)) != getattr(config, field)
-                    for field in ("run_id", "source", "destination")
-                ):
-                    raise BenchmarkError(f"{role}: diagnostic identity mismatch")
-                diagnostic["board_role"] = role
-                diagnostic["status"] = diagnostic.get("status", "unknown")
-                summary["boards"][role] = diagnostic
-                checkpoint(f"diagnostics_{role}_captured")
-            except Exception as error:
-                summary["boards"][role] = {
-                    "status": "invalid",
-                    "error": str(error),
-                }
-                checkpoint(f"diagnostics_{role}_failed")
+
+            for name, snapshot_method in (
+                ("aggregate", session.snapshot_diagnostics),
+                ("radio_phase", session.snapshot_radio_diagnostics),
+            ):
+                try:
+                    diagnostic = snapshot_method(config, args.control_timeout)
+                    if any(
+                        int(diagnostic.get(field, 0)) != getattr(config, field)
+                        for field in ("run_id", "source", "destination")
+                    ):
+                        raise BenchmarkError(
+                            f"{role}: {name} diagnostic identity mismatch"
+                        )
+                    diagnostic["board_role"] = role
+                    diagnostic["status"] = diagnostic.get("status", "unknown")
+                    board[name] = diagnostic
+                    checkpoint(f"diagnostics_{role}_{name}_captured")
+                except Exception as error:
+                    board[name] = {
+                        "status": "invalid",
+                        "error": str(error),
+                    }
+                    checkpoint(f"diagnostics_{role}_{name}_failed")
+            summary["boards"][role] = board
+
         board_values = summary["boards"].values()
         summary["status"] = (
             "valid_identity"
             if len(summary["boards"]) == 2
-            and all(item.get("status") != "invalid" for item in board_values)
+            and all(
+                all(
+                    isinstance(item.get(name), Mapping)
+                    and item[name].get("status") != "invalid"
+                    for name in ("aggregate", "radio_phase")
+                )
+                for item in board_values
+            )
             else "invalid"
         )
         summary["full_window_coverage"] = {
-            role: item.get("coverage_complete") is True
+            role: {
+                name: item[name].get("coverage_complete") is True
+                for name in ("aggregate", "radio_phase")
+                if isinstance(item.get(name), Mapping)
+            }
             for role, item in summary["boards"].items()
             if isinstance(item, Mapping)
         }
         summary["pending_or_running"] = {
-            role: bool(item.get("as_of_incomplete", False))
+            role: {
+                name: bool(item[name].get("as_of_incomplete", False))
+                for name in ("aggregate", "radio_phase")
+                if isinstance(item.get(name), Mapping)
+            }
             for role, item in summary["boards"].items()
             if isinstance(item, Mapping)
         }
@@ -2075,9 +2522,12 @@ def run_hardware(args: argparse.Namespace) -> dict[str, Any]:
                 diagnostics_captured = True
                 result["diagnostics"] = {
                     "requested": True,
-                    "scope": "per_board_local_aggregate",
-                    "operation": CONTROL_SNAPSHOT_DIAGNOSTICS,
-                    "response_kind": DIAGNOSTIC_KIND,
+                    "scope": "per_board_local_diagnostics",
+                    "operations": {
+                        "aggregate": CONTROL_SNAPSHOT_DIAGNOSTICS,
+                        "radio_phase": CONTROL_SNAPSHOT_RADIO_DIAGNOSTICS,
+                    },
+                    "response_kinds": {"aggregate": DIAGNOSTIC_KIND, "radio_phase": 5},
                     "response_bytes": DIAGNOSTIC_REPORT_BYTES,
                     "status": "invalid",
                     "validity": "invalid",
@@ -2089,7 +2539,7 @@ def run_hardware(args: argparse.Namespace) -> dict[str, Any]:
             diagnostics_captured = True
             result["diagnostics"] = {
                 "requested": True,
-                "scope": "per_board_local_aggregate",
+                "scope": "per_board_local_diagnostics",
                 "status": "invalid",
                 "validity": "invalid",
                 "rf_coverage_authoritative": False,

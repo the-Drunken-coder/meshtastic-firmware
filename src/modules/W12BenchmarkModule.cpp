@@ -7,6 +7,7 @@
 #include "Router.h"
 #include "Throttle.h"
 #include "UptimeClock.h"
+#include "mesh/RadioLibInterface.h"
 #include <cstring>
 
 W12BenchmarkModule *w12BenchmarkModule = nullptr;
@@ -22,7 +23,13 @@ constexpr int32_t kProducerIntervalMs = 0;
 bool validOperation(W12BenchmarkModule::Op op)
 {
     return op == W12BenchmarkModule::Op::RESET || op == W12BenchmarkModule::Op::START || op == W12BenchmarkModule::Op::STOP ||
-           op == W12BenchmarkModule::Op::SNAPSHOT || op == W12BenchmarkModule::Op::SNAPSHOT_DIAGNOSTICS;
+           op == W12BenchmarkModule::Op::SNAPSHOT || op == W12BenchmarkModule::Op::SNAPSHOT_DIAGNOSTICS ||
+           op == W12BenchmarkModule::Op::SNAPSHOT_RADIO_DIAGNOSTICS;
+}
+
+uint32_t diagnosticAge(bool present, uint32_t timestamp, uint32_t nowMs)
+{
+    return present ? nowMs - timestamp : UINT32_MAX;
 }
 } // namespace
 
@@ -252,6 +259,81 @@ size_t W12BenchmarkModule::encodeDiagnosticsReport(uint8_t *bytes, size_t capaci
     return DIAGNOSTIC_REPORT_BYTES;
 }
 
+size_t W12BenchmarkModule::encodeRadioDiagnosticsReport(uint8_t *bytes, size_t capacity, const Stats &value,
+                                                        const RadioDiagnostics &d, uint8_t pendingTxCount, uint32_t nowMs,
+                                                        uint32_t radioState)
+{
+    if (!bytes || capacity < RADIO_DIAGNOSTIC_REPORT_BYTES)
+        return 0;
+
+    memset(bytes, 0, RADIO_DIAGNOSTIC_REPORT_BYTES);
+    put16(bytes, MAGIC);
+    bytes[2] = VERSION;
+    bytes[3] = static_cast<uint8_t>(Kind::RADIO_DIAGNOSTICS);
+    put32(bytes + 4, value.config.runId);
+    put32(bytes + 8, value.config.source);
+    put32(bytes + 12, value.config.destination);
+    put32(bytes + 16, value.elapsedMs);
+    bytes[20] = static_cast<uint8_t>((value.prepared ? 1 : 0) | (value.running ? 2 : 0) | (value.complete ? 4 : 0) |
+                                     (pendingTxCount ? 16 : 0) | ((value.running || pendingTxCount) ? 32 : 0));
+    bytes[21] = pendingTxCount;
+
+    put32(bytes + 24, d.rxArmAttempts);
+    put32(bytes + 28, d.rxArmSuccesses);
+    put32(bytes + 32, d.rxArmFailures);
+    put32(bytes + 36, d.rxStandbyCalls);
+    put32(bytes + 40, d.rxStandbyFailures);
+    put16(bytes + 44, static_cast<uint16_t>(d.rxStandbyLastResult));
+    put32(bytes + 46, d.rxStartCalls);
+    put32(bytes + 50, d.rxStartFailures);
+    put16(bytes + 54, static_cast<uint16_t>(d.rxStartLastResult));
+    put32(bytes + 56, d.rxStartRetryCalls);
+    put32(bytes + 60, d.rxIrqMapCalls);
+    put32(bytes + 64, d.rxIrqMapFailures);
+    put16(bytes + 68, static_cast<uint16_t>(d.rxIrqMapLastResult));
+    put16(bytes + 70, static_cast<uint16_t>(d.rxArmLastResult));
+    put32(bytes + 72, d.rxStartDurationCountUs);
+    put32(bytes + 76, d.rxStartDurationSumUs);
+    put32(bytes + 80, d.rxStartDurationMaxUs);
+    put32(bytes + 84, d.channelActiveDurationCountUs);
+    put32(bytes + 88, d.channelActiveDurationSumUs);
+    put32(bytes + 92, d.channelActiveDurationMaxUs);
+    put32(bytes + 96, d.startSendDurationCountUs);
+    put32(bytes + 100, d.startSendDurationSumUs);
+    put32(bytes + 104, d.startSendDurationMaxUs);
+    put32(bytes + 108, d.pollCalls);
+    put32(bytes + 112, d.pollRxChecks);
+    put32(bytes + 116, d.pollRxReadSuccess);
+    put32(bytes + 120, d.pollRxReadFailure);
+    put32(bytes + 124, d.pollRxPending);
+    put32(bytes + 128, d.pollRxLastFlags);
+    put16(bytes + 132, static_cast<uint16_t>(d.pollRxLastResult));
+    put32(bytes + 134, d.pollRxFlagsOr);
+    put32(bytes + 138, d.pollTxChecks);
+    put32(bytes + 142, d.pollTxPending);
+    bytes[146] = d.pollTxLastDone;
+    bytes[147] = static_cast<uint8_t>((radioState & 1u) != 0);
+    bytes[148] = static_cast<uint8_t>((radioState & 2u) != 0);
+    bytes[149] = static_cast<uint8_t>((radioState >> 2) & 0x03u);
+    bytes[150] = static_cast<uint8_t>((radioState >> 4) & 0x01u);
+    bytes[151] = 255;
+    bytes[152] = 0;
+
+    for (uint8_t i = 0; i < 12; i++)
+        put32(bytes + 156 + i * sizeof(uint32_t), d.rxDoneBy5sBucket[i]);
+    put32(bytes + 204, diagnosticAge(d.hasLastRxDone, d.lastRxDoneAtMs, nowMs));
+    put32(bytes + 208, diagnosticAge(d.hasLastRxRead, d.lastRxReadAtMs, nowMs));
+    put32(bytes + 212, diagnosticAge(d.hasLastRxAuth, d.lastRxAuthAtMs, nowMs));
+    bytes[216] = d.rxArmLastStage;
+    bytes[217] = d.pollChipStatus0;
+    bytes[218] = d.pollChipStatus1;
+    bytes[219] = d.pollChipStatusObserved;
+    put32(bytes + 220, diagnosticAge(d.pollChipStatusObserved != 0, d.pollChipStatusAtMs, nowMs));
+    put32(bytes + 224, d.pollChipRxCount);
+    put32(bytes + 228, d.pollChipNonRxCount);
+    return RADIO_DIAGNOSTIC_REPORT_BYTES;
+}
+
 bool W12BenchmarkModule::sameConfig(const RunConfig &a, const RunConfig &b)
 {
     return a.runId == b.runId && a.source == b.source && a.destination == b.destination && a.count == b.count &&
@@ -449,23 +531,39 @@ void W12BenchmarkModule::onCcaRssiSample(int16_t rssiDbm)
 void W12BenchmarkModule::onRxIrq(bool readOk, bool rxDone, bool crcError, bool lenError, bool headerCrcError, bool timeout,
                                  bool otherError)
 {
-    if (!collectDiagnostics())
+    const bool collect = collectDiagnostics();
+    const bool collectRadio = collectRadioDiagnostics();
+    if (!collect && !collectRadio)
         return;
     if (!readOk) {
-        saturatingIncrement(diagnostics.rxOtherErrors);
+        if (collect)
+            saturatingIncrement(diagnostics.rxOtherErrors);
         return;
     }
-    if (rxDone)
-        saturatingIncrement(diagnostics.rxIrqDone);
-    if (crcError)
+    if (rxDone) {
+        if (collect)
+            saturatingIncrement(diagnostics.rxIrqDone);
+        if (collectRadio) {
+            const uint32_t nowMs = Time::getMillis();
+            radioDiagnostics.hasLastRxDone = true;
+            radioDiagnostics.lastRxDoneAtMs = nowMs;
+            if (radioDiagnosticWindowStarted) {
+                uint32_t bucket = (nowMs - radioDiagnosticStartMs) / 5000u;
+                if (bucket >= 12)
+                    bucket = 11;
+                saturatingIncrement(radioDiagnostics.rxDoneBy5sBucket[bucket]);
+            }
+        }
+    }
+    if (collect && crcError)
         saturatingIncrement(diagnostics.rxCrcErrors);
-    if (lenError)
+    if (collect && lenError)
         saturatingIncrement(diagnostics.rxLenErrors);
-    if (headerCrcError)
+    if (collect && headerCrcError)
         saturatingIncrement(diagnostics.rxHeaderCrcErrors);
-    if (timeout)
+    if (collect && timeout)
         saturatingIncrement(diagnostics.rxTimeouts);
-    if (otherError)
+    if (collect && otherError)
         saturatingIncrement(diagnostics.rxOtherErrors);
 }
 
@@ -473,6 +571,10 @@ void W12BenchmarkModule::onRxRead(bool success)
 {
     if (collectDiagnostics())
         saturatingIncrement(success ? diagnostics.rxReadSuccess : diagnostics.rxReadFailure);
+    if (success && collectRadioDiagnostics()) {
+        radioDiagnostics.hasLastRxRead = true;
+        radioDiagnostics.lastRxReadAtMs = Time::getMillis();
+    }
 }
 
 void W12BenchmarkModule::onRxQueueEnqueued()
@@ -508,6 +610,10 @@ void W12BenchmarkModule::onRxAuthenticated()
 {
     if (collectDiagnostics())
         saturatingIncrement(diagnostics.rxAuthAccepted);
+    if (collectRadioDiagnostics()) {
+        radioDiagnostics.hasLastRxAuth = true;
+        radioDiagnostics.lastRxAuthAtMs = Time::getMillis();
+    }
 }
 
 void W12BenchmarkModule::onModuleReceiveHandlerDuration(uint32_t elapsedMs)
@@ -520,12 +626,143 @@ void W12BenchmarkModule::onModuleReceiveHandlerDuration(uint32_t elapsedMs)
         diagnostics.moduleReceiveHandlerMaxMs = elapsedMs;
 }
 
+void W12BenchmarkModule::onRxArmAttempt()
+{
+    if (!collectRadioDiagnostics())
+        return;
+    saturatingIncrement(radioDiagnostics.rxArmAttempts);
+    radioDiagnostics.rxArmLastStage = static_cast<uint8_t>(RxArmStage::NONE);
+}
+
+void W12BenchmarkModule::onRxArmStage(RxArmStage stage, int16_t result, bool retry)
+{
+    if (!collectRadioDiagnostics())
+        return;
+
+    switch (stage) {
+    case RxArmStage::STANDBY:
+        saturatingIncrement(radioDiagnostics.rxStandbyCalls);
+        radioDiagnostics.rxStandbyLastResult = result;
+        if (result != RADIOLIB_ERR_NONE)
+            saturatingIncrement(radioDiagnostics.rxStandbyFailures);
+        break;
+    case RxArmStage::RX_START:
+        saturatingIncrement(radioDiagnostics.rxStartCalls);
+        radioDiagnostics.rxStartLastResult = result;
+        if (result != RADIOLIB_ERR_NONE)
+            saturatingIncrement(radioDiagnostics.rxStartFailures);
+        if (retry)
+            saturatingIncrement(radioDiagnostics.rxStartRetryCalls);
+        break;
+    case RxArmStage::IRQ_MAP:
+        saturatingIncrement(radioDiagnostics.rxIrqMapCalls);
+        radioDiagnostics.rxIrqMapLastResult = result;
+        if (result != RADIOLIB_ERR_NONE)
+            saturatingIncrement(radioDiagnostics.rxIrqMapFailures);
+        break;
+    case RxArmStage::NONE:
+        break;
+    }
+    if (result != RADIOLIB_ERR_NONE)
+        radioDiagnostics.rxArmLastStage = static_cast<uint8_t>(stage);
+}
+
+void W12BenchmarkModule::onRxArmFinished(int16_t result, RxArmStage failureStage)
+{
+    if (!collectRadioDiagnostics())
+        return;
+    radioDiagnostics.rxArmLastResult = result;
+    if (result == RADIOLIB_ERR_NONE) {
+        saturatingIncrement(radioDiagnostics.rxArmSuccesses);
+        radioDiagnostics.rxArmLastStage = static_cast<uint8_t>(RxArmStage::NONE);
+    } else {
+        saturatingIncrement(radioDiagnostics.rxArmFailures);
+        radioDiagnostics.rxArmLastStage = static_cast<uint8_t>(failureStage);
+    }
+}
+
+void W12BenchmarkModule::onRadioPhase(RadioPhase phase, uint32_t elapsedUs)
+{
+    if (!collectRadioDiagnostics())
+        return;
+    uint32_t *count = nullptr;
+    uint32_t *sum = nullptr;
+    uint32_t *maximum = nullptr;
+    switch (phase) {
+    case RadioPhase::RX_START:
+        count = &radioDiagnostics.rxStartDurationCountUs;
+        sum = &radioDiagnostics.rxStartDurationSumUs;
+        maximum = &radioDiagnostics.rxStartDurationMaxUs;
+        break;
+    case RadioPhase::CHANNEL_ACTIVE:
+        count = &radioDiagnostics.channelActiveDurationCountUs;
+        sum = &radioDiagnostics.channelActiveDurationSumUs;
+        maximum = &radioDiagnostics.channelActiveDurationMaxUs;
+        break;
+    case RadioPhase::START_SEND:
+        count = &radioDiagnostics.startSendDurationCountUs;
+        sum = &radioDiagnostics.startSendDurationSumUs;
+        maximum = &radioDiagnostics.startSendDurationMaxUs;
+        break;
+    }
+    saturatingIncrement(*count);
+    saturatingAdd(*sum, elapsedUs);
+    if (elapsedUs > *maximum)
+        *maximum = elapsedUs;
+}
+
+void W12BenchmarkModule::onRadioPoll()
+{
+    if (collectRadioDiagnostics())
+        saturatingIncrement(radioDiagnostics.pollCalls);
+}
+
+void W12BenchmarkModule::onRadioPollRx(int16_t result, uint32_t flags, bool pending, uint16_t rawStatus)
+{
+    if (!collectRadioDiagnostics())
+        return;
+    saturatingIncrement(radioDiagnostics.pollRxChecks);
+    radioDiagnostics.pollRxLastResult = result;
+    radioDiagnostics.pollRxLastFlags = flags;
+    radioDiagnostics.pollRxFlagsOr |= flags;
+    if (result == RADIOLIB_ERR_NONE) {
+        saturatingIncrement(radioDiagnostics.pollRxReadSuccess);
+        if (pending)
+            saturatingIncrement(radioDiagnostics.pollRxPending);
+        radioDiagnostics.pollChipStatus0 = static_cast<uint8_t>(rawStatus >> 8);
+        radioDiagnostics.pollChipStatus1 = static_cast<uint8_t>(rawStatus);
+        radioDiagnostics.pollChipStatusObserved = 1;
+        radioDiagnostics.pollChipStatusAtMs = Time::getMillis();
+        if ((radioDiagnostics.pollChipStatus1 & 0x07u) == 4u)
+            saturatingIncrement(radioDiagnostics.pollChipRxCount);
+        else
+            saturatingIncrement(radioDiagnostics.pollChipNonRxCount);
+    } else {
+        saturatingIncrement(radioDiagnostics.pollRxReadFailure);
+    }
+}
+
+void W12BenchmarkModule::onRadioPollTx(bool pending)
+{
+    if (!collectRadioDiagnostics())
+        return;
+    saturatingIncrement(radioDiagnostics.pollTxChecks);
+    if (pending)
+        saturatingIncrement(radioDiagnostics.pollTxPending);
+    radioDiagnostics.pollTxLastDone = pending ? 1 : 0;
+}
+
 bool W12BenchmarkModule::collectDiagnostics() const
 {
     return stats.prepared && stats.running;
 }
 
 bool W12BenchmarkModule::collectTxLifecycleDiagnostics() const
+{
+    return stats.prepared && (stats.running || pendingTxCount != 0);
+}
+
+bool W12BenchmarkModule::collectRadioDiagnostics() const
 {
     return stats.prepared && (stats.running || pendingTxCount != 0);
 }
@@ -566,7 +803,12 @@ void W12BenchmarkModule::resetRun(const RunConfig &config)
     snapshotRunMatches = false;
     diagnosticSnapshotRequested = false;
     diagnosticSnapshotRunMatches = false;
+    radioDiagnosticSnapshotRequested = false;
+    radioDiagnosticSnapshotRunMatches = false;
+    radioDiagnosticStartMs = 0;
+    radioDiagnosticWindowStarted = false;
     diagnostics = Diagnostics{};
+    radioDiagnostics = RadioDiagnostics{};
     for (auto &slot : txSlots)
         slot = TxSlot{};
     pendingTxCount = 0;
@@ -662,6 +904,8 @@ bool W12BenchmarkModule::handleControl(const meshtastic_MeshPacket &mp)
         if (stats.running || stats.complete)
             return false;
         stats.running = true;
+        radioDiagnosticStartMs = Time::getMillis();
+        radioDiagnosticWindowStarted = true;
         receiverWindowStarted = nodeDB->getNodeNum() != activeConfig.destination;
         startedAtMs = receiverWindowStarted ? Time::getMillis() : 0;
         setIntervalFromNow(0);
@@ -682,6 +926,14 @@ bool W12BenchmarkModule::handleControl(const meshtastic_MeshPacket &mp)
             finishRun();
         diagnosticSnapshotRequested = true;
         diagnosticSnapshotRunMatches = true;
+        return true;
+    case Op::SNAPSHOT_RADIO_DIAGNOSTICS:
+        if (!stats.running && !stats.complete)
+            return false;
+        if (stats.running && receiverWindowStarted && Throttle::hasElapsed(startedAtMs, activeConfig.durationMs))
+            finishRun();
+        radioDiagnosticSnapshotRequested = true;
+        radioDiagnosticSnapshotRunMatches = true;
         return true;
     case Op::RESET:
         break;
@@ -770,7 +1022,8 @@ meshtastic_MeshPacket *W12BenchmarkModule::allocReply()
 {
     const bool reportRequested = snapshotRequested && snapshotRunMatches;
     const bool diagnosticsRequested = diagnosticSnapshotRequested && diagnosticSnapshotRunMatches;
-    if (!reportRequested && !diagnosticsRequested)
+    const bool radioDiagnosticsRequested = radioDiagnosticSnapshotRequested && radioDiagnosticSnapshotRunMatches;
+    if (!reportRequested && !diagnosticsRequested && !radioDiagnosticsRequested)
         return nullptr;
 
     meshtastic_MeshPacket *reply = router->allocForSending();
@@ -782,9 +1035,14 @@ meshtastic_MeshPacket *W12BenchmarkModule::allocReply()
     reply->decoded.portnum = meshtastic_PortNum_PRIVATE_APP;
     const Stats currentStats = getStats();
     reply->decoded.payload.size =
-        diagnosticsRequested ? encodeDiagnosticsReport(reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes),
-                                                       currentStats, diagnostics, pendingTxCount)
-                             : encodeReport(reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes), currentStats);
+        radioDiagnosticsRequested
+            ? encodeRadioDiagnosticsReport(reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes), currentStats,
+                                           radioDiagnostics, pendingTxCount, Time::getMillis(),
+                                           RadioLibInterface::instance ? RadioLibInterface::instance->getW12DiagnosticRadioState()
+                                                                       : 0)
+        : diagnosticsRequested ? encodeDiagnosticsReport(reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes),
+                                                         currentStats, diagnostics, pendingTxCount)
+                               : encodeReport(reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes), currentStats);
     if (reply->decoded.payload.size == 0) {
         packetPool.release(reply);
         return nullptr;
@@ -793,6 +1051,8 @@ meshtastic_MeshPacket *W12BenchmarkModule::allocReply()
     snapshotRunMatches = false;
     diagnosticSnapshotRequested = false;
     diagnosticSnapshotRunMatches = false;
+    radioDiagnosticSnapshotRequested = false;
+    radioDiagnosticSnapshotRunMatches = false;
     return reply;
 }
 
