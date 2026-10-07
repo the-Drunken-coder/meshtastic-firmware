@@ -193,6 +193,26 @@ static TestableW12Adapter *adapter;
 static void makeW12Adapter();
 
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+#if defined(MESHTASTIC_W12_BENCHMARK_SINGLE_RX) && MESHTASTIC_W12_BENCHMARK_SINGLE_RX
+static constexpr uint8_t adapterExpectedRxTimeout[3] = {0, 0, 0};
+#else
+static constexpr uint8_t adapterExpectedRxTimeout[3] = {0xFF, 0xFF, 0xFF};
+#endif
+#else
+static constexpr uint8_t adapterExpectedRxTimeout[3] = {0xFF, 0xFF, 0xFF};
+#endif
+
+static void assertAdapterSetRxTimeout()
+{
+    const auto *setRx = adapterHal->recording.last(op16(RADIOLIB_LR2021_CMD_SET_RX));
+    TEST_ASSERT_NOT_NULL(setRx);
+    TEST_ASSERT_GREATER_OR_EQUAL_size_t(5, setRx->size());
+    TEST_ASSERT_EQUAL_UINT8(adapterExpectedRxTimeout[0], (*setRx)[2]);
+    TEST_ASSERT_EQUAL_UINT8(adapterExpectedRxTimeout[1], (*setRx)[3]);
+    TEST_ASSERT_EQUAL_UINT8(adapterExpectedRxTimeout[2], (*setRx)[4]);
+}
+
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
 class TestableW12AdapterDiagnostics : public W12BenchmarkModule
 {
   public:
@@ -602,6 +622,7 @@ static void test_w12_adapter_radio_diagnostics_counts_standby_failure_and_result
 static void test_w12_adapter_radio_diagnostics_counts_start_failure_retry_and_result()
 {
     makeW12AdapterWithDiagnostics();
+    adapterHal->recording.transactions.clear();
     adapterHal->failCommand = RADIOLIB_LR2021_CMD_SET_RX;
     adapter->armReceive();
     const auto diagnostics = adapterDiagnostics->getRadioDiagnostics();
@@ -618,6 +639,8 @@ static void test_w12_adapter_radio_diagnostics_counts_start_failure_retry_and_re
     TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_SPI_CMD_INVALID, diagnostics.rxArmLastResult);
     TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(W12BenchmarkModule::RxArmStage::RX_START), diagnostics.rxArmLastStage);
     TEST_ASSERT_TRUE(adapter->isOffline());
+    TEST_ASSERT_EQUAL_UINT32(2, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+    assertAdapterSetRxTimeout();
 }
 
 static void test_w12_adapter_radio_diagnostics_counts_irq_map_failure_and_result()
@@ -710,6 +733,16 @@ static void test_w12_adapter_recovery_preserves_active_flrc_and_rearms_rx()
     TEST_ASSERT_EQUAL_UINT32(W12FlrcProfile::RECEIVE_IRQS, flags);
 }
 
+static void test_w12_adapter_rx_arm_uses_configured_fallback_and_expected_timeout()
+{
+    makeW12Adapter();
+    const auto *fallback = adapterHal->recording.last(op16(RADIOLIB_LR2021_CMD_SET_RX_TX_FALLBACK_MODE));
+    TEST_ASSERT_NOT_NULL(fallback);
+    TEST_ASSERT_GREATER_OR_EQUAL_size_t(3, fallback->size());
+    TEST_ASSERT_EQUAL_UINT8(RADIOLIB_LR2021_FALLBACK_MODE_STBY_RC, (*fallback)[2]);
+    assertAdapterSetRxTimeout();
+}
+
 static void test_w12_adapter_failed_rx_remains_offline_until_successful_rearm()
 {
     makeW12Adapter();
@@ -758,6 +791,15 @@ static void test_w12_adapter_terminal_rx_error_rejects_payload_and_rearms()
     adapterHal->irq = 0;
     adapter->armReceive();
     TEST_ASSERT_TRUE(adapter->receiving());
+    adapterHal->recording.transactions.clear();
+    adapterHal->irq = RADIOLIB_LR2021_IRQ_RX_DONE | RADIOLIB_LR2021_IRQ_CRC_ERROR;
+    adapter->receiveInterrupt();
+    TEST_ASSERT_EQUAL_UINT32(2, adapter->badReceives());
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_READ_RX_FIFO)));
+    adapterHal->irq = 0;
+    adapter->armReceive();
+    TEST_ASSERT_TRUE(adapter->receiving());
+    assertAdapterSetRxTimeout();
     adapterHal->irq = RADIOLIB_LR2021_IRQ_SYNCWORD_VALID;
     TEST_ASSERT_TRUE(adapter->receiveActive());
     Time::advanceTestMillis(W12FlrcProfile::durationMs(MAX_LORA_PAYLOAD_LEN));
@@ -877,6 +919,11 @@ static void assertAdapterReceptionDeliveredOnce()
     TEST_ASSERT_TRUE(received.rx_snr_unavailable);
     TEST_ASSERT_EQUAL_UINT32(0, adapter->badReceives());
     TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_READ_RX_FIFO)));
+    TEST_ASSERT_GREATER_THAN_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO)));
+    TEST_ASSERT_GREATER_THAN_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_CLEAR_IRQ)));
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+    assertAdapterSetRxTimeout();
     adapter->pollMissedIrqs();
     TEST_ASSERT_EQUAL_UINT32(1, adapterReceiver->packets.size());
 }
@@ -1155,6 +1202,8 @@ static void test_w12_adapter_terminal_send_error_and_start_failure_release_witho
     TEST_ASSERT_EQUAL_UINT32(0, adapter->goodTransmits());
     TEST_ASSERT_EQUAL_UINT16(1, adapter->droppedTransmits());
     TEST_ASSERT_EQUAL_INT32(liveBefore, packetPoolLiveBytes());
+    TEST_ASSERT_GREATER_THAN_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+    assertAdapterSetRxTimeout();
     adapter->stop();
     adapterHal->irqOnSetTx = 0;
     adapterHal->failCommand = RADIOLIB_LR2021_CMD_SET_TX;
@@ -1164,6 +1213,8 @@ static void test_w12_adapter_terminal_send_error_and_start_failure_release_witho
     TEST_ASSERT_EQUAL_UINT32(0, adapter->goodTransmits());
     TEST_ASSERT_EQUAL_UINT16(2, adapter->droppedTransmits());
     TEST_ASSERT_EQUAL_INT32(liveBefore, packetPoolLiveBytes());
+    TEST_ASSERT_GREATER_THAN_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+    assertAdapterSetRxTimeout();
 }
 #else
 static void test_w12_adapter_default_gate_refuses_flrc_send_and_releases_packet()
@@ -1181,6 +1232,7 @@ static void test_w12_adapter_default_gate_refuses_flrc_send_and_releases_packet(
 
 static void runW12AdapterTests()
 {
+    RUN_TEST(test_w12_adapter_rx_arm_uses_configured_fallback_and_expected_timeout);
     RUN_TEST(test_w12_adapter_recovery_preserves_active_flrc_and_rearms_rx);
     RUN_TEST(test_w12_adapter_failed_rx_remains_offline_until_successful_rearm);
     RUN_TEST(test_w12_adapter_sensing_busy_and_failed_reads_defer_without_lora_cad);
