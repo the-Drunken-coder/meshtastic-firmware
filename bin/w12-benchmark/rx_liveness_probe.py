@@ -11,16 +11,19 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import dataclasses
 import datetime as _dt
 import hashlib
 import importlib.util
+import math
 import os
 import platform
 import secrets
 import sys
 import threading
 import time
+from collections.abc import Mapping as MappingABC
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -63,10 +66,13 @@ SOURCE_PROGRESS_SAMPLE_DELAY_SECONDS = 1.0
 MIN_RX_COUNTER_SAMPLES = 2
 MIN_RX_COUNTER_SPAN_SECONDS = 3.0
 RECEIVER_COMPLETION_TIMEOUT_SECONDS = DEFAULT_WALL_SECONDS + 10.0
+REARM_RECEIVER_STATS_DELAY_SECONDS = 1.0
+REARM_EVIDENCE_MARGIN_MS = 2000
 INT16_MIN = -32768
 HEADER_STATUS_MASK = 0x37
 SAMPLE_STATUS_MASK = 0x3F
 UINT16_MAX = 0xFFFF
+UINT32_MAX = 0xFFFFFFFF
 
 
 class LivenessError(benchmark.BenchmarkError):
@@ -548,6 +554,101 @@ def receiver_window_observation(
     }
 
 
+def inspect_sdk_queue(queue: Any) -> dict[str, Any]:
+    """Separate real ToRadio queue entries from SDK false ACK markers."""
+
+    if queue is None:
+        return {
+            "known": False,
+            "queue_entries": None,
+            "queued_packets": None,
+            "pending_packets": None,
+            "ack_markers": None,
+            "unknown_entries": 1,
+            "unknown_details": ["queue_is_missing"],
+        }
+    if not isinstance(queue, MappingABC):
+        return {
+            "known": False,
+            "queue_entries": None,
+            "queued_packets": None,
+            "pending_packets": None,
+            "ack_markers": None,
+            "unknown_entries": 1,
+            "unknown_details": ["queue_is_not_mapping"],
+        }
+    queued_packets = 0
+    ack_markers = 0
+    unknown_details: list[str] = []
+    try:
+        entries = list(queue.items())
+    except Exception as error:
+        return {
+            "known": False,
+            "queue_entries": None,
+            "queued_packets": None,
+            "pending_packets": None,
+            "ack_markers": None,
+            "unknown_entries": 1,
+            "unknown_details": [f"queue_read_failed:{type(error).__name__}"],
+        }
+    try:
+        mesh_pb2, _ = _load_meshtastic_types()
+        to_radio_type = mesh_pb2.ToRadio
+    except Exception as error:
+        return {
+            "known": False,
+            "queue_entries": len(entries),
+            "queued_packets": None,
+            "pending_packets": None,
+            "ack_markers": None,
+            "unknown_entries": len(entries),
+            "unknown_details": [f"protobuf_type_unavailable:{type(error).__name__}"],
+        }
+    for entry in entries:
+        try:
+            key, value = entry
+        except Exception as error:
+            unknown_details.append(f"{entry!r}:{type(error).__name__}")
+            continue
+        if (
+            not isinstance(key, int)
+            or isinstance(key, bool)
+            or not 0 < key <= 0xFFFFFFFF
+        ):
+            unknown_details.append(f"{key!r}:ValueError")
+            continue
+        if value is False:
+            ack_markers += 1
+            continue
+        try:
+            if not isinstance(value, to_radio_type):
+                raise ValueError("entry is not a protobuf ToRadio message")
+            if not value.HasField("packet"):
+                raise ValueError("entry has no packet field")
+            packet_id = value.packet.id
+            if (
+                not isinstance(packet_id, int)
+                or isinstance(packet_id, bool)
+                or not 0 < packet_id <= 0xFFFFFFFF
+                or packet_id != key
+            ):
+                raise ValueError("entry packet ID does not match queue key")
+        except Exception as error:
+            unknown_details.append(f"{key!r}:{type(error).__name__}")
+            continue
+        queued_packets += 1
+    return {
+        "known": not unknown_details,
+        "queue_entries": len(entries),
+        "queued_packets": queued_packets,
+        "pending_packets": queued_packets,
+        "ack_markers": ack_markers,
+        "unknown_entries": len(unknown_details),
+        "unknown_details": unknown_details,
+    }
+
+
 def rearm_candidate(
     elapsed_seconds: float,
     now: float,
@@ -761,15 +862,34 @@ class LivenessSession:
             raise LivenessError(f"control_write_error: {error}") from error
 
     def host_rearm_guard(self) -> dict[str, Any]:
+        missing = object()
         queue_status = getattr(self.interface, "queueStatus", None)
-        queue_free = getattr(queue_status, "free", None)
+        queue_free = (
+            missing if queue_status is None else getattr(queue_status, "free", missing)
+        )
         queue = getattr(self.interface, "queue", None)
-        queued = len(queue) if queue is not None else None
-        eligible = queued == 0 and (queue_free is None or int(queue_free) > 0)
+        queue_state = inspect_sdk_queue(queue)
+        free_valid = (
+            isinstance(queue_free, int)
+            and not isinstance(queue_free, bool)
+            and queue_free > 0
+        )
+        eligible = (
+            queue_state["known"]
+            and queue_state["queued_packets"] == 0
+            and free_valid
+        )
         return {
             "eligible": eligible,
-            "queue_free_cached": queue_free,
-            "queued_packets": queued,
+            "queue_free_cached": None if queue_free is missing else queue_free,
+            "queue_entries": queue_state["queue_entries"],
+            "queued_packets": queue_state["queued_packets"],
+            "pending_packets": queue_state["pending_packets"],
+            "ack_markers": queue_state["ack_markers"],
+            "unknown_queue_entries": queue_state["unknown_entries"],
+            "unknown_queue_details": queue_state["unknown_details"],
+            "queue_state_known": queue_state["known"] and free_valid,
+            "queue_free_invalid": not free_valid,
             "firmware_guard_authoritative": True,
             "note": "firmware checks active TX, radio TX queue, receiver window, and one-shot budget",
         }
@@ -883,6 +1003,227 @@ def _sample_dict(report: RxLivenessReport, host_monotonic: float, request_id: in
 def _identity_check(value: Mapping[str, Any], config: Any, label: str) -> None:
     if not _same_config_mapping(value, config):
         raise LivenessError(f"{label}_identity_mismatch: run/source/destination mismatch")
+
+
+def validate_rearm_kind3_report(
+    value: Mapping[str, Any], config: Any, label: str
+) -> dict[str, Any]:
+    """Validate a local kind-3 report used to bound the rearm experiment."""
+
+    _identity_check(value, config, label)
+    if value.get("prepared") is not True:
+        raise LivenessError(f"{label}_incomplete: report is not prepared")
+    if value.get("running") is not True or value.get("complete") is not False:
+        raise LivenessError(f"{label}_incomplete: report is not a running window")
+    elapsed_ms = value.get("elapsed_ms")
+    if (
+        not isinstance(elapsed_ms, int)
+        or isinstance(elapsed_ms, bool)
+        or not 0 < elapsed_ms < config.duration_ms
+    ):
+        raise LivenessError(f"{label}_time_invalid: elapsed window is outside the run")
+    counters = (
+        "received",
+        "duplicates",
+        "corrupt",
+        "out_of_range",
+        "enqueued",
+        "send_failures",
+        "tx_started",
+        "tx_succeeded",
+        "tx_failures",
+        "tx_dropped",
+        "tx_cancelled",
+    )
+    for field in counters:
+        value_field = value.get(field)
+        if (
+            not isinstance(value_field, int)
+            or isinstance(value_field, bool)
+            or not 0 <= value_field <= UINT32_MAX
+        ):
+            raise LivenessError(f"{label}_counter_invalid: {field} is invalid")
+    if value["received"] > config.count:
+        raise LivenessError(f"{label}_counter_invalid: received exceeds configured count")
+    return dict(value)
+
+
+def authenticated_unique_progress(
+    before: Mapping[str, Any], after: Mapping[str, Any], config: Any
+) -> dict[str, Any]:
+    """Return exact kind-3 authenticated-unique progress without RF claims."""
+
+    before_report = validate_rearm_kind3_report(before, config, "receiver_before")
+    after_report = validate_rearm_kind3_report(after, config, "receiver_after")
+    if after_report["elapsed_ms"] < before_report["elapsed_ms"]:
+        raise LivenessError("receiver_after_time_invalid: elapsed time decreased")
+    before_received = before_report["received"]
+    after_received = after_report["received"]
+    if after_received < before_received:
+        raise LivenessError("receiver_after_counter_invalid: received decreased")
+    return {
+        "authenticated_unique_count_before": before_received,
+        "authenticated_unique_count_after": after_received,
+        "authenticated_unique_count_delta": after_received - before_received,
+        "elapsed_ms_before": before_report["elapsed_ms"],
+        "elapsed_ms_after": after_report["elapsed_ms"],
+        "interpretation": "authenticated unique benchmark receipts from an independent local window; not packet-level TX/RX matching or PER",
+    }
+
+
+def freeze_rearm_decision(
+    receiver_counter_guard: Mapping[str, Any],
+    host_guard: Mapping[str, Any],
+    receiver_window: Mapping[str, Any],
+    source_progress: Mapping[str, Any],
+    source_snapshots: Sequence[Mapping[str, Any]],
+    decision_host_monotonic: float,
+) -> dict[str, Any]:
+    """Copy all decision-time evidence so later samples cannot overwrite it."""
+
+    return copy.deepcopy(
+        {
+            "decision_host_monotonic": decision_host_monotonic,
+            "receiver_counter_guard": receiver_counter_guard,
+            "host_guard": host_guard,
+            "receiver_window": receiver_window,
+            "source_progress": source_progress,
+            "source_snapshots": list(source_snapshots),
+        }
+    )
+
+
+def rearm_evidence_margin(
+    elapsed_ms: Any,
+    duration_ms: Any,
+    margin_ms: int = REARM_EVIDENCE_MARGIN_MS,
+) -> dict[str, Any]:
+    """Require bounded post-op8 evidence time before sending op8."""
+
+    valid = (
+        isinstance(elapsed_ms, int)
+        and not isinstance(elapsed_ms, bool)
+        and isinstance(duration_ms, int)
+        and not isinstance(duration_ms, bool)
+        and isinstance(margin_ms, int)
+        and not isinstance(margin_ms, bool)
+        and margin_ms > 0
+    )
+    if not valid:
+        return {
+            "eligible": False,
+            "reason": "invalid_evidence_margin_inputs",
+            "remaining_ms": None,
+            "margin_ms": margin_ms,
+        }
+    remaining_ms = duration_ms - elapsed_ms
+    return {
+        "eligible": remaining_ms >= margin_ms,
+        "reason": "sufficient_evidence_margin"
+        if remaining_ms >= margin_ms
+        else "rearm_evidence_window_margin",
+        "remaining_ms": remaining_ms,
+        "margin_ms": margin_ms,
+    }
+
+
+def rearm_evidence_margin_with_host_elapsed(
+    device_elapsed_ms: Any,
+    duration_ms: Any,
+    request_started_host_monotonic: Any,
+    now_host_monotonic: Any,
+    margin_ms: int = REARM_EVIDENCE_MARGIN_MS,
+) -> dict[str, Any]:
+    """Charge pre-op8 host time against the device window conservatively."""
+
+    result = rearm_evidence_margin(device_elapsed_ms, duration_ms, margin_ms)
+    host_values_valid = all(
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        for value in (request_started_host_monotonic, now_host_monotonic)
+    )
+    device_values_valid = (
+        isinstance(device_elapsed_ms, int)
+        and not isinstance(device_elapsed_ms, bool)
+        and isinstance(duration_ms, int)
+        and not isinstance(duration_ms, bool)
+    )
+    if not host_values_valid or not device_values_valid:
+        result.update(
+            {
+                "eligible": False,
+                "reason": "invalid_evidence_timing_inputs",
+                "device_elapsed_ms": device_elapsed_ms,
+                "host_elapsed_ms": None,
+                "conservative_elapsed_ms": None,
+                "host_elapsed_upper_bound": True,
+            }
+        )
+        return result
+    host_elapsed_seconds = float(now_host_monotonic) - float(
+        request_started_host_monotonic
+    )
+    if host_elapsed_seconds < 0:
+        result.update(
+            {
+                "eligible": False,
+                "reason": "invalid_evidence_timing_inputs",
+                "device_elapsed_ms": device_elapsed_ms,
+                "host_elapsed_ms": None,
+                "conservative_elapsed_ms": None,
+                "host_elapsed_upper_bound": True,
+            }
+        )
+        return result
+    host_elapsed_ms = math.ceil(host_elapsed_seconds * 1000)
+    conservative_elapsed_ms = device_elapsed_ms + host_elapsed_ms
+    result = rearm_evidence_margin(
+        conservative_elapsed_ms, duration_ms, margin_ms
+    )
+    result.update(
+        {
+            "device_elapsed_ms": device_elapsed_ms,
+            "host_elapsed_ms": host_elapsed_ms,
+            "conservative_elapsed_ms": conservative_elapsed_ms,
+            "host_elapsed_upper_bound": True,
+        }
+    )
+    return result
+
+
+def evaluate_source_progress_across_rearm(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    config: Any,
+    *,
+    start_host_monotonic: float,
+    end_host_monotonic: float,
+) -> dict[str, Any]:
+    """Describe the source interval spanning the pre-op8 tail and post-op8 period."""
+
+    before_report = validate_rearm_kind3_report(before, config, "source_before_rearm")
+    after_report = validate_rearm_kind3_report(after, config, "source_after_rearm")
+    if end_host_monotonic <= start_host_monotonic:
+        raise LivenessError("source_progress_across_rearm_time_invalid: host time did not advance")
+    if after_report["elapsed_ms"] <= before_report["elapsed_ms"]:
+        raise LivenessError("source_progress_across_rearm_time_invalid: elapsed time did not advance")
+    progress = evaluate_source_tx_progress(before_report, after_report)
+    progress.update(
+        {
+            "interval_start": "source_kind3_after_baseline_before_receiver_pre_op8",
+            "interval_end": "source_kind3_after_receiver_post_op8",
+            "interval_start_sample": "after_tx_progress_check",
+            "interval_end_sample": "after_rearm",
+            "interval_start_host_monotonic": start_host_monotonic,
+            "interval_end_host_monotonic": end_host_monotonic,
+            "interval_start_elapsed_ms": before_report["elapsed_ms"],
+            "interval_end_elapsed_ms": after_report["elapsed_ms"],
+            "receiver_pre_op8_tail_included": True,
+            "interval_note": "includes receiver pre-op8 kind-3 snapshot/control tail and post-op8 interval; does not isolate post-op8 TX",
+        }
+    )
+    return progress
 
 
 def fresh_config_snapshots_checked(
@@ -1005,6 +1346,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             "sample_interval_seconds": args.sample_interval,
             "rearm_at_seconds": args.rearm_at_seconds,
             "stagnant_seconds": args.rearm_stagnant_seconds,
+            "rearm_evidence_margin_ms": REARM_EVIDENCE_MARGIN_MS,
         },
         "provenance": provenance,
         "file_digests": file_digests,
@@ -1117,10 +1459,16 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
             if rearm_decision["eligible"]:
                 guard = receiver.host_rearm_guard()
                 result["rearm"]["host_guard"] = guard
+                evidence_margin = rearm_evidence_margin(
+                    report.elapsed_ms, config.duration_ms
+                )
+                result["rearm"]["evidence_window_margin"] = evidence_margin
                 if not receiver_counter_guard["eligible"]:
                     result["rearm"]["skipped_reason"] = "receiver_counter_guard_not_ready"
                 elif not report.elapsed_ms > 0:
                     result["rearm"]["skipped_reason"] = "receiver_window_not_started"
+                elif not evidence_margin["eligible"]:
+                    result["rearm"]["skipped_reason"] = "rearm_evidence_window_margin"
                 elif guard["eligible"]:
                     sender.check_health()
                     source_before_report = sender.base.snapshot(
@@ -1130,14 +1478,13 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
                     if source_before is None:
                         raise LivenessError("source_diagnostic_before: empty kind-3 report")
                     _identity_check(source_before, config, "source_diagnostic_before")
-                    result["source_snapshots"].append(
-                        {
-                            **dict(source_before),
-                            "report_kind": benchmark.REPORT_KIND,
-                            "sample": "before_tx_progress_check",
-                            "host_monotonic": time.monotonic(),
-                        }
-                    )
+                    source_before_record = {
+                        **dict(source_before),
+                        "report_kind": benchmark.REPORT_KIND,
+                        "sample": "before_tx_progress_check",
+                        "host_monotonic": time.monotonic(),
+                    }
+                    result["source_snapshots"].append(source_before_record)
                     checkpoint("source_progress_baseline_captured")
                     time.sleep(SOURCE_PROGRESS_SAMPLE_DELAY_SECONDS)
                     sender.check_health()
@@ -1148,23 +1495,88 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
                     if source_after is None:
                         raise LivenessError("source_diagnostic_after: empty kind-3 report")
                     _identity_check(source_after, config, "source_diagnostic_after")
-                    result["source_snapshots"].append(
-                        {
-                            **dict(source_after),
-                            "report_kind": benchmark.REPORT_KIND,
-                            "sample": "after_tx_progress_check",
-                            "host_monotonic": time.monotonic(),
-                        }
-                    )
+                    source_after_record = {
+                        **dict(source_after),
+                        "report_kind": benchmark.REPORT_KIND,
+                        "sample": "after_tx_progress_check",
+                        "host_monotonic": time.monotonic(),
+                    }
+                    result["source_snapshots"].append(source_after_record)
                     checkpoint("source_progress_sampled")
                     source_progress = evaluate_source_tx_progress(
                         source_before, source_after
                     )
                     result["rearm"]["source_tx_progress"] = source_progress
                     if source_progress["eligible"]:
+                        decision_context = freeze_rearm_decision(
+                            receiver_counter_guard,
+                            guard,
+                            result["receiver_window"],
+                            source_progress,
+                            [source_before_record, source_after_record],
+                            time.monotonic(),
+                        )
+                        result["rearm"]["decision"] = copy.deepcopy(
+                            decision_context
+                        )
+                        checkpoint("rearm_decision_context_saved")
+                        receiver_before_request_started = time.monotonic()
+                        receiver_before_report = receiver.base.snapshot(
+                            config, args.control_timeout
+                        )
+                        receiver_before = benchmark._report_dict(
+                            receiver_before_report
+                        )
+                        if receiver_before is None:
+                            raise LivenessError(
+                                "receiver_before: empty kind-3 report"
+                            )
+                        receiver_before = validate_rearm_kind3_report(
+                            receiver_before, config, "receiver_before"
+                        )
+                        receiver_before_record = {
+                            **receiver_before,
+                            "report_kind": benchmark.REPORT_KIND,
+                            "host_monotonic": time.monotonic(),
+                        }
+                        result["rearm"]["receiver_kind3_before"] = (
+                            receiver_before_record
+                        )
+                        decision_context["receiver_kind3_before"] = copy.deepcopy(
+                            receiver_before_record
+                        )
+                        result["rearm"]["decision"] = copy.deepcopy(
+                            decision_context
+                        )
+                        checkpoint("rearm_receiver_before_captured")
+                        pre_op8_evidence_margin = rearm_evidence_margin_with_host_elapsed(
+                            receiver_before["elapsed_ms"],
+                            config.duration_ms,
+                            receiver_before_request_started,
+                            time.monotonic(),
+                        )
+                        result["rearm"]["pre_op8_evidence_window_margin"] = (
+                            pre_op8_evidence_margin
+                        )
+                        decision_context["pre_op8_evidence_window_margin"] = copy.deepcopy(
+                            pre_op8_evidence_margin
+                        )
+                        result["rearm"]["decision"] = copy.deepcopy(
+                            decision_context
+                        )
+                        if not pre_op8_evidence_margin["eligible"]:
+                            result["rearm"]["skipped_reason"] = (
+                                "rearm_evidence_window_margin"
+                            )
+                            checkpoint("rearm_pre_op8_evidence_margin_skipped")
+                            next_sample = max(
+                                next_sample + args.sample_interval,
+                                time.monotonic() + args.sample_interval,
+                            )
+                            continue
                         rearm_attempted = True
                         result["rearm"]["attempted"] = True
-                        rearm_report, _, rearm_request_id = receiver.request(
+                        rearm_report, rearm_sent_monotonic, rearm_request_id = receiver.request(
                             config, CONTROL_REARM_RX_LIVENESS, args.control_timeout
                         )
                         rearm_sample = _sample_dict(
@@ -1179,10 +1591,97 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
                                 "performed": rearm_report.operation_rearm_performed,
                                 "software_armed": rearm_report.operation_rearm_software_armed,
                                 "sample_sequence": rearm_report.snapshot_sequence,
+                                "sent_monotonic": rearm_sent_monotonic,
                             }
                         )
                         if not rearm_report.operation_rearm_performed:
                             add_failure("rearm_response_not_performed")
+                        time.sleep(REARM_RECEIVER_STATS_DELAY_SECONDS)
+                        receiver_after_report = receiver.base.snapshot(
+                            config, args.control_timeout
+                        )
+                        receiver_after = benchmark._report_dict(
+                            receiver_after_report
+                        )
+                        if receiver_after is None:
+                            raise LivenessError(
+                                "receiver_after: empty kind-3 report"
+                            )
+                        receiver_after = validate_rearm_kind3_report(
+                            receiver_after, config, "receiver_after"
+                        )
+                        receiver_after_record = {
+                            **receiver_after,
+                            "report_kind": benchmark.REPORT_KIND,
+                            "host_monotonic": time.monotonic(),
+                        }
+                        result["rearm"]["receiver_kind3_after"] = (
+                            receiver_after_record
+                        )
+                        result["rearm"]["receiver_authenticated_unique_progress"] = (
+                            authenticated_unique_progress(
+                                receiver_before, receiver_after, config
+                            )
+                        )
+                        source_after_rearm_report = sender.base.snapshot(
+                            config, args.control_timeout
+                        )
+                        source_after_rearm = benchmark._report_dict(
+                            source_after_rearm_report
+                        )
+                        if source_after_rearm is None:
+                            raise LivenessError(
+                                "source_after_rearm: empty kind-3 report"
+                            )
+                        source_after_rearm = validate_rearm_kind3_report(
+                            source_after_rearm, config, "source_after_rearm"
+                        )
+                        source_after_rearm_record = {
+                            **source_after_rearm,
+                            "report_kind": benchmark.REPORT_KIND,
+                            "sample": "after_rearm",
+                            "host_monotonic": time.monotonic(),
+                        }
+                        result["source_snapshots"].append(source_after_rearm_record)
+                        source_progress_across_rearm = evaluate_source_progress_across_rearm(
+                            source_after,
+                            source_after_rearm,
+                            config,
+                            start_host_monotonic=source_after_record["host_monotonic"],
+                            end_host_monotonic=source_after_rearm_record[
+                                "host_monotonic"
+                            ],
+                        )
+                        result["rearm"]["source_progress_across_rearm"] = (
+                            source_progress_across_rearm
+                        )
+                        if not source_progress_across_rearm["valid"]:
+                            add_failure("source_post_rearm_counter_invalid")
+                        decision_context["receiver_kind3_after"] = copy.deepcopy(
+                            receiver_after_record
+                        )
+                        decision_context["op8"] = {
+                            "sent_monotonic": rearm_sent_monotonic,
+                            "request_id": rearm_request_id,
+                            "performed": rearm_report.operation_rearm_performed,
+                            "software_armed": rearm_report.operation_rearm_software_armed,
+                            "sample_sequence": rearm_report.snapshot_sequence,
+                        }
+                        decision_context["receiver_authenticated_unique_progress"] = copy.deepcopy(
+                            result["rearm"][
+                                "receiver_authenticated_unique_progress"
+                            ]
+                        )
+                        decision_context["source_after_rearm"] = copy.deepcopy(
+                            source_after_rearm_record
+                        )
+                        decision_context["source_progress_across_rearm"] = copy.deepcopy(
+                            source_progress_across_rearm
+                        )
+                        result["rearm"]["decision"] = copy.deepcopy(
+                            decision_context
+                        )
+                        checkpoint("rearm_evidence_captured")
                 else:
                     result["rearm"]["skipped_reason"] = "host_queue_guard_not_ready"
             next_sample = max(

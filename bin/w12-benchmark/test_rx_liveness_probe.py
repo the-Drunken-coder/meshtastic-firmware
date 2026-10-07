@@ -104,6 +104,37 @@ def liveness_payload(run=None, **changes):
     return bytes(payload)
 
 
+def kind3_report(run=None, **changes):
+    run = config() if run is None else run
+    values = {
+        "run_id": run.run_id,
+        "source": run.source,
+        "destination": run.destination,
+        "count": run.count,
+        "size": run.size,
+        "duration_ms": run.duration_ms,
+        "window": run.window,
+        "flags": run.flags,
+        "prepared": True,
+        "running": True,
+        "complete": False,
+        "elapsed_ms": 100,
+        "received": 10,
+        "duplicates": 1,
+        "corrupt": 0,
+        "out_of_range": 0,
+        "enqueued": 100,
+        "send_failures": 0,
+        "tx_started": 100,
+        "tx_succeeded": 99,
+        "tx_failures": 0,
+        "tx_dropped": 0,
+        "tx_cancelled": 0,
+    }
+    values.update(changes)
+    return values
+
+
 class ParserTests(unittest.TestCase):
     def test_exact_report_decodes_signed_values_and_operation_vs_history(self):
         run = config()
@@ -372,6 +403,154 @@ class ControlAndCounterTests(unittest.TestCase):
         with self.assertRaisesRegex(probe.LivenessError, "source_identity_mismatch"):
             probe._identity_check(report, run, "source")
 
+    def test_rearm_kind3_receipt_progress_accepts_exact_authenticated_unique_delta(self):
+        run = config()
+        before = kind3_report(run, elapsed_ms=200, received=10)
+        after = kind3_report(run, elapsed_ms=1200, received=13)
+        result = probe.authenticated_unique_progress(before, after, run)
+        self.assertEqual(result["authenticated_unique_count_before"], 10)
+        self.assertEqual(result["authenticated_unique_count_after"], 13)
+        self.assertEqual(result["authenticated_unique_count_delta"], 3)
+        self.assertIn(
+            "not packet-level TX/RX matching or PER", result["interpretation"]
+        )
+
+    def test_rearm_kind3_receipt_progress_fails_wrong_config_incomplete_or_decrease(self):
+        run = config()
+        with self.assertRaisesRegex(probe.LivenessError, "identity_mismatch"):
+            probe.authenticated_unique_progress(
+                kind3_report(run), kind3_report(config(run_id=run.run_id + 1)), run
+            )
+        with self.assertRaisesRegex(probe.LivenessError, "incomplete"):
+            probe.authenticated_unique_progress(
+                kind3_report(run, prepared=False), kind3_report(run), run
+            )
+        with self.assertRaisesRegex(probe.LivenessError, "received decreased"):
+            probe.authenticated_unique_progress(
+                kind3_report(run, received=10), kind3_report(run, received=9), run
+            )
+        with self.assertRaisesRegex(probe.LivenessError, "elapsed time decreased"):
+            probe.authenticated_unique_progress(
+                kind3_report(run, elapsed_ms=1200),
+                kind3_report(run, elapsed_ms=1000),
+                run,
+            )
+
+    def test_rearm_kind3_rejects_boundary_terminal_and_invalid_uint32_counters(self):
+        run = config()
+        with self.assertRaisesRegex(probe.LivenessError, "time_invalid"):
+            probe.validate_rearm_kind3_report(
+                kind3_report(run, elapsed_ms=run.duration_ms), run, "boundary"
+            )
+        with self.assertRaisesRegex(probe.LivenessError, "incomplete"):
+            probe.validate_rearm_kind3_report(
+                kind3_report(
+                    run,
+                    running=False,
+                    complete=True,
+                    elapsed_ms=run.duration_ms + 1,
+                ),
+                run,
+                "terminal",
+            )
+        with self.assertRaisesRegex(probe.LivenessError, "counter_invalid"):
+            probe.validate_rearm_kind3_report(
+                kind3_report(run, received=run.count + 1), run, "received"
+            )
+        for field, invalid in (
+            ("duplicates", -1),
+            ("corrupt", True),
+            ("tx_succeeded", probe.UINT32_MAX + 1),
+        ):
+            with self.subTest(field=field, invalid=invalid), self.assertRaisesRegex(
+                probe.LivenessError, "counter_invalid"
+            ):
+                probe.validate_rearm_kind3_report(
+                    kind3_report(run, **{field: invalid}), run, field
+                )
+
+    def test_source_progress_across_rearm_records_exact_interval_and_tail(self):
+        run = config()
+        before = kind3_report(run, elapsed_ms=100, tx_started=10, tx_succeeded=9)
+        after = kind3_report(run, elapsed_ms=1200, tx_started=12, tx_succeeded=11)
+        result = probe.evaluate_source_progress_across_rearm(
+            before,
+            after,
+            run,
+            start_host_monotonic=20.0,
+            end_host_monotonic=21.5,
+        )
+        self.assertTrue(result["eligible"])
+        self.assertEqual(result["interval_start_sample"], "after_tx_progress_check")
+        self.assertEqual(result["interval_end_sample"], "after_rearm")
+        self.assertEqual(result["interval_start_elapsed_ms"], 100)
+        self.assertEqual(result["interval_end_elapsed_ms"], 1200)
+        self.assertTrue(result["receiver_pre_op8_tail_included"])
+        self.assertIn("pre-op8", result["interval_note"])
+
+    def test_source_progress_across_rearm_requires_elapsed_and_host_progress(self):
+        run = config()
+        before = kind3_report(run, elapsed_ms=100, tx_started=10, tx_succeeded=9)
+        same_elapsed = kind3_report(
+            run, elapsed_ms=100, tx_started=12, tx_succeeded=11
+        )
+        with self.assertRaisesRegex(probe.LivenessError, "elapsed time did not advance"):
+            probe.evaluate_source_progress_across_rearm(
+                before,
+                same_elapsed,
+                run,
+                start_host_monotonic=20.0,
+                end_host_monotonic=21.5,
+            )
+        with self.assertRaisesRegex(probe.LivenessError, "host time did not advance"):
+            probe.evaluate_source_progress_across_rearm(
+                before,
+                kind3_report(run, elapsed_ms=200, tx_started=12, tx_succeeded=11),
+                run,
+                start_host_monotonic=20.0,
+                end_host_monotonic=20.0,
+            )
+
+    def test_rearm_evidence_margin_skips_near_end_window(self):
+        sufficient = probe.rearm_evidence_margin(58000, 60000)
+        self.assertTrue(sufficient["eligible"])
+        self.assertEqual(sufficient["remaining_ms"], 2000)
+        near_end = probe.rearm_evidence_margin(58001, 60000)
+        self.assertFalse(near_end["eligible"])
+        self.assertEqual(near_end["remaining_ms"], 1999)
+        self.assertEqual(near_end["reason"], "rearm_evidence_window_margin")
+
+    def test_pre_op8_host_delay_can_cross_margin_without_marking_rearm_attempted(self):
+        fresh = probe.rearm_evidence_margin_with_host_elapsed(
+            58000, 60000, 10.0, 10.0
+        )
+        self.assertTrue(fresh["eligible"])
+        delayed = probe.rearm_evidence_margin_with_host_elapsed(
+            58000, 60000, 10.0, 10.001
+        )
+        self.assertFalse(delayed["eligible"])
+        self.assertEqual(delayed["reason"], "rearm_evidence_window_margin")
+        self.assertEqual(delayed["host_elapsed_ms"], 1)
+        self.assertEqual(delayed["conservative_elapsed_ms"], 58001)
+        self.assertTrue(delayed["host_elapsed_upper_bound"])
+        decision = probe.rearm_candidate(20.0, 20.0, 10.0, False, 20.0, 3.0)
+        self.assertTrue(decision["eligible"])
+
+    def test_rearm_decision_copies_guard_and_window_at_decision_time(self):
+        guard = {"valid_counter_samples": 2}
+        host_guard = {"queued_packets": 0, "ack_markers": 3}
+        window = {"status": "running", "elapsed_ms": 1200}
+        progress = {"tx_succeeded_delta": 2}
+        decision = probe.freeze_rearm_decision(
+            guard, host_guard, window, progress, [{"tx_succeeded": 5}], 12.0
+        )
+        guard["valid_counter_samples"] = 99
+        host_guard["queued_packets"] = 12
+        window["status"] = "complete"
+        self.assertEqual(decision["receiver_counter_guard"]["valid_counter_samples"], 2)
+        self.assertEqual(decision["host_guard"]["queued_packets"], 0)
+        self.assertEqual(decision["receiver_window"]["status"], "running")
+
 
 class ResponseSafetyTests(unittest.TestCase):
     def _session(self, event):
@@ -446,6 +625,83 @@ class ResponseSafetyTests(unittest.TestCase):
 
 
 class ControlTransportTests(unittest.TestCase):
+    def test_sdk_false_ack_markers_do_not_count_as_pending_packets(self):
+        mesh_pb2, _ = probe._load_meshtastic_types()
+        real = mesh_pb2.ToRadio()
+        real.packet.id = 123
+        state = probe.inspect_sdk_queue({123: real, 777: False})
+        self.assertTrue(state["known"])
+        self.assertEqual(state["queued_packets"], 1)
+        self.assertEqual(state["pending_packets"], 1)
+        self.assertEqual(state["ack_markers"], 1)
+        self.assertTrue(state["unknown_details"] == [])
+
+    def test_unknown_sdk_queue_entry_fails_closed(self):
+        state = probe.inspect_sdk_queue({123: object()})
+        self.assertFalse(state["known"])
+        self.assertEqual(state["unknown_entries"], 1)
+
+    def test_to_radio_like_fakes_and_malformed_mapping_items_fail_closed(self):
+        class FakePacket:
+            def __init__(self, packet_id):
+                self.id = packet_id
+
+        class FakeToRadio:
+            def __init__(self, packet_id):
+                self.packet = FakePacket(packet_id)
+
+            def HasField(self, _name):
+                return True
+
+        for packet_id in (1.0, "1"):
+            state = probe.inspect_sdk_queue({1: FakeToRadio(packet_id)})
+            self.assertFalse(state["known"])
+            self.assertEqual(state["unknown_entries"], 1)
+
+        class MalformedDict(dict):
+            def items(self):
+                return [(1,), (2, object())]
+
+        state = probe.inspect_sdk_queue(MalformedDict())
+        self.assertFalse(state["known"])
+        self.assertEqual(state["unknown_entries"], 2)
+
+    def test_host_guard_ignores_false_markers_but_blocks_unknown_entries(self):
+        session = object.__new__(probe.LivenessSession)
+        queue_status = SimpleNamespace(free=16)
+        session.interface = SimpleNamespace(queueStatus=queue_status, queue={77: False})
+        marker_guard = session.host_rearm_guard()
+        self.assertTrue(marker_guard["eligible"])
+        self.assertEqual(marker_guard["ack_markers"], 1)
+        mesh_pb2, _ = probe._load_meshtastic_types()
+        real = mesh_pb2.ToRadio()
+        real.packet.id = 77
+        session.interface.queue = {77: real}
+        real_guard = session.host_rearm_guard()
+        self.assertFalse(real_guard["eligible"])
+        self.assertEqual(real_guard["pending_packets"], 1)
+        session.interface.queue = {77: object()}
+        unknown_guard = session.host_rearm_guard()
+        self.assertFalse(unknown_guard["eligible"])
+        self.assertEqual(unknown_guard["unknown_queue_entries"], 1)
+        session.interface.queue = None
+        missing_guard = session.host_rearm_guard()
+        self.assertFalse(missing_guard["eligible"])
+        self.assertEqual(missing_guard["unknown_queue_entries"], 1)
+        session.interface.queue = {}
+        session.interface.queueStatus = None
+        missing_status_guard = session.host_rearm_guard()
+        self.assertFalse(missing_status_guard["eligible"])
+        self.assertTrue(missing_status_guard["queue_free_invalid"])
+        session.interface.queueStatus = SimpleNamespace()
+        missing_free_guard = session.host_rearm_guard()
+        self.assertFalse(missing_free_guard["eligible"])
+        self.assertTrue(missing_free_guard["queue_free_invalid"])
+        session.interface.queueStatus = SimpleNamespace(free=True)
+        boolean_free_guard = session.host_rearm_guard()
+        self.assertFalse(boolean_free_guard["eligible"])
+        self.assertTrue(boolean_free_guard["queue_free_invalid"])
+
     def test_narrow_sender_bypasses_sdk_queue_and_sets_local_safe_fields(self):
         mesh_pb2, portnums_pb2 = probe._load_meshtastic_types()
 
@@ -631,7 +887,7 @@ class FreshConfigTests(unittest.TestCase):
 class MetadataTests(unittest.TestCase):
     def test_probe_protocol_is_self_relative_and_diagnostic_only(self):
         protocol = json.loads(
-            (MODULE_PATH.with_name("rx-liveness-protocol.json")).read_text()
+            MODULE_PATH.with_name("rx-liveness-protocol.json").read_text()
         )
         self.assertEqual(protocol["report"]["bytes"], 80)
         self.assertEqual(protocol["report"]["kind"], 6)
