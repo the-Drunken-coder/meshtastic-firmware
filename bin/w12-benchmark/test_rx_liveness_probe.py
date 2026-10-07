@@ -446,6 +446,83 @@ class ResponseSafetyTests(unittest.TestCase):
 
 
 class ControlTransportTests(unittest.TestCase):
+    def test_sdk_false_ack_markers_do_not_count_as_pending_packets(self):
+        mesh_pb2, _ = probe._load_meshtastic_types()
+        real = mesh_pb2.ToRadio()
+        real.packet.id = 123
+        state = probe.inspect_sdk_queue({123: real, 777: False})
+        self.assertTrue(state["known"])
+        self.assertEqual(state["queued_packets"], 1)
+        self.assertEqual(state["pending_packets"], 1)
+        self.assertEqual(state["ack_markers"], 1)
+        self.assertTrue(state["unknown_details"] == [])
+
+    def test_unknown_sdk_queue_entry_fails_closed(self):
+        state = probe.inspect_sdk_queue({123: object()})
+        self.assertFalse(state["known"])
+        self.assertEqual(state["unknown_entries"], 1)
+
+    def test_to_radio_like_fakes_and_malformed_mapping_items_fail_closed(self):
+        class FakePacket:
+            def __init__(self, packet_id):
+                self.id = packet_id
+
+        class FakeToRadio:
+            def __init__(self, packet_id):
+                self.packet = FakePacket(packet_id)
+
+            def HasField(self, _name):
+                return True
+
+        for packet_id in (1.0, "1"):
+            state = probe.inspect_sdk_queue({1: FakeToRadio(packet_id)})
+            self.assertFalse(state["known"])
+            self.assertEqual(state["unknown_entries"], 1)
+
+        class MalformedDict(dict):
+            def items(self):
+                return [(1,), (2, object())]
+
+        state = probe.inspect_sdk_queue(MalformedDict())
+        self.assertFalse(state["known"])
+        self.assertEqual(state["unknown_entries"], 2)
+
+    def test_host_guard_ignores_false_markers_but_blocks_unknown_entries(self):
+        session = object.__new__(probe.LivenessSession)
+        queue_status = SimpleNamespace(free=16)
+        session.interface = SimpleNamespace(queueStatus=queue_status, queue={77: False})
+        marker_guard = session.host_rearm_guard()
+        self.assertTrue(marker_guard["eligible"])
+        self.assertEqual(marker_guard["ack_markers"], 1)
+        mesh_pb2, _ = probe._load_meshtastic_types()
+        real = mesh_pb2.ToRadio()
+        real.packet.id = 77
+        session.interface.queue = {77: real}
+        real_guard = session.host_rearm_guard()
+        self.assertFalse(real_guard["eligible"])
+        self.assertEqual(real_guard["pending_packets"], 1)
+        session.interface.queue = {77: object()}
+        unknown_guard = session.host_rearm_guard()
+        self.assertFalse(unknown_guard["eligible"])
+        self.assertEqual(unknown_guard["unknown_queue_entries"], 1)
+        session.interface.queue = None
+        missing_guard = session.host_rearm_guard()
+        self.assertFalse(missing_guard["eligible"])
+        self.assertEqual(missing_guard["unknown_queue_entries"], 1)
+        session.interface.queue = {}
+        session.interface.queueStatus = None
+        missing_status_guard = session.host_rearm_guard()
+        self.assertFalse(missing_status_guard["eligible"])
+        self.assertTrue(missing_status_guard["queue_free_invalid"])
+        session.interface.queueStatus = SimpleNamespace()
+        missing_free_guard = session.host_rearm_guard()
+        self.assertFalse(missing_free_guard["eligible"])
+        self.assertTrue(missing_free_guard["queue_free_invalid"])
+        session.interface.queueStatus = SimpleNamespace(free=True)
+        boolean_free_guard = session.host_rearm_guard()
+        self.assertFalse(boolean_free_guard["eligible"])
+        self.assertTrue(boolean_free_guard["queue_free_invalid"])
+
     def test_narrow_sender_bypasses_sdk_queue_and_sets_local_safe_fields(self):
         mesh_pb2, portnums_pb2 = probe._load_meshtastic_types()
 
@@ -631,7 +708,7 @@ class FreshConfigTests(unittest.TestCase):
 class MetadataTests(unittest.TestCase):
     def test_probe_protocol_is_self_relative_and_diagnostic_only(self):
         protocol = json.loads(
-            (MODULE_PATH.with_name("rx-liveness-protocol.json")).read_text()
+            MODULE_PATH.with_name("rx-liveness-protocol.json").read_text()
         )
         self.assertEqual(protocol["report"]["bytes"], 80)
         self.assertEqual(protocol["report"]["kind"], 6)

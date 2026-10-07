@@ -21,6 +21,7 @@ import secrets
 import sys
 import threading
 import time
+from collections.abc import Mapping as MappingABC
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -548,6 +549,101 @@ def receiver_window_observation(
     }
 
 
+def inspect_sdk_queue(queue: Any) -> dict[str, Any]:
+    """Separate real ToRadio queue entries from SDK false ACK markers."""
+
+    if queue is None:
+        return {
+            "known": False,
+            "queue_entries": None,
+            "queued_packets": None,
+            "pending_packets": None,
+            "ack_markers": None,
+            "unknown_entries": 1,
+            "unknown_details": ["queue_is_missing"],
+        }
+    if not isinstance(queue, MappingABC):
+        return {
+            "known": False,
+            "queue_entries": None,
+            "queued_packets": None,
+            "pending_packets": None,
+            "ack_markers": None,
+            "unknown_entries": 1,
+            "unknown_details": ["queue_is_not_mapping"],
+        }
+    queued_packets = 0
+    ack_markers = 0
+    unknown_details: list[str] = []
+    try:
+        entries = list(queue.items())
+    except Exception as error:
+        return {
+            "known": False,
+            "queue_entries": None,
+            "queued_packets": None,
+            "pending_packets": None,
+            "ack_markers": None,
+            "unknown_entries": 1,
+            "unknown_details": [f"queue_read_failed:{type(error).__name__}"],
+        }
+    try:
+        mesh_pb2, _ = _load_meshtastic_types()
+        to_radio_type = mesh_pb2.ToRadio
+    except Exception as error:
+        return {
+            "known": False,
+            "queue_entries": len(entries),
+            "queued_packets": None,
+            "pending_packets": None,
+            "ack_markers": None,
+            "unknown_entries": len(entries),
+            "unknown_details": [f"protobuf_type_unavailable:{type(error).__name__}"],
+        }
+    for entry in entries:
+        try:
+            key, value = entry
+        except Exception as error:
+            unknown_details.append(f"{entry!r}:{type(error).__name__}")
+            continue
+        if (
+            not isinstance(key, int)
+            or isinstance(key, bool)
+            or not 0 < key <= 0xFFFFFFFF
+        ):
+            unknown_details.append(f"{key!r}:ValueError")
+            continue
+        if value is False:
+            ack_markers += 1
+            continue
+        try:
+            if not isinstance(value, to_radio_type):
+                raise ValueError("entry is not a protobuf ToRadio message")
+            if not value.HasField("packet"):
+                raise ValueError("entry has no packet field")
+            packet_id = value.packet.id
+            if (
+                not isinstance(packet_id, int)
+                or isinstance(packet_id, bool)
+                or not 0 < packet_id <= 0xFFFFFFFF
+                or packet_id != key
+            ):
+                raise ValueError("entry packet ID does not match queue key")
+        except Exception as error:
+            unknown_details.append(f"{key!r}:{type(error).__name__}")
+            continue
+        queued_packets += 1
+    return {
+        "known": not unknown_details,
+        "queue_entries": len(entries),
+        "queued_packets": queued_packets,
+        "pending_packets": queued_packets,
+        "ack_markers": ack_markers,
+        "unknown_entries": len(unknown_details),
+        "unknown_details": unknown_details,
+    }
+
+
 def rearm_candidate(
     elapsed_seconds: float,
     now: float,
@@ -761,15 +857,34 @@ class LivenessSession:
             raise LivenessError(f"control_write_error: {error}") from error
 
     def host_rearm_guard(self) -> dict[str, Any]:
+        missing = object()
         queue_status = getattr(self.interface, "queueStatus", None)
-        queue_free = getattr(queue_status, "free", None)
+        queue_free = (
+            missing if queue_status is None else getattr(queue_status, "free", missing)
+        )
         queue = getattr(self.interface, "queue", None)
-        queued = len(queue) if queue is not None else None
-        eligible = queued == 0 and (queue_free is None or int(queue_free) > 0)
+        queue_state = inspect_sdk_queue(queue)
+        free_valid = (
+            isinstance(queue_free, int)
+            and not isinstance(queue_free, bool)
+            and queue_free > 0
+        )
+        eligible = (
+            queue_state["known"]
+            and queue_state["queued_packets"] == 0
+            and free_valid
+        )
         return {
             "eligible": eligible,
-            "queue_free_cached": queue_free,
-            "queued_packets": queued,
+            "queue_free_cached": None if queue_free is missing else queue_free,
+            "queue_entries": queue_state["queue_entries"],
+            "queued_packets": queue_state["queued_packets"],
+            "pending_packets": queue_state["pending_packets"],
+            "ack_markers": queue_state["ack_markers"],
+            "unknown_queue_entries": queue_state["unknown_entries"],
+            "unknown_queue_details": queue_state["unknown_details"],
+            "queue_state_known": queue_state["known"] and free_valid,
+            "queue_free_invalid": not free_valid,
             "firmware_guard_authoritative": True,
             "note": "firmware checks active TX, radio TX queue, receiver window, and one-shot budget",
         }
