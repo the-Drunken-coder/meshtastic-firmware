@@ -1,0 +1,84 @@
+--- a/firmware/.pio/libdeps/native/RadioLib/src/modules/LR2021/LR2021.cpp
++++ b/firmware/.pio/libdeps/native/RadioLib/src/modules/LR2021/LR2021.cpp
+@@ -576,8 +576,32 @@
+     return(RADIOLIB_ERR_WRONG_MODEM);
+   }
+ 
++  auto finishRead = [this](int16_t result) {
++    const int16_t fifoState = clearRxFifo();
++    const int16_t irqState = clearIrqState(RADIOLIB_LR2021_IRQ_ALL);
++    if(result != RADIOLIB_ERR_NONE) {
++      return(result);
++    }
++    if(fifoState != RADIOLIB_ERR_NONE) {
++      return(fifoState);
++    }
++    return(irqState);
++  };
++
+   // check integrity CRC
+-  uint32_t irq = getIrqStatus();
++  uint8_t stat1 = 0;
++  uint8_t stat2 = 0;
++  uint32_t irq = 0;
++  Module::BitWidth_t statusWidth = this->mod->spiConfig.widths[RADIOLIB_MODULE_SPI_WIDTH_STATUS];
++  this->mod->spiConfig.widths[RADIOLIB_MODULE_SPI_WIDTH_STATUS] = Module::BITS_0;
++  // With no status prefix, getStatus() returns the status bytes and IRQ flags in one transfer;
++  // SPItransferStream routes stat1 through the existing parseStatusCb.
++  state = getStatus(&stat1, &stat2, &irq);
++  this->mod->spiConfig.widths[RADIOLIB_MODULE_SPI_WIDTH_STATUS] = statusWidth;
++  if(state != RADIOLIB_ERR_NONE) {
++    return(finishRead(state));
++  }
++
+   int16_t crcState = RADIOLIB_ERR_NONE;
+   // report CRC mismatch when there's a payload CRC error
+   if(irq & RADIOLIB_LR2021_IRQ_CRC_ERROR) {
+@@ -592,7 +616,22 @@
+   }
+ 
+   // get packet length
+-  size_t length = getPacketLength();
++  size_t length = this->implicitLen;
++  if((modem != RADIOLIB_LR2021_PACKET_TYPE_LORA) ||
++     (this->headerType != RADIOLIB_LRXXXX_LORA_HEADER_IMPLICIT)) {
++    uint16_t packetLength = 0;
++    state = getRxPktLength(&packetLength);
++    if(state != RADIOLIB_ERR_NONE) {
++      return(finishRead(state));
++    }
++    length = (size_t)packetLength;
++  }
++  // Meshtastic passes FLRC's pre-queried expected length here. Reject a shorter
++  // radio-reported packet, including zero, while retaining prefix reads when actual > requested.
++  // Keep len == 0 and LoRa implicit mode's existing compatibility semantics.
++  if((modem == RADIOLIB_LR2021_PACKET_TYPE_FLRC) && (len != 0) && (length < len)) {
++    return(finishRead(RADIOLIB_ERR_PACKET_TOO_SHORT));
++  }
+   if((len != 0) && (len < length)) {
+     // user requested less data than we got, only return what was requested
+     length = len;
+@@ -600,19 +639,12 @@
+ 
+   // read packet data
+   state = readRadioRxFifo(data, length);
+-  RADIOLIB_ASSERT(state);
+-
+-  // clear the Rx buffer
+-  state = clearRxFifo();
+-  RADIOLIB_ASSERT(state);
+-
+-  // clear interrupt flags
+-  state = clearIrqState(RADIOLIB_LR2021_IRQ_ALL);
++  if(state != RADIOLIB_ERR_NONE) {
++    return(finishRead(state));
++  }
+ 
+   // check if CRC failed - this is done after reading data to give user the option to keep them
+-  RADIOLIB_ASSERT(crcState);
+-
+-  return(state);
++  return(finishRead(crcState));
+ }
+ 
+ int16_t LR2021::finishReceive() {

@@ -78,9 +78,16 @@ bool LR2021Interface::beginFlrc()
     int16_t result = W12FlrcProfile::begin(lora);
     RadioMode::markInitialized(result == RADIOLIB_ERR_NONE);
     if (result != RADIOLIB_ERR_NONE) {
+#if MESHTASTIC_W12_BENCHMARK_ATOMIC_FLRC_CONSUME && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) &&                   \
+    ((defined(MESHTASTIC_W12_BENCHMARK_SINGLE_RX) && MESHTASTIC_W12_BENCHMARK_SINGLE_RX) ||                                      \
+     defined(MESHTASTIC_W12_BENCHMARK_RX_TIMEOUT_MS))
+        atomicConsumeRearmBlocked = true;
+#endif
         rxOffline = true;
         LOG_ERROR("W12 FLRC profile init failed %s%d", radioLibErr, result);
     } else {
+        // Only a successful full profile restore clears a foreign-modem block.
+        atomicConsumeRearmBlocked = false;
         LOG_INFO("W12 FLRC 915MHz fixed candidate: chip drive -9dBm, RF acceptance pending");
     }
     return result == RADIOLIB_ERR_NONE;
@@ -102,6 +109,11 @@ bool LR2021Interface::reconfigure()
 #endif
     if (!RadioMode::isFlrc())
         return LR20x0Interface::reconfigure();
+    if (atomicConsumeRearmBlocked) {
+        rxOffline = true;
+        RadioMode::markInitialized(false);
+        return false;
+    }
     RadioLibInterface::reconfigure();
     // Mode writes are pending until reboot; logical-channel edits retain the active fixed waveform.
 #if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
@@ -171,6 +183,12 @@ void LR2021Interface::startReceive()
 {
     if (!RadioMode::isFlrc()) {
         LR20x0Interface::startReceive();
+        return;
+    }
+    if (atomicConsumeRearmBlocked) {
+        isReceiving = false;
+        rxOffline = true;
+        RadioMode::markInitialized(false);
         return;
     }
 #if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
@@ -472,6 +490,102 @@ bool LR2021Interface::receiveIrqPending()
     return result != RADIOLIB_ERR_NONE || (flags & W12FlrcProfile::RECEIVE_IRQS);
 }
 
+bool LR2021Interface::consumeReceivePacket(uint8_t *data, size_t capacity, RadioReceiveConsumeResult &result)
+{
+    result = RadioReceiveConsumeResult{};
+#if MESHTASTIC_W12_BENCHMARK_ATOMIC_FLRC_CONSUME && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) &&                   \
+    ((defined(MESHTASTIC_W12_BENCHMARK_SINGLE_RX) && MESHTASTIC_W12_BENCHMARK_SINGLE_RX) ||                                      \
+     defined(MESHTASTIC_W12_BENCHMARK_RX_TIMEOUT_MS))
+    if (!RadioMode::isFlrc())
+        return false;
+#ifndef DISABLE_WELCOME_UNSET
+    if (RadioMode::activeConfig().region == meshtastic_Config_LoRaConfig_RegionCode_UNSET)
+        return false;
+#endif
+    // The seam owns IRQ/FIFO state only while no TX is in flight. It is a
+    // finite-RX experiment and must not consume a transmit completion.
+    if (sendingPacket != nullptr || isSending())
+        return false;
+
+    LR2021FlrcRxPacketStatus packetStatus;
+    result.state = lora.readFlrcPacket(data, capacity, &packetStatus);
+    result.length = result.state == RADIOLIB_ERR_NONE ? packetStatus.packetLength : 0;
+    result.rearmSafe = packetStatus.rearmSafe && !packetStatus.rearmBlocked;
+    if (packetStatus.rearmBlocked) {
+        atomicConsumeRearmBlocked = true;
+        rxOffline = true;
+        RadioMode::markInitialized(false);
+    }
+    result.hasRssi = result.state == RADIOLIB_ERR_NONE && packetStatus.packetStatusReadValid;
+    if (result.hasRssi)
+        result.rssi = lround(packetStatus.rssiAverage);
+#if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+    if (w12BenchmarkModule) {
+        const uint32_t irqFlags = packetStatus.irqReadValid ? packetStatus.irqFlags : 0;
+        w12BenchmarkModule->onRxIrq(
+            packetStatus.irqReadValid, irqFlags & RADIOLIB_LR2021_IRQ_RX_DONE, irqFlags & RADIOLIB_LR2021_IRQ_CRC_ERROR,
+            irqFlags & RADIOLIB_LR2021_IRQ_LEN_ERROR, irqFlags & RADIOLIB_LR2021_IRQ_LORA_HDR_CRC_ERROR,
+            irqFlags & RADIOLIB_LR2021_IRQ_TIMEOUT,
+            irqFlags & (RADIOLIB_LR2021_IRQ_ERROR | RADIOLIB_LR2021_IRQ_CMD_ERROR | RADIOLIB_LR2021_IRQ_ADDR_ERROR));
+    }
+#endif
+    return true;
+#else
+    (void)data;
+    (void)capacity;
+    return false;
+#endif
+}
+
+bool LR2021Interface::recoverReceiveAfterFailedConsume()
+{
+#if MESHTASTIC_W12_BENCHMARK_ATOMIC_FLRC_CONSUME && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) &&                   \
+    ((defined(MESHTASTIC_W12_BENCHMARK_SINGLE_RX) && MESHTASTIC_W12_BENCHMARK_SINGLE_RX) ||                                      \
+     defined(MESHTASTIC_W12_BENCHMARK_RX_TIMEOUT_MS))
+    if (!RadioMode::isFlrc() || atomicConsumeRearmBlocked)
+        return false;
+
+    // The consume call made the initial cleanup attempt. One public discard
+    // retry may prove a fresh STDBY_RC boundary before ordinary rearm.
+    LR2021FlrcRxDiscardStatus discardStatus;
+    (void)lora.discardFlrcReceive(&discardStatus);
+    if (discardStatus.rearmBlocked) {
+        atomicConsumeRearmBlocked = true;
+        rxOffline = true;
+        RadioMode::markInitialized(false);
+        LOG_ERROR("FLRC recovery modem proof failed; RX left offline");
+        return false;
+    }
+    if (discardStatus.rearmSafe)
+        return true;
+
+    // No FIFO and IRQ proof means ordinary arm/rearm must remain blocked until
+    // a full FLRC profile restore establishes ownership again.
+    atomicConsumeRearmBlocked = true;
+    rxOffline = true;
+    RadioMode::markInitialized(false);
+    LOG_ERROR("FLRC consume cleanup unsafe; RX left offline");
+    return false;
+#else
+    return false;
+#endif
+}
+
+void LR2021Interface::applyReceiveConsumeMetadata(meshtastic_MeshPacket *mp, const RadioReceiveConsumeResult &result)
+{
+    if (!RadioMode::isFlrc()) {
+        addReceiveMetadata(mp);
+        return;
+    }
+
+    // FLRC has no SNR value in the LR2021 packet-status response.
+    mp->rx_snr = 0;
+    mp->rx_snr_unavailable = true;
+    mp->has_rx_rssi = result.hasRssi;
+    if (mp->has_rx_rssi)
+        mp->rx_rssi = result.rssi;
+}
+
 bool LR2021Interface::validReceiveIrq()
 {
     if (!RadioMode::isFlrc())
@@ -480,10 +594,11 @@ bool LR2021Interface::validReceiveIrq()
     int16_t result = W12FlrcProfile::readIrqFlags(module, flags);
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
     if (w12BenchmarkModule)
-        w12BenchmarkModule->onRxIrq(result == RADIOLIB_ERR_NONE, flags & RADIOLIB_LR2021_IRQ_RX_DONE,
-                                    flags & RADIOLIB_LR2021_IRQ_CRC_ERROR, flags & RADIOLIB_LR2021_IRQ_LEN_ERROR,
-                                    flags & RADIOLIB_LR2021_IRQ_LORA_HDR_CRC_ERROR, flags & RADIOLIB_LR2021_IRQ_TIMEOUT,
-                                    flags & (RADIOLIB_LR2021_IRQ_ERROR | RADIOLIB_LR2021_IRQ_CMD_ERROR));
+        w12BenchmarkModule->onRxIrq(
+            result == RADIOLIB_ERR_NONE, flags & RADIOLIB_LR2021_IRQ_RX_DONE, flags & RADIOLIB_LR2021_IRQ_CRC_ERROR,
+            flags & RADIOLIB_LR2021_IRQ_LEN_ERROR, flags & RADIOLIB_LR2021_IRQ_LORA_HDR_CRC_ERROR,
+            flags & RADIOLIB_LR2021_IRQ_TIMEOUT,
+            flags & (RADIOLIB_LR2021_IRQ_ERROR | RADIOLIB_LR2021_IRQ_CMD_ERROR | RADIOLIB_LR2021_IRQ_ADDR_ERROR));
 #endif
     if (result == RADIOLIB_ERR_NONE && W12FlrcProfile::acceptsIrq(flags))
         return true;

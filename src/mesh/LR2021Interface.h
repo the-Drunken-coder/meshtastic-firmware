@@ -2,6 +2,10 @@
 #if RADIOLIB_EXCLUDE_LR2021 != 1
 #include "LR20x0Interface.h"
 
+#ifndef MESHTASTIC_W12_BENCHMARK_ATOMIC_FLRC_CONSUME
+#define MESHTASTIC_W12_BENCHMARK_ATOMIC_FLRC_CONSUME 0
+#endif
+
 /**
  * Our adapter for LR2021 radios
  */
@@ -26,6 +30,9 @@ class LR2021Interface : public LR20x0Interface<LR2021>
     bool recoverChipStateLoss() override;
     bool receiveIrqPending() override;
     bool validReceiveIrq() override;
+    bool consumeReceivePacket(uint8_t *data, size_t capacity, RadioReceiveConsumeResult &result) override;
+    bool recoverReceiveAfterFailedConsume() override;
+    void applyReceiveConsumeMetadata(meshtastic_MeshPacket *mp, const RadioReceiveConsumeResult &result) override;
     bool validTransmitIrq() override;
     bool armTransmitBeforeStart() override;
     void onTransmitStarted() override;
@@ -43,5 +50,6 @@ class LR2021Interface : public LR20x0Interface<LR2021>
   private:
     bool beginFlrc();
     int16_t standbyFlrc();
+    bool atomicConsumeRearmBlocked = false;
 };
 #endif

@@ -1,102 +1,66 @@
 #!/usr/bin/env python3
-"""Apply the pinned LR2021 readData correctness patch once per dependency tree."""
+"""Apply the pinned LR2021 correctness and finite-FLRC driver patch as a pair."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import os
+import re
+import tempfile
 from pathlib import Path
 
 
-RADIOLIB_VERSION = "7.7.1"
-RADIOLIB_COMMIT = "510e00cfb05bbc3c2b7b524262785454944adb6e"
-RADIOLIB_URI = f"https://github.com/jgromes/RadioLib/archive/{RADIOLIB_COMMIT}.zip"
-SOURCE_RELATIVE_PATH = Path("src/modules/LR2021/LR2021.cpp")
-ORIGINAL_SHA256 = "7662c16d8a2e4d10cd1fee7d5910a85a5a246d79f3c76586195af16a2fbbbfa9"
-PATCHED_SHA256 = "12bc9aa547d24b0b311fda8e231bff3e8f1177bf8398160238f9e836f2cae701"
-
-OLD_STATUS_BLOCK = """  // check integrity CRC
-  uint32_t irq = getIrqStatus();
-"""
-NEW_STATUS_BLOCK = """  auto finishRead = [this](int16_t result) {
-    const int16_t fifoState = clearRxFifo();
-    const int16_t irqState = clearIrqState(RADIOLIB_LR2021_IRQ_ALL);
-    if(result != RADIOLIB_ERR_NONE) {
-      return(result);
-    }
-    if(fifoState != RADIOLIB_ERR_NONE) {
-      return(fifoState);
-    }
-    return(irqState);
-  };
-
-  // check integrity CRC
-  uint8_t stat1 = 0;
-  uint8_t stat2 = 0;
-  uint32_t irq = 0;
-  Module::BitWidth_t statusWidth = this->mod->spiConfig.widths[RADIOLIB_MODULE_SPI_WIDTH_STATUS];
-  this->mod->spiConfig.widths[RADIOLIB_MODULE_SPI_WIDTH_STATUS] = Module::BITS_0;
-  // With no status prefix, getStatus() returns the status bytes and IRQ flags in one transfer;
-  // SPItransferStream routes stat1 through the existing parseStatusCb.
-  state = getStatus(&stat1, &stat2, &irq);
-  this->mod->spiConfig.widths[RADIOLIB_MODULE_SPI_WIDTH_STATUS] = statusWidth;
-  if(state != RADIOLIB_ERR_NONE) {
-    return(finishRead(state));
-  }
-
-"""
-OLD_LENGTH_BLOCK = """  // get packet length
-  size_t length = getPacketLength();
-"""
-NEW_LENGTH_BLOCK = """  // get packet length
-  size_t length = this->implicitLen;
-  if((modem != RADIOLIB_LR2021_PACKET_TYPE_LORA) ||
-     (this->headerType != RADIOLIB_LRXXXX_LORA_HEADER_IMPLICIT)) {
-    uint16_t packetLength = 0;
-    state = getRxPktLength(&packetLength);
-    if(state != RADIOLIB_ERR_NONE) {
-      return(finishRead(state));
-    }
-    length = (size_t)packetLength;
-  }
-  // Meshtastic passes FLRC's pre-queried expected length here. Reject a shorter
-  // radio-reported packet, including zero, while retaining prefix reads when actual > requested.
-  // Keep len == 0 and LoRa implicit mode's existing compatibility semantics.
-  if((modem == RADIOLIB_LR2021_PACKET_TYPE_FLRC) && (len != 0) && (length < len)) {
-    return(finishRead(RADIOLIB_ERR_PACKET_TOO_SHORT));
-  }
-"""
-OLD_CLEANUP_BLOCK = """  // read packet data
-  state = readRadioRxFifo(data, length);
-  RADIOLIB_ASSERT(state);
-
-  // clear the Rx buffer
-  state = clearRxFifo();
-  RADIOLIB_ASSERT(state);
-
-  // clear interrupt flags
-  state = clearIrqState(RADIOLIB_LR2021_IRQ_ALL);
-
-  // check if CRC failed - this is done after reading data to give user the option to keep them
-  RADIOLIB_ASSERT(crcState);
-
-  return(state);
-"""
-NEW_CLEANUP_BLOCK = """  // read packet data
-  state = readRadioRxFifo(data, length);
-  if(state != RADIOLIB_ERR_NONE) {
-    return(finishRead(state));
-  }
-
-  // check if CRC failed - this is done after reading data to give user the option to keep them
-  return(finishRead(crcState));
-"""
+HERE = Path(__file__).resolve().parent
+PATCH_DIRECTORY = HERE / "lr2021-patches"
+MANIFEST_PATH = PATCH_DIRECTORY / "manifest.json"
 
 
 class PatchError(RuntimeError):
-    """Raised when the dependency is absent, unpinned, or at an unknown hash."""
+    """Raised when the dependency, source pair, or patch inputs are not pinned."""
 
+
+def _load_manifest() -> dict:
+    try:
+        manifest = json.loads(MANIFEST_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        raise PatchError(f"Atomic LR2021 patch manifest is missing or invalid: {MANIFEST_PATH}") from exc
+    try:
+        dependency = manifest["dependency"]
+        files = manifest["files"]
+        states = manifest["states"]
+        patches = manifest["patches"]
+        if dependency["name"] != "RadioLib":
+            raise KeyError("dependency.name")
+        for state in ("original", "checked_cpp_original_header", "atomic"):
+            states[state]["cpp_sha256"]
+            states[state]["header_sha256"]
+        files["cpp"]
+        files["header"]
+        patches["correctness"]
+        patches["api_cpp"]
+        patches["api_header"]
+    except (KeyError, TypeError) as exc:
+        raise PatchError(f"Atomic LR2021 patch manifest is incomplete: {MANIFEST_PATH}") from exc
+    return manifest
+
+
+_MANIFEST = _load_manifest()
+RADIOLIB_VERSION = _MANIFEST["dependency"]["version"]
+RADIOLIB_COMMIT = _MANIFEST["dependency"]["commit"]
+RADIOLIB_URI = _MANIFEST["dependency"]["uri"]
+SOURCE_RELATIVE_PATH = Path(_MANIFEST["files"]["cpp"])
+HEADER_RELATIVE_PATH = Path(_MANIFEST["files"]["header"])
+ORIGINAL_SHA256 = _MANIFEST["states"]["original"]["cpp_sha256"]
+CHECKED_CPP_SHA256 = _MANIFEST["states"]["checked_cpp_original_header"]["cpp_sha256"]
+ORIGINAL_HEADER_SHA256 = _MANIFEST["states"]["original"]["header_sha256"]
+PATCHED_SHA256 = _MANIFEST["states"]["atomic"]["cpp_sha256"]
+PATCHED_HEADER_SHA256 = _MANIFEST["states"]["atomic"]["header_sha256"]
+
+_CORRECTNESS_PATCH = PATCH_DIRECTORY / _MANIFEST["patches"]["correctness"]
+_API_CPP_PATCH = PATCH_DIRECTORY / _MANIFEST["patches"]["api_cpp"]
+_API_HEADER_PATCH = PATCH_DIRECTORY / _MANIFEST["patches"]["api_header"]
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -126,48 +90,139 @@ def verify_dependency_pin(radiolib_root: Path) -> None:
         )
 
 
+def _pair_state(cpp_hash: str, header_hash: str) -> str:
+    if cpp_hash == PATCHED_SHA256 and header_hash == PATCHED_HEADER_SHA256:
+        return "atomic"
+    if cpp_hash == ORIGINAL_SHA256 and header_hash == ORIGINAL_HEADER_SHA256:
+        return "original"
+    if cpp_hash == CHECKED_CPP_SHA256 and header_hash == ORIGINAL_HEADER_SHA256:
+        return "checked_cpp_original_header"
+    raise PatchError(
+        "Refusing mixed or unknown LR2021 source pair: "
+        f"cpp={cpp_hash}, header={header_hash}"
+    )
+
+
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def _patch_hunks(patch_path: Path) -> list[tuple[int, list[str], list[str]]]:
+    try:
+        lines = patch_path.read_text().splitlines(keepends=True)
+    except FileNotFoundError as exc:
+        raise PatchError(f"Stored LR2021 patch is missing: {patch_path}") from exc
+    hunks: list[tuple[int, list[str], list[str]]] = []
+    index = 0
+    while index < len(lines) and not lines[index].startswith("@@ "):
+        index += 1
+    while index < len(lines):
+        match = _HUNK_RE.match(lines[index])
+        if not match:
+            raise PatchError(f"Invalid unified-diff hunk in {patch_path}: {lines[index].rstrip()}")
+        old_start = int(match.group(1))
+        index += 1
+        old_lines: list[str] = []
+        new_lines: list[str] = []
+        while index < len(lines) and not lines[index].startswith("@@ "):
+            line = lines[index]
+            if line.startswith("\\ No newline at end of file"):
+                index += 1
+                continue
+            if not line or line[0] not in " +-":
+                raise PatchError(f"Invalid unified-diff line in {patch_path}: {line.rstrip()}")
+            if line[0] in " -":
+                old_lines.append(line[1:])
+            if line[0] in " +":
+                new_lines.append(line[1:])
+            index += 1
+        if not old_lines:
+            raise PatchError(f"Empty patch hunk in {patch_path}")
+        old_count = int(match.group(2) or "1")
+        new_count = int(match.group(4) or "1")
+        if len(old_lines) != old_count or len(new_lines) != new_count:
+            raise PatchError(f"Unified-diff line counts do not match hunk header in {patch_path}")
+        hunks.append((old_start, old_lines, new_lines))
+    if not hunks:
+        raise PatchError(f"Stored LR2021 patch has no hunks: {patch_path}")
+    return hunks
+
+
+def _apply_unified_patch(source: bytes, patch_path: Path, reverse: bool = False) -> bytes:
+    text = source.decode("utf-8")
+    lines = text.splitlines(keepends=True)
+    replacements: list[tuple[int, int, list[str]]] = []
+    for old_start, old_lines, new_lines in _patch_hunks(patch_path):
+        if reverse:
+            old_lines, new_lines = new_lines, old_lines
+        matches = [
+            index
+            for index in range(len(lines) - len(old_lines) + 1)
+            if lines[index : index + len(old_lines)] == old_lines
+        ]
+        if len(matches) != 1:
+            raise PatchError(
+                f"Patch hunk from {patch_path} matched {len(matches)} times "
+                f"(expected one near line {old_start})"
+            )
+        start = matches[0]
+        replacements.append((start, start + len(old_lines), new_lines))
+    for start, end, new_lines in reversed(replacements):
+        lines[start:end] = new_lines
+    return "".join(lines).encode("utf-8")
+
+
+def _write_pair(source_path: Path, source: bytes, header_path: Path, header: bytes) -> None:
+    temporary_paths: list[Path] = []
+    replaced: list[tuple[Path, bytes]] = []
+    try:
+        for destination, data in ((source_path, source), (header_path, header)):
+            with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=f".{destination.name}.", delete=False) as temporary:
+                temporary.write(data)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+                temporary_paths.append(Path(temporary.name))
+        for temporary, destination in zip(temporary_paths, (source_path, header_path)):
+            replaced.append((destination, destination.read_bytes()))
+            os.replace(temporary, destination)
+    except Exception:
+        for destination, original in replaced:
+            destination.write_bytes(original)
+        raise
+    finally:
+        for temporary in temporary_paths:
+            temporary.unlink(missing_ok=True)
+
+
 def apply_patch(radiolib_root: Path) -> str:
-    """Patch one installed RadioLib tree and return ``patched`` or ``already-patched``."""
+    """Patch the pinned LR2021 source/header pair and return its transition."""
 
     radiolib_root = radiolib_root.resolve()
     verify_dependency_pin(radiolib_root)
     source_path = radiolib_root / SOURCE_RELATIVE_PATH
-    if not source_path.is_file():
-        raise PatchError(f"Pinned RadioLib source is missing: {source_path}")
-
-    observed_hash = sha256(source_path)
-    if observed_hash == PATCHED_SHA256:
-        return "already-patched"
-    if observed_hash != ORIGINAL_SHA256:
-        raise PatchError(
-            f"Refusing to patch unknown LR2021.cpp hash {observed_hash}; "
-            f"expected {ORIGINAL_SHA256} or {PATCHED_SHA256}"
-        )
+    header_path = radiolib_root / HEADER_RELATIVE_PATH
+    if not source_path.is_file() or not header_path.is_file():
+        raise PatchError(f"Pinned LR2021 source pair is incomplete under {radiolib_root}")
 
     source = source_path.read_bytes()
-    old_status_block = OLD_STATUS_BLOCK.encode()
-    new_status_block = NEW_STATUS_BLOCK.encode()
-    old_length_block = OLD_LENGTH_BLOCK.encode()
-    new_length_block = NEW_LENGTH_BLOCK.encode()
-    old_cleanup_block = OLD_CLEANUP_BLOCK.encode()
-    new_cleanup_block = NEW_CLEANUP_BLOCK.encode()
-    if (
-        source.count(old_status_block) != 1
-        or source.count(old_length_block) != 1
-        or source.count(old_cleanup_block) != 1
-    ):
-        raise PatchError("Pinned LR2021.cpp does not contain the expected patch anchors")
+    header = header_path.read_bytes()
+    state = _pair_state(sha256_bytes(source), sha256_bytes(header))
+    if state == "atomic":
+        return "already-patched"
 
-    patched = (
-        source.replace(old_status_block, new_status_block, 1)
-        .replace(old_length_block, new_length_block, 1)
-        .replace(old_cleanup_block, new_cleanup_block, 1)
-    )
-    patched_hash = sha256_bytes(patched)
-    if patched_hash != PATCHED_SHA256:
-        raise PatchError(f"Patch produced unexpected LR2021.cpp hash {patched_hash}")
+    generated_source = source
+    if state == "original":
+        generated_source = _apply_unified_patch(generated_source, _CORRECTNESS_PATCH)
+        if sha256_bytes(generated_source) != CHECKED_CPP_SHA256:
+            raise PatchError("Correctness patch produced an unexpected checked LR2021.cpp hash")
+    generated_source = _apply_unified_patch(generated_source, _API_CPP_PATCH)
+    generated_header = _apply_unified_patch(header, _API_HEADER_PATCH)
 
-    source_path.write_bytes(patched)
+    # Both outputs are validated before either destination is replaced.
+    if sha256_bytes(generated_source) != PATCHED_SHA256:
+        raise PatchError("Finite-FLRC patch produced an unexpected LR2021.cpp hash")
+    if sha256_bytes(generated_header) != PATCHED_HEADER_SHA256:
+        raise PatchError("Finite-FLRC patch produced an unexpected LR2021.h hash")
+    _write_pair(source_path, generated_source, header_path, generated_header)
     return "patched"
 
 

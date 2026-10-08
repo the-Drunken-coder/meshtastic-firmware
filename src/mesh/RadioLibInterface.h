@@ -73,6 +73,22 @@ struct W12RxRearmResult {
 };
 #endif
 
+/**
+ * Result of an optional driver-owned receive consume operation.
+ *
+ * The default RadioLibInterface path never creates this result. A specialized
+ * finite-RX driver may fill it while it owns IRQ validation, FIFO reads,
+ * teardown, and packet metadata acquisition.
+ */
+struct RadioReceiveConsumeResult {
+    int16_t state = RADIOLIB_ERR_UNKNOWN;
+    size_t length = 0;
+    bool hasRssi = false;
+    int16_t rssi = 0;
+    bool validHeader = false;
+    bool rearmSafe = false;
+};
+
 // ESP32 has special rules about ISR code
 #ifdef ARDUINO_ARCH_ESP32
 #define INTERRUPT_ATTR IRAM_ATTR
@@ -374,6 +390,7 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
 
     /// Set by a driver's startReceive() when it gives up and leaves RX off; cleared once RX is armed again.
     bool rxOffline = false;
+    bool receiveRearmSafe = true;
 
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
     // One relaxed atomic word publishes only IRQ attachment from ISR-adjacent glue. The owner-thread
@@ -581,6 +598,27 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
 
     virtual bool receiveIrqPending() { return iface->checkIrq(RADIOLIB_IRQ_RX_DONE); }
     virtual bool validReceiveIrq() { return true; }
+    /**
+     * Optionally consume one complete receive event in a driver-owned seam.
+     *
+     * Returning false leaves the existing validReceiveIrq/getPacketLength/
+     * readData path untouched. Returning true transfers ownership of the
+     * event, including failures, to the result.
+     */
+    virtual bool consumeReceivePacket(uint8_t *data, size_t capacity, RadioReceiveConsumeResult &result)
+    {
+        (void)data;
+        (void)capacity;
+        (void)result;
+        return false;
+    }
+    virtual void applyReceiveConsumeMetadata(meshtastic_MeshPacket *mp, const RadioReceiveConsumeResult &result)
+    {
+        (void)result;
+        addReceiveMetadata(mp);
+    }
+    /** Recover a failed finite consume before the owner arms RX again. */
+    virtual bool recoverReceiveAfterFailedConsume() { return false; }
     virtual bool validTransmitIrq() { return true; }
     virtual bool armTransmitBeforeStart() { return false; }
     virtual void onTransmitStarted() {}

@@ -15,6 +15,7 @@
 
 static MockMeshService *mockMeshService;
 
+#include "lr2021_atomic_driver_tests.h"
 #include "w12_adapter_tests.h"
 
 static void test_lr20x0BandClassification()
@@ -752,6 +753,9 @@ void setup()
     RUN_TEST(test_flrc_frame_duration_and_randomized_relay_guard);
     RUN_TEST(test_flrc_profile_keeps_carrier_and_lora_preferences_until_reboot);
     runW12AdapterTests();
+#if MESHTASTIC_W12_BENCHMARK_ATOMIC_FLRC_CONSUME
+    w12AtomicDriverTests::runAtomicDriverTests();
+#endif
     exit(UNITY_END());
 }
 
