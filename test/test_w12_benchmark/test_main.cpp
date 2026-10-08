@@ -225,6 +225,7 @@ static BenchmarkRadio *testRadio = nullptr;
 static BenchmarkRoutingModule *testRouting = nullptr;
 static MeshService *testService = nullptr;
 static BenchmarkModuleShim *testModule = nullptr;
+static BenchmarkDiagnosticRadio *testDiagnosticRadio = nullptr;
 static AirTime *savedAirTime = nullptr;
 static meshtastic::NodeStatus *savedNodeStatus = nullptr;
 static NodeDB *savedNodeDB = nullptr;
@@ -331,6 +332,8 @@ static void destroyFixture()
 {
     if (testRadio)
         testRadio->releaseAll();
+    delete testDiagnosticRadio;
+    testDiagnosticRadio = nullptr;
     delete testModule;
     testModule = nullptr;
     w12BenchmarkModule = nullptr;
@@ -361,6 +364,8 @@ static void resetTestState()
 {
     if (testRadio)
         testRadio->releaseAll();
+    delete testDiagnosticRadio;
+    testDiagnosticRadio = nullptr;
     delete testModule;
     testModule = nullptr;
     w12BenchmarkModule = nullptr;
@@ -830,7 +835,7 @@ void test_behavior_control_is_local_authorized_and_reset_is_not_mid_run()
 void test_spi_yield_control_lifecycle_freezes_at_owned_terminal_boundary()
 {
     const auto run = runConfig();
-    BenchmarkDiagnosticRadio diagnosticRadio;
+    testDiagnosticRadio = new BenchmarkDiagnosticRadio();
 
     // Op12 is local and exact-config gated. It cannot arm an unprepared run, and a foreign
     // configuration must not consume the request.
@@ -921,7 +926,7 @@ void test_spi_yield_control_lifecycle_freezes_at_owned_terminal_boundary()
                           static_cast<int>(sendControl(run, W12BenchmarkModule::Op::START, run.destination)));
     TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
                           static_cast<int>(testModule->handleReceived(makeData(run, 0))));
-    Time::setTestMillis(run.durationMs);
+    Time::advanceTestMillis(run.durationMs);
     TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
                           static_cast<int>(testModule->handleReceived(makeData(run, 1))));
     TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
@@ -1079,19 +1084,19 @@ void test_rx_liveness_rearm_requires_receiver_window_and_radio_and_does_not_cons
                           static_cast<int>(sendControl(run, W12BenchmarkModule::Op::REARM_RX_LIVENESS, run.destination)));
     TEST_ASSERT_NULL(testModule->allocReply());
 
-    BenchmarkDiagnosticRadio diagnosticRadio;
-    diagnosticRadio.sending = true;
+    testDiagnosticRadio = new BenchmarkDiagnosticRadio();
+    testDiagnosticRadio->sending = true;
     TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
                           static_cast<int>(sendControl(run, W12BenchmarkModule::Op::REARM_RX_LIVENESS, run.destination)));
-    TEST_ASSERT_EQUAL_UINT32(0, diagnosticRadio.startReceiveCalls);
-    diagnosticRadio.sending = false;
-    diagnosticRadio.scriptedSample.irqReadResult = -8;
-    diagnosticRadio.scriptedSample.chipStatsResult = -7;
-    diagnosticRadio.scriptedSample.rssiReadResult = -9;
-    diagnosticRadio.scriptedSample.softwareState = 0x15;
+    TEST_ASSERT_EQUAL_UINT32(0, testDiagnosticRadio->startReceiveCalls);
+    testDiagnosticRadio->sending = false;
+    testDiagnosticRadio->scriptedSample.irqReadResult = -8;
+    testDiagnosticRadio->scriptedSample.chipStatsResult = -7;
+    testDiagnosticRadio->scriptedSample.rssiReadResult = -9;
+    testDiagnosticRadio->scriptedSample.softwareState = 0x15;
     TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
                           static_cast<int>(sendControl(run, W12BenchmarkModule::Op::REARM_RX_LIVENESS, run.destination)));
-    TEST_ASSERT_EQUAL_UINT32(1, diagnosticRadio.startReceiveCalls);
+    TEST_ASSERT_EQUAL_UINT32(1, testDiagnosticRadio->startReceiveCalls);
     meshtastic_MeshPacket *rearmReply = testModule->allocReply();
     TEST_ASSERT_NOT_NULL(rearmReply);
     const uint8_t *rearmWire = rearmReply->decoded.payload.bytes;
@@ -1105,7 +1110,7 @@ void test_rx_liveness_rearm_requires_receiver_window_and_radio_and_does_not_cons
     packetPool.release(rearmReply);
     TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
                           static_cast<int>(sendControl(run, W12BenchmarkModule::Op::REARM_RX_LIVENESS, run.destination)));
-    TEST_ASSERT_EQUAL_UINT32(1, diagnosticRadio.startReceiveCalls);
+    TEST_ASSERT_EQUAL_UINT32(1, testDiagnosticRadio->startReceiveCalls);
     TEST_ASSERT_NULL(testModule->allocReply());
 
     auto wrongRun = run;
@@ -1817,6 +1822,8 @@ void tearDown()
             break;
         testService->releaseQueueStatusToPool(status);
     }
+    delete testDiagnosticRadio;
+    testDiagnosticRadio = nullptr;
     Time::useRealClock();
     Time::resetMonotonicForTests();
 }
