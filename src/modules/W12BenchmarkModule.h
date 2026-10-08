@@ -38,6 +38,9 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     static constexpr uint16_t RADIO_DIAGNOSTIC_REPORT_BYTES = 233;
     static constexpr uint16_t RX_LIVENESS_REPORT_BYTES = 80;
     static constexpr uint16_t PRE_SEND_ATTRIBUTION_REPORT_BYTES = 233;
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    static constexpr uint16_t RADIO_GAPS_REPORT_BYTES = 112;
+#endif
     static constexpr uint16_t DEFAULT_SIZE = 219;
     static constexpr uint16_t MAX_SIZE = 219;
     static constexpr uint32_t MIN_COUNT = 1000;
@@ -55,6 +58,7 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
         SNAPSHOT_RX_LIVENESS = 7,
         REARM_RX_LIVENESS = 8,
         SNAPSHOT_PRE_SEND_ATTRIBUTION = 9,
+        SNAPSHOT_RADIO_GAPS = 10,
     };
 
     enum class Kind : uint8_t {
@@ -65,6 +69,7 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
         RADIO_DIAGNOSTICS = 5,
         RX_LIVENESS = 6,
         PRE_SEND_ATTRIBUTION = 7,
+        OWNER_RADIO_GAPS = 8,
     };
 
     enum class CcaReason : uint8_t {
@@ -191,6 +196,34 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
         bool hasLastRxAuth = false;
         uint8_t rxArmLastStage = 255;
     };
+
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    struct RadioGapMetric {
+        uint32_t count = 0;
+        uint32_t minUs = 0;
+        uint32_t maxUs = 0;
+        uint64_t sumUs = 0;
+    };
+
+    struct RadioGapDiagnostics {
+        RadioGapMetric ownerRxNotifyToRearmUs;
+        RadioGapMetric ownerTxNotifyToStartTransmitCallUs;
+        uint32_t rxNotifications = 0;
+        uint32_t rxValidDone = 0;
+        uint32_t rxInvalid = 0;
+        uint32_t rxArmFailures = 0;
+        uint32_t txValidDone = 0;
+        uint32_t txInvalidIrq = 0;
+        uint32_t txStartFailures = 0;
+        uint32_t txUnpaired = 0;
+        uint32_t intervalRejected = 0;
+        bool overflow = false;
+        bool txCandidate = false;
+        bool txPendingStart = false;
+        uint32_t txCandidateAtUs = 0;
+        uint32_t txPendingStartUs = 0;
+    };
+#endif
 
     struct RxLivenessDiagnostics {
         uint32_t snapshotSequence = 0;
@@ -359,10 +392,29 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     void onRadioPoll();
     void onRadioPollRx(int16_t result, uint32_t flags, bool pending, uint16_t rawStatus = 0);
     void onRadioPollTx(bool pending);
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    void onOwnerRxNotification(uint32_t startedAtUs, uint32_t completedAtUs, uint32_t rxDoneBefore, uint32_t rxDoneAfter,
+                               uint32_t armFailuresBefore, uint32_t armFailuresAfter, bool rearmed);
+    void onOwnerTxNotification(uint32_t startedAtUs, bool owned, bool valid);
+    void onOwnerTxStartTransmitCall(uint32_t nowUs, bool owned);
+    void onOwnerTxStartTransmitResult(bool success);
+    void onOwnerTxStartTransmitFailure(bool owned);
+#endif
 
     Stats getStats() const;
     Diagnostics getDiagnostics() const { return diagnostics; }
     RadioDiagnostics getRadioDiagnostics() const { return radioDiagnostics; }
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    RadioGapDiagnostics getRadioGapDiagnostics() const { return radioGapDiagnostics; }
+#endif
+    uint32_t getRadioRxDoneCount() const
+    {
+        uint32_t count = 0;
+        for (const auto bucket : radioDiagnostics.rxDoneBy5sBucket)
+            count = UINT32_MAX - count < bucket ? UINT32_MAX : count + bucket;
+        return count;
+    }
+    uint32_t getRadioRxArmFailureCount() const { return radioDiagnostics.rxArmFailures; }
     PreSendAttributionDiagnostics getPreSendAttributionDiagnostics() const { return preSendDiagnostics; }
 
     // Public pure wire helpers keep host harnesses independent of object/thread setup.
@@ -380,6 +432,10 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
                                          const RxLivenessDiagnostics &diagnostics, uint8_t pendingTxCount);
     static size_t encodePreSendAttributionReport(uint8_t *bytes, size_t capacity, const Stats &stats,
                                                  const PreSendAttributionDiagnostics &diagnostics, uint8_t pendingTxCount);
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    static size_t encodeRadioGapsReport(uint8_t *bytes, size_t capacity, const Stats &stats,
+                                        const RadioGapDiagnostics &diagnostics, uint8_t pendingTxCount);
+#endif
     static bool validConfig(const RunConfig &config);
 
   protected:
@@ -421,12 +477,20 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     bool diagnosticSnapshotRunMatches = false;
     bool radioDiagnosticSnapshotRequested = false;
     bool radioDiagnosticSnapshotRunMatches = false;
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    bool radioGapsSnapshotRequested = false;
+    bool radioGapsSnapshotRunMatches = false;
+    bool radioGapRunLatched = false;
+#endif
     uint32_t radioDiagnosticStartMs = 0;
     bool radioDiagnosticWindowStarted = false;
     TxSlot txSlots[TX_SLOT_COUNT] = {};
     uint8_t pendingTxCount = 0;
     Diagnostics diagnostics;
     RadioDiagnostics radioDiagnostics;
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    RadioGapDiagnostics radioGapDiagnostics;
+#endif
     RxLivenessDiagnostics rxLivenessDiagnostics;
     PreSendAttributionDiagnostics preSendDiagnostics;
     const meshtastic_MeshPacket *trackedTxTimerPacket = nullptr;
@@ -462,6 +526,10 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     bool collectDiagnostics() const;
     bool collectTxLifecycleDiagnostics() const;
     bool collectRadioDiagnostics() const;
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    bool collectRadioGapDiagnostics() const;
+    void finalizeOwnerTxCandidate();
+#endif
     bool captureRxLiveness();
     bool capturePreSendAttribution();
     bool performRxLivenessRearm();

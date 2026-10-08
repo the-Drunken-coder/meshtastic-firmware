@@ -442,7 +442,7 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
      */
     void startTransmitTimerRebroadcast(meshtastic_MeshPacket *p);
 
-    bool handleTransmitInterrupt();
+    bool handleTransmitInterrupt(const uint32_t *ownerTxNotifyAtUs = nullptr);
     void handleReceiveInterrupt();
 
     static void timerCallback(void *p1, uint32_t p2);

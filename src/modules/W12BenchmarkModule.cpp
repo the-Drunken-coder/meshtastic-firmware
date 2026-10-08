@@ -22,16 +22,76 @@ constexpr int32_t kProducerIntervalMs = 0;
 
 bool validOperation(W12BenchmarkModule::Op op)
 {
-    return op == W12BenchmarkModule::Op::RESET || op == W12BenchmarkModule::Op::START || op == W12BenchmarkModule::Op::STOP ||
-           op == W12BenchmarkModule::Op::SNAPSHOT || op == W12BenchmarkModule::Op::SNAPSHOT_DIAGNOSTICS ||
-           op == W12BenchmarkModule::Op::SNAPSHOT_RADIO_DIAGNOSTICS || op == W12BenchmarkModule::Op::SNAPSHOT_RX_LIVENESS ||
-           op == W12BenchmarkModule::Op::REARM_RX_LIVENESS || op == W12BenchmarkModule::Op::SNAPSHOT_PRE_SEND_ATTRIBUTION;
+    bool valid = op == W12BenchmarkModule::Op::RESET || op == W12BenchmarkModule::Op::START ||
+                 op == W12BenchmarkModule::Op::STOP || op == W12BenchmarkModule::Op::SNAPSHOT ||
+                 op == W12BenchmarkModule::Op::SNAPSHOT_DIAGNOSTICS || op == W12BenchmarkModule::Op::SNAPSHOT_RADIO_DIAGNOSTICS ||
+                 op == W12BenchmarkModule::Op::SNAPSHOT_RX_LIVENESS || op == W12BenchmarkModule::Op::REARM_RX_LIVENESS ||
+                 op == W12BenchmarkModule::Op::SNAPSHOT_PRE_SEND_ATTRIBUTION;
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    valid = valid || op == W12BenchmarkModule::Op::SNAPSHOT_RADIO_GAPS;
+#endif
+    return valid;
 }
 
 uint32_t diagnosticAge(bool present, uint32_t timestamp, uint32_t nowMs)
 {
     return present ? nowMs - timestamp : UINT32_MAX;
 }
+
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+constexpr uint32_t kMaxRadioGapUs = W12BenchmarkModule::MAX_DURATION_MS * 1000UL;
+constexpr uint8_t kOwnerNotifySource = 1;
+
+void gapIncrement(uint32_t &value, bool &overflow)
+{
+    if (value == UINT32_MAX) {
+        overflow = true;
+        return;
+    }
+    ++value;
+}
+
+void gapAdd(uint32_t &value, uint32_t amount, bool &overflow)
+{
+    if (UINT32_MAX - value < amount) {
+        value = UINT32_MAX;
+        overflow = true;
+        return;
+    }
+    value += amount;
+}
+
+void gapAdd(uint64_t &value, uint32_t amount, bool &overflow)
+{
+    if (UINT64_MAX - value < amount) {
+        value = UINT64_MAX;
+        overflow = true;
+        return;
+    }
+    value += amount;
+}
+
+void recordGap(W12BenchmarkModule::RadioGapMetric &metric, uint32_t elapsedUs, bool &overflow)
+{
+    if (metric.count == UINT32_MAX) {
+        overflow = true;
+        return;
+    }
+    ++metric.count;
+    if (metric.count == 1 || elapsedUs < metric.minUs)
+        metric.minUs = elapsedUs;
+    if (elapsedUs > metric.maxUs)
+        metric.maxUs = elapsedUs;
+    gapAdd(metric.sumUs, elapsedUs, overflow);
+}
+
+bool validRadioGapInterval(uint32_t startedAtUs, uint32_t completedAtUs, uint32_t &elapsedUs)
+{
+    // Unsigned subtraction keeps short intervals valid across micros() wrap.
+    elapsedUs = completedAtUs - startedAtUs;
+    return elapsedUs <= kMaxRadioGapUs;
+}
+#endif
 } // namespace
 
 W12BenchmarkModule::W12BenchmarkModule()
@@ -477,6 +537,52 @@ size_t W12BenchmarkModule::encodePreSendAttributionReport(uint8_t *bytes, size_t
     return PRE_SEND_ATTRIBUTION_REPORT_BYTES;
 }
 
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+size_t W12BenchmarkModule::encodeRadioGapsReport(uint8_t *bytes, size_t capacity, const Stats &value,
+                                                 const RadioGapDiagnostics &d, uint8_t pendingTxCount)
+{
+    if (!bytes || capacity < RADIO_GAPS_REPORT_BYTES)
+        return 0;
+
+    memset(bytes, 0, RADIO_GAPS_REPORT_BYTES);
+    put16(bytes, MAGIC);
+    bytes[2] = VERSION;
+    bytes[3] = static_cast<uint8_t>(Kind::OWNER_RADIO_GAPS);
+    put32(bytes + 4, value.config.runId);
+    put32(bytes + 8, value.config.source);
+    put32(bytes + 12, value.config.destination);
+    put32(bytes + 16, value.elapsedMs);
+    bytes[20] = static_cast<uint8_t>((value.prepared ? 1 : 0) | (value.running ? 2 : 0) | (value.complete ? 4 : 0) | 8 |
+                                     (pendingTxCount ? 16 : 0) | ((value.running || pendingTxCount) ? 32 : 0));
+    bytes[21] = pendingTxCount;
+
+    const auto putMetric = [bytes](uint8_t offset, const RadioGapMetric &metric) {
+        W12BenchmarkModule::put32(bytes + offset, metric.count);
+        if (metric.count == 0)
+            return;
+        W12BenchmarkModule::put32(bytes + offset + 4, metric.minUs);
+        W12BenchmarkModule::put32(bytes + offset + 8, metric.maxUs);
+        for (uint8_t i = 0; i < sizeof(metric.sumUs); i++)
+            bytes[offset + 12 + i] = static_cast<uint8_t>(metric.sumUs >> (i * 8));
+    };
+    putMetric(24, d.ownerRxNotifyToRearmUs);
+    putMetric(44, d.ownerTxNotifyToStartTransmitCallUs);
+
+    put32(bytes + 64, d.rxNotifications);
+    put32(bytes + 68, d.rxValidDone);
+    put32(bytes + 72, d.rxInvalid);
+    put32(bytes + 76, d.rxArmFailures);
+    put32(bytes + 80, d.txValidDone);
+    put32(bytes + 84, d.txInvalidIrq);
+    put32(bytes + 88, d.txStartFailures);
+    put32(bytes + 92, d.txUnpaired);
+    put32(bytes + 96, d.intervalRejected);
+    bytes[100] = kOwnerNotifySource;
+    bytes[101] = static_cast<uint8_t>(d.overflow);
+    return RADIO_GAPS_REPORT_BYTES;
+}
+#endif
+
 bool W12BenchmarkModule::sameConfig(const RunConfig &a, const RunConfig &b)
 {
     return a.runId == b.runId && a.source == b.source && a.destination == b.destination && a.count == b.count &&
@@ -643,6 +749,12 @@ void W12BenchmarkModule::onTxFinished(const meshtastic_MeshPacket *packet, Radio
     *slot = TxSlot{};
     if (pendingTxCount != 0)
         pendingTxCount--;
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    if (!stats.running && pendingTxCount == 0) {
+        finalizeOwnerTxCandidate();
+        radioGapRunLatched = false;
+    }
+#endif
 }
 
 void W12BenchmarkModule::onTxDelayScheduled(const meshtastic_MeshPacket *packet, bool accepted)
@@ -821,6 +933,10 @@ void W12BenchmarkModule::onTxFailureObserved(const meshtastic_MeshPacket *packet
         slot->failureStage = stage;
         slot->failureRadioResult = radioResult;
     }
+    if (stage == TxFailureStage::START_TRANSMIT)
+        onOwnerTxStartTransmitResult(false);
+    else if (stage == TxFailureStage::PREFLIGHT || stage == TxFailureStage::CLEAR_TX_IRQ)
+        onOwnerTxStartTransmitFailure(ownsTx(packet));
 #else
     (void)packet;
     (void)stage;
@@ -1110,6 +1226,133 @@ void W12BenchmarkModule::onRadioPollTx(bool pending)
     radioDiagnostics.pollTxLastDone = pending ? 1 : 0;
 }
 
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+void W12BenchmarkModule::onOwnerRxNotification(uint32_t startedAtUs, uint32_t completedAtUs, uint32_t rxDoneBefore,
+                                               uint32_t rxDoneAfter, uint32_t armFailuresBefore, uint32_t armFailuresAfter,
+                                               bool rearmed)
+{
+    if (!collectRadioGapDiagnostics())
+        return;
+
+    gapIncrement(radioGapDiagnostics.rxNotifications, radioGapDiagnostics.overflow);
+    const bool countersRewound = rxDoneAfter < rxDoneBefore || armFailuresAfter < armFailuresBefore;
+    if (countersRewound)
+        radioGapDiagnostics.overflow = true;
+    const uint32_t validDone = countersRewound ? 0 : rxDoneAfter - rxDoneBefore;
+    const uint32_t armFailures = countersRewound ? 0 : armFailuresAfter - armFailuresBefore;
+    if (validDone != 0)
+        gapAdd(radioGapDiagnostics.rxValidDone, validDone, radioGapDiagnostics.overflow);
+    if (armFailures != 0)
+        gapAdd(radioGapDiagnostics.rxArmFailures, armFailures, radioGapDiagnostics.overflow);
+
+    if (countersRewound || validDone == 0 || armFailures != 0 || !rearmed) {
+        gapIncrement(radioGapDiagnostics.rxInvalid, radioGapDiagnostics.overflow);
+        if (!stats.running && pendingTxCount == 0)
+            radioGapRunLatched = false;
+        return;
+    }
+
+    uint32_t elapsedUs = 0;
+    if (!validRadioGapInterval(startedAtUs, completedAtUs, elapsedUs)) {
+        gapIncrement(radioGapDiagnostics.intervalRejected, radioGapDiagnostics.overflow);
+        if (!stats.running && pendingTxCount == 0)
+            radioGapRunLatched = false;
+        return;
+    }
+    recordGap(radioGapDiagnostics.ownerRxNotifyToRearmUs, elapsedUs, radioGapDiagnostics.overflow);
+    if (!stats.running && pendingTxCount == 0)
+        radioGapRunLatched = false;
+}
+
+void W12BenchmarkModule::onOwnerTxNotification(uint32_t startedAtUs, bool owned, bool valid)
+{
+    if (!collectRadioGapDiagnostics() || !owned)
+        return;
+
+    if (!valid) {
+        gapIncrement(radioGapDiagnostics.txInvalidIrq, radioGapDiagnostics.overflow);
+        finalizeOwnerTxCandidate();
+        if (!stats.running && pendingTxCount == 0)
+            radioGapRunLatched = false;
+        return;
+    }
+
+    gapIncrement(radioGapDiagnostics.txValidDone, radioGapDiagnostics.overflow);
+    finalizeOwnerTxCandidate();
+    radioGapDiagnostics.txCandidate = true;
+    radioGapDiagnostics.txCandidateAtUs = startedAtUs;
+    if (!stats.running && pendingTxCount == 0)
+        finalizeOwnerTxCandidate();
+    if (!stats.running && pendingTxCount == 0)
+        radioGapRunLatched = false;
+}
+
+void W12BenchmarkModule::onOwnerTxStartTransmitCall(uint32_t nowUs, bool owned)
+{
+    if (!collectRadioGapDiagnostics() || !radioGapDiagnostics.txCandidate)
+        return;
+
+    if (!owned) {
+        gapIncrement(radioGapDiagnostics.txUnpaired, radioGapDiagnostics.overflow);
+        radioGapDiagnostics.txCandidate = false;
+        if (!stats.running && pendingTxCount == 0)
+            radioGapRunLatched = false;
+        return;
+    }
+
+    uint32_t elapsedUs = 0;
+    radioGapDiagnostics.txCandidate = false;
+    if (!validRadioGapInterval(radioGapDiagnostics.txCandidateAtUs, nowUs, elapsedUs)) {
+        gapIncrement(radioGapDiagnostics.intervalRejected, radioGapDiagnostics.overflow);
+        if (!stats.running && pendingTxCount == 0)
+            radioGapRunLatched = false;
+        return;
+    }
+    radioGapDiagnostics.txPendingStart = true;
+    radioGapDiagnostics.txPendingStartUs = elapsedUs;
+}
+
+void W12BenchmarkModule::onOwnerTxStartTransmitResult(bool success)
+{
+    if (!radioGapDiagnostics.txPendingStart)
+        return;
+
+    const uint32_t elapsedUs = radioGapDiagnostics.txPendingStartUs;
+    radioGapDiagnostics.txPendingStart = false;
+    if (success)
+        recordGap(radioGapDiagnostics.ownerTxNotifyToStartTransmitCallUs, elapsedUs, radioGapDiagnostics.overflow);
+    else
+        gapIncrement(radioGapDiagnostics.txStartFailures, radioGapDiagnostics.overflow);
+    if (!stats.running && pendingTxCount == 0)
+        radioGapRunLatched = false;
+}
+
+void W12BenchmarkModule::onOwnerTxStartTransmitFailure(bool owned)
+{
+    if (!collectRadioGapDiagnostics())
+        return;
+    if (!owned) {
+        if (radioGapDiagnostics.txCandidate)
+            finalizeOwnerTxCandidate();
+        if (!stats.running && pendingTxCount == 0)
+            radioGapRunLatched = false;
+        return;
+    }
+    radioGapDiagnostics.txCandidate = false;
+    gapIncrement(radioGapDiagnostics.txStartFailures, radioGapDiagnostics.overflow);
+    if (!stats.running && pendingTxCount == 0)
+        radioGapRunLatched = false;
+}
+
+void W12BenchmarkModule::finalizeOwnerTxCandidate()
+{
+    if (radioGapDiagnostics.txCandidate) {
+        gapIncrement(radioGapDiagnostics.txUnpaired, radioGapDiagnostics.overflow);
+        radioGapDiagnostics.txCandidate = false;
+    }
+}
+#endif
+
 bool W12BenchmarkModule::collectDiagnostics() const
 {
     return stats.prepared && stats.running;
@@ -1124,6 +1367,13 @@ bool W12BenchmarkModule::collectRadioDiagnostics() const
 {
     return stats.prepared && (stats.running || pendingTxCount != 0);
 }
+
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+bool W12BenchmarkModule::collectRadioGapDiagnostics() const
+{
+    return stats.prepared && radioGapRunLatched;
+}
+#endif
 
 bool W12BenchmarkModule::captureRxLiveness()
 {
@@ -1291,10 +1541,18 @@ void W12BenchmarkModule::resetRun(const RunConfig &config)
     diagnosticSnapshotRunMatches = false;
     radioDiagnosticSnapshotRequested = false;
     radioDiagnosticSnapshotRunMatches = false;
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    radioGapsSnapshotRequested = false;
+    radioGapsSnapshotRunMatches = false;
+    radioGapRunLatched = false;
+#endif
     radioDiagnosticStartMs = 0;
     radioDiagnosticWindowStarted = false;
     diagnostics = Diagnostics{};
     radioDiagnostics = RadioDiagnostics{};
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    radioGapDiagnostics = RadioGapDiagnostics{};
+#endif
     rxLivenessDiagnostics = RxLivenessDiagnostics{};
     preSendDiagnostics = PreSendAttributionDiagnostics{};
 #if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
@@ -1370,6 +1628,12 @@ void W12BenchmarkModule::finishRun()
         stats.goodputBps = 0;
         stats.running = false;
         stats.complete = true;
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+        if (pendingTxCount == 0)
+            finalizeOwnerTxCandidate();
+        if (pendingTxCount == 0)
+            radioGapRunLatched = false;
+#endif
         return;
     }
 
@@ -1384,6 +1648,12 @@ void W12BenchmarkModule::finishRun()
     stats.goodputBps = static_cast<uint32_t>((bytes * 1000u) / elapsed);
     stats.running = false;
     stats.complete = true;
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    if (pendingTxCount == 0)
+        finalizeOwnerTxCandidate();
+    if (pendingTxCount == 0)
+        radioGapRunLatched = false;
+#endif
 }
 
 bool W12BenchmarkModule::handleControl(const meshtastic_MeshPacket &mp)
@@ -1407,6 +1677,9 @@ bool W12BenchmarkModule::handleControl(const meshtastic_MeshPacket &mp)
     case Op::START:
         if (stats.running || stats.complete)
             return false;
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+        radioGapRunLatched = true;
+#endif
         stats.running = true;
         radioDiagnosticStartMs = Time::getMillis();
         radioDiagnosticWindowStarted = true;
@@ -1471,6 +1744,14 @@ bool W12BenchmarkModule::handleControl(const meshtastic_MeshPacket &mp)
         preSendSnapshotRequested = true;
         preSendSnapshotRunMatches = true;
         return true;
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    case Op::SNAPSHOT_RADIO_GAPS:
+        if (stats.running || !stats.complete || pendingTxCount != 0)
+            return false;
+        radioGapsSnapshotRequested = true;
+        radioGapsSnapshotRunMatches = true;
+        return true;
+#endif
     case Op::RESET:
         break;
     }
@@ -1561,7 +1842,13 @@ meshtastic_MeshPacket *W12BenchmarkModule::allocReply()
     const bool radioDiagnosticsRequested = radioDiagnosticSnapshotRequested && radioDiagnosticSnapshotRunMatches;
     const bool rxLivenessRequested = rxLivenessSnapshotRequested && rxLivenessSnapshotRunMatches;
     const bool preSendRequested = preSendSnapshotRequested && preSendSnapshotRunMatches;
-    if (!reportRequested && !diagnosticsRequested && !radioDiagnosticsRequested && !rxLivenessRequested && !preSendRequested)
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    const bool radioGapsRequested = radioGapsSnapshotRequested && radioGapsSnapshotRunMatches;
+#else
+    const bool radioGapsRequested = false;
+#endif
+    if (!reportRequested && !diagnosticsRequested && !radioDiagnosticsRequested && !rxLivenessRequested && !preSendRequested &&
+        !radioGapsRequested)
         return nullptr;
 
     meshtastic_MeshPacket *reply = router->allocForSending();
@@ -1575,6 +1862,11 @@ meshtastic_MeshPacket *W12BenchmarkModule::allocReply()
     if (preSendRequested) {
         reply->decoded.payload.size = encodePreSendAttributionReport(
             reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes), currentStats, preSendDiagnostics, pendingTxCount);
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    } else if (radioGapsRequested) {
+        reply->decoded.payload.size = encodeRadioGapsReport(reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes),
+                                                            currentStats, radioGapDiagnostics, pendingTxCount);
+#endif
     } else if (rxLivenessRequested) {
         saturatingIncrement(rxLivenessDiagnostics.snapshotSequence);
         reply->decoded.payload.size = encodeRxLivenessReport(reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes),
@@ -1604,6 +1896,10 @@ meshtastic_MeshPacket *W12BenchmarkModule::allocReply()
     rxLivenessSnapshotRunMatches = false;
     preSendSnapshotRequested = false;
     preSendSnapshotRunMatches = false;
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    radioGapsSnapshotRequested = false;
+    radioGapsSnapshotRunMatches = false;
+#endif
     return reply;
 }
 

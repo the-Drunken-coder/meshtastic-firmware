@@ -4,6 +4,7 @@
 #include "TestUtil.h"
 #include "UptimeClock.h"
 #include "airtime.h"
+#include "mesh/CryptoEngine.h"
 #include "mesh/MeshService.h"
 #include "mesh/NodeDB.h"
 #include "mesh/RadioInterface.h"
@@ -115,6 +116,15 @@ class BenchmarkRadio : public RadioInterface
         releaseAt(index);
     }
 
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    void finishAtWithOwnerTxNotification(size_t index, uint32_t startedAtUs, bool owned = true, bool valid = true)
+    {
+        if (w12BenchmarkModule)
+            w12BenchmarkModule->onOwnerTxNotification(startedAtUs, owned, valid);
+        finishAt(index, valid ? RadioInterface::TxState::Sent : RadioInterface::TxState::Failed);
+    }
+#endif
+
     void releaseAll()
     {
         while (!pending.empty())
@@ -185,6 +195,29 @@ class BenchmarkModuleShim : public W12BenchmarkModule
     using W12BenchmarkModule::handleReceived;
     using W12BenchmarkModule::runOnce;
 };
+
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+class RouterBatchSelectionProbe final : public CryptoEngine
+{
+  public:
+    bool pkiCcmBatchEnabled() const override { return true; }
+
+    bool decryptPkiCcm(const uint8_t *key, size_t keyLen, const uint8_t *nonce, size_t nonceLen, size_t cryptLen,
+                       const uint8_t *crypt, const uint8_t *auth, size_t authLen, uint8_t *plain, size_t plainCapacity,
+                       bool batchRequested) override
+    {
+        if (batchRequested)
+            sawBatchRequested = true;
+        // Keep the production decrypt operation while observing only which caller path was selected.
+        return CryptoEngine::decryptPkiCcm(key, keyLen, nonce, nonceLen, cryptLen, crypt, auth, authLen, plain, plainCapacity,
+                                           false);
+    }
+
+    void clearSelection() { sawBatchRequested = false; }
+
+    bool sawBatchRequested = false;
+};
+#endif
 
 static BenchmarkNodeDB *testNodeDB = nullptr;
 static BenchmarkRouter *testRouter = nullptr;
@@ -1328,6 +1361,193 @@ void test_pki_ccm_timing_aggregates_retry_calls_without_a_second_gate_sample()
 }
 
 #if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+void test_radio_gaps_report_zero_and_overflow_encoding_is_strict()
+{
+    W12BenchmarkModule::Stats stats;
+    stats.config = runConfig();
+    stats.prepared = true;
+    stats.complete = true;
+    W12BenchmarkModule::RadioGapDiagnostics diagnostics;
+    uint8_t wire[W12BenchmarkModule::RADIO_GAPS_REPORT_BYTES];
+    memset(wire, 0xa5, sizeof(wire));
+    TEST_ASSERT_EQUAL_UINT(W12BenchmarkModule::RADIO_GAPS_REPORT_BYTES,
+                           W12BenchmarkModule::encodeRadioGapsReport(wire, sizeof(wire), stats, diagnostics, 0));
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(W12BenchmarkModule::Kind::OWNER_RADIO_GAPS), wire[3]);
+    TEST_ASSERT_EQUAL_UINT8(1 | 4 | 8, wire[20]);
+    TEST_ASSERT_EQUAL_UINT8(0, wire[21]);
+    TEST_ASSERT_EQUAL_UINT8(1, wire[100]);
+    TEST_ASSERT_EQUAL_UINT8(0, wire[101]);
+    for (size_t offset = 24; offset < 100; offset++)
+        TEST_ASSERT_EQUAL_UINT8(0, wire[offset]);
+    for (size_t offset = 102; offset < sizeof(wire); offset++)
+        TEST_ASSERT_EQUAL_UINT8(0, wire[offset]);
+
+    diagnostics.ownerRxNotifyToRearmUs.count = 1;
+    diagnostics.ownerRxNotifyToRearmUs.minUs = 7;
+    diagnostics.ownerRxNotifyToRearmUs.maxUs = 9;
+    diagnostics.ownerRxNotifyToRearmUs.sumUs = UINT64_MAX;
+    diagnostics.overflow = true;
+    TEST_ASSERT_EQUAL_UINT(W12BenchmarkModule::RADIO_GAPS_REPORT_BYTES,
+                           W12BenchmarkModule::encodeRadioGapsReport(wire, sizeof(wire), stats, diagnostics, 0));
+    TEST_ASSERT_EQUAL_UINT32(1, read32(wire, 24));
+    TEST_ASSERT_EQUAL_UINT32(7, read32(wire, 28));
+    TEST_ASSERT_EQUAL_UINT32(9, read32(wire, 32));
+    TEST_ASSERT_EQUAL_UINT8(1, wire[101]);
+}
+
+void test_radio_gaps_controls_gate_completed_page_and_pair_owner_hooks()
+{
+    auto run = runConfig();
+    myNodeInfo.my_node_num = run.source;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.source)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::START, run.source)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::SNAPSHOT_RADIO_GAPS, run.source)));
+    TEST_ASSERT_NULL(testModule->allocReply());
+
+    testModule->onOwnerRxNotification(100, 150, 0, 1, 0, 0, true);
+    testModule->onOwnerRxNotification(200, 250, 1, 1, 0, 0, false);
+    testModule->onOwnerRxNotification(300, 350, 1, 2, 0, 1, true);
+    testModule->onOwnerTxNotification(400, true, true);
+    testModule->onOwnerTxStartTransmitCall(475, true);
+    testModule->onOwnerTxStartTransmitResult(true);
+    testModule->onOwnerTxNotification(500, true, false);
+    testModule->onOwnerTxNotification(600, true, true);
+    testModule->onOwnerTxStartTransmitFailure(true);
+    testModule->onOwnerTxNotification(700, true, true);
+
+    auto diagnostics = testModule->getRadioGapDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.ownerRxNotifyToRearmUs.count);
+    TEST_ASSERT_EQUAL_UINT32(50, diagnostics.ownerRxNotifyToRearmUs.sumUs);
+    TEST_ASSERT_EQUAL_UINT32(50, diagnostics.ownerRxNotifyToRearmUs.minUs);
+    TEST_ASSERT_EQUAL_UINT32(50, diagnostics.ownerRxNotifyToRearmUs.maxUs);
+    TEST_ASSERT_EQUAL_UINT32(3, diagnostics.rxNotifications);
+    TEST_ASSERT_EQUAL_UINT32(2, diagnostics.rxValidDone);
+    TEST_ASSERT_EQUAL_UINT32(2, diagnostics.rxInvalid);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.rxArmFailures);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.ownerTxNotifyToStartTransmitCallUs.count);
+    TEST_ASSERT_EQUAL_UINT32(75, diagnostics.ownerTxNotifyToStartTransmitCallUs.minUs);
+    TEST_ASSERT_EQUAL_UINT32(75, diagnostics.ownerTxNotifyToStartTransmitCallUs.maxUs);
+    TEST_ASSERT_EQUAL_UINT32(75, diagnostics.ownerTxNotifyToStartTransmitCallUs.sumUs);
+    // Each valid owner notification is a valid TX IRQ classification. The
+    // sequence above intentionally exercises three such notifications.
+    TEST_ASSERT_EQUAL_UINT32(3, diagnostics.txValidDone);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.txInvalidIrq);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.txStartFailures);
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::STOP, run.source)));
+    TEST_ASSERT_EQUAL_UINT32(1, testModule->getRadioGapDiagnostics().txUnpaired);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::SNAPSHOT_RADIO_GAPS, run.source)));
+    meshtastic_MeshPacket *reply = testModule->allocReply();
+    TEST_ASSERT_NOT_NULL(reply);
+    TEST_ASSERT_EQUAL_UINT(W12BenchmarkModule::RADIO_GAPS_REPORT_BYTES, reply->decoded.payload.size);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(W12BenchmarkModule::Kind::OWNER_RADIO_GAPS), reply->decoded.payload.bytes[3]);
+    TEST_ASSERT_EQUAL_UINT8(1 | 4 | 8, reply->decoded.payload.bytes[20]);
+    TEST_ASSERT_EQUAL_UINT8(0, reply->decoded.payload.bytes[21]);
+    packetPool.release(reply);
+
+    ++run.runId;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.source)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::START, run.source)));
+    testModule->onOwnerTxStartTransmitCall(1000, true);
+    TEST_ASSERT_EQUAL_UINT32(0, testModule->getRadioGapDiagnostics().ownerTxNotifyToStartTransmitCallUs.count);
+}
+
+void test_radio_gaps_reject_intervals_outside_finite_run_window()
+{
+    auto run = runConfig();
+    myNodeInfo.my_node_num = run.source;
+    sendControl(run, W12BenchmarkModule::Op::RESET, run.source);
+    sendControl(run, W12BenchmarkModule::Op::START, run.source);
+    testModule->onOwnerRxNotification(0, W12BenchmarkModule::MAX_DURATION_MS * 1000UL + 1, 0, 1, 0, 0, true);
+    testModule->onOwnerTxNotification(0, true, true);
+    testModule->onOwnerTxStartTransmitCall(W12BenchmarkModule::MAX_DURATION_MS * 1000UL + 1, true);
+    testModule->onOwnerRxNotification(UINT32_MAX - 10, 5, 1, 2, 0, 0, true);
+    testModule->onOwnerTxNotification(UINT32_MAX - 10, true, true);
+    testModule->onOwnerTxStartTransmitCall(5, true);
+    testModule->onOwnerTxStartTransmitResult(true);
+    const auto diagnostics = testModule->getRadioGapDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.ownerRxNotifyToRearmUs.count);
+    TEST_ASSERT_EQUAL_UINT32(16, diagnostics.ownerRxNotifyToRearmUs.sumUs);
+    TEST_ASSERT_EQUAL_UINT32(16, diagnostics.ownerRxNotifyToRearmUs.minUs);
+    TEST_ASSERT_EQUAL_UINT32(16, diagnostics.ownerRxNotifyToRearmUs.maxUs);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.ownerTxNotifyToStartTransmitCallUs.count);
+    TEST_ASSERT_EQUAL_UINT32(16, diagnostics.ownerTxNotifyToStartTransmitCallUs.sumUs);
+    TEST_ASSERT_EQUAL_UINT32(16, diagnostics.ownerTxNotifyToStartTransmitCallUs.minUs);
+    TEST_ASSERT_EQUAL_UINT32(16, diagnostics.ownerTxNotifyToStartTransmitCallUs.maxUs);
+    TEST_ASSERT_EQUAL_UINT32(2, diagnostics.intervalRejected);
+}
+
+void test_radio_gaps_stop_pending_cancel_freezes_page()
+{
+    const auto run = runConfig();
+    myNodeInfo.my_node_num = run.source;
+    sendControl(run, W12BenchmarkModule::Op::RESET, run.source);
+    sendControl(run, W12BenchmarkModule::Op::START, run.source);
+    TEST_ASSERT_EQUAL_INT(0, testModule->runOnce());
+    TEST_ASSERT_EQUAL_UINT(1, testRadio->pendingCount());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::STOP, run.source)));
+    TEST_ASSERT_TRUE(testModule->getStats().complete);
+    testRadio->finishAt(0, RadioInterface::TxState::Cancelled);
+    TEST_ASSERT_EQUAL_UINT(0, testRadio->pendingCount());
+    const auto frozen = testModule->getRadioGapDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(0, frozen.txUnpaired);
+    TEST_ASSERT_EQUAL_UINT32(0, frozen.txValidDone);
+
+    testModule->onOwnerRxNotification(200, 250, 0, 1, 0, 0, true);
+    testModule->onOwnerTxNotification(300, true, true);
+    const auto after = testModule->getRadioGapDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(frozen.rxNotifications, after.rxNotifications);
+    TEST_ASSERT_EQUAL_UINT32(frozen.txValidDone, after.txValidDone);
+    TEST_ASSERT_EQUAL_UINT32(frozen.txUnpaired, after.txUnpaired);
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::SNAPSHOT_RADIO_GAPS, run.source)));
+    meshtastic_MeshPacket *reply = testModule->allocReply();
+    TEST_ASSERT_NOT_NULL(reply);
+    TEST_ASSERT_EQUAL_UINT8(0, reply->decoded.payload.bytes[21]);
+    packetPool.release(reply);
+}
+
+void test_radio_gaps_stop_pending_sent_observes_before_terminal_cleanup()
+{
+    const auto run = runConfig();
+    myNodeInfo.my_node_num = run.source;
+    sendControl(run, W12BenchmarkModule::Op::RESET, run.source);
+    sendControl(run, W12BenchmarkModule::Op::START, run.source);
+    TEST_ASSERT_EQUAL_INT(0, testModule->runOnce());
+    TEST_ASSERT_EQUAL_UINT(1, testRadio->pendingCount());
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::STOP, run.source)));
+    testRadio->finishAtWithOwnerTxNotification(0, 400);
+    TEST_ASSERT_EQUAL_UINT(0, testRadio->pendingCount());
+    const auto frozen = testModule->getRadioGapDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(1, frozen.txValidDone);
+    TEST_ASSERT_EQUAL_UINT32(1, frozen.txUnpaired);
+
+    testModule->onOwnerRxNotification(500, 550, 0, 1, 0, 0, true);
+    testModule->onOwnerTxNotification(600, true, true);
+    const auto after = testModule->getRadioGapDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(frozen.rxNotifications, after.rxNotifications);
+    TEST_ASSERT_EQUAL_UINT32(frozen.txValidDone, after.txValidDone);
+    TEST_ASSERT_EQUAL_UINT32(frozen.txUnpaired, after.txUnpaired);
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::SNAPSHOT_RADIO_GAPS, run.source)));
+    meshtastic_MeshPacket *reply = testModule->allocReply();
+    TEST_ASSERT_NOT_NULL(reply);
+    TEST_ASSERT_EQUAL_UINT8(0, reply->decoded.payload.bytes[21]);
+    packetPool.release(reply);
+}
+
 static meshtastic_MeshPacket encryptedBenchmarkForAdminFallback(const W12BenchmarkModule::RunConfig &frame, PacketId packetId,
                                                                 bool trustedAdmin = true)
 {
@@ -1337,6 +1557,8 @@ static meshtastic_MeshPacket encryptedBenchmarkForAdminFallback(const W12Benchma
     crypto->generateKeyPair(wrongPublic, wrongPrivate);
     auto packet = makeData(frame, 0);
     packet.id = packetId;
+    // Fill the exact 239-byte encrypted radio candidate while keeping the W12 payload identity unchanged.
+    packet.decoded.want_response = true;
     uint8_t plaintext[256];
     const size_t size = pb_encode_to_bytes(plaintext, sizeof(plaintext), &meshtastic_Data_msg, &packet.decoded);
     TEST_ASSERT_GREATER_THAN_UINT32(0, size);
@@ -1404,6 +1626,66 @@ void test_pki_ccm_auth_gate_excludes_wrong_identity_mqtt_plain_and_failed_auth()
     TEST_ASSERT_EQUAL_UINT32(0, timing.pkiCcmDecodeUs.count);
     TEST_ASSERT_EQUAL_UINT32(0, timing.rxGateDecodeUs.count);
 }
+
+void test_router_batch_selection_requires_exact_benchmark_candidate()
+{
+    const auto run = runConfig();
+    myNodeInfo.my_node_num = run.destination;
+    sendControl(run, W12BenchmarkModule::Op::RESET, run.destination);
+    sendControl(run, W12BenchmarkModule::Op::START, run.destination);
+
+    CryptoEngine *savedCrypto = crypto;
+    RouterBatchSelectionProbe probe;
+    crypto = &probe;
+
+    auto matching = encryptedBenchmarkForAdminFallback(run, 0x70123500);
+    const auto matchingVerdict = passesRoutingAuthGate(&matching);
+    const bool matchingBatch = probe.sawBatchRequested;
+    const auto matchingTiming = testModule->getPreSendAttributionDiagnostics().phaseTiming.pkiCcmDecodeUs;
+
+    probe.clearSelection();
+    auto wantsAck = encryptedBenchmarkForAdminFallback(run, 0x70123501);
+    wantsAck.want_ack = true;
+    const auto wantsAckVerdict = passesRoutingAuthGate(&wantsAck);
+    const bool wantsAckBatch = probe.sawBatchRequested;
+
+    probe.clearSelection();
+    auto mqtt = encryptedBenchmarkForAdminFallback(run, 0x70123502);
+    mqtt.via_mqtt = true;
+    const auto mqttVerdict = passesRoutingAuthGate(&mqtt);
+    const bool mqttBatch = probe.sawBatchRequested;
+
+    probe.clearSelection();
+    auto shorterRun = run;
+    --shorterRun.size;
+    auto shorter = encryptedBenchmarkForAdminFallback(shorterRun, 0x70123503);
+    const auto shorterVerdict = passesRoutingAuthGate(&shorter);
+    const bool shorterBatch = probe.sawBatchRequested;
+
+    probe.clearSelection();
+    auto foreignRun = run;
+    foreignRun.source = 0x33333333;
+    auto foreign = encryptedBenchmarkForAdminFallback(foreignRun, 0x70123504);
+    const auto foreignVerdict = passesRoutingAuthGate(&foreign);
+    const bool foreignBatch = probe.sawBatchRequested;
+
+    crypto = savedCrypto;
+
+    TEST_ASSERT_EQUAL_UINT(MAX_RADIO_PAYLOAD_LEN, matching.encrypted.size);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(RoutingAuthVerdict::ACCEPT), static_cast<int>(matchingVerdict));
+    TEST_ASSERT_TRUE(matchingBatch);
+    TEST_ASSERT_TRUE(matchingTiming.count > 0);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(RoutingAuthVerdict::ACCEPT), static_cast<int>(wantsAckVerdict));
+    TEST_ASSERT_FALSE(wantsAckBatch);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(RoutingAuthVerdict::ACCEPT), static_cast<int>(mqttVerdict));
+    TEST_ASSERT_FALSE(mqttBatch);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(RoutingAuthVerdict::ACCEPT), static_cast<int>(shorterVerdict));
+    TEST_ASSERT_FALSE(shorterBatch);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(RoutingAuthVerdict::ACCEPT), static_cast<int>(foreignVerdict));
+    TEST_ASSERT_FALSE(foreignBatch);
+    TEST_ASSERT_EQUAL_UINT32(matchingTiming.count,
+                             testModule->getPreSendAttributionDiagnostics().phaseTiming.pkiCcmDecodeUs.count);
+}
 #endif
 
 void setUp()
@@ -1451,6 +1733,12 @@ void setup()
     RUN_TEST(test_phase_timing_aggregates_wrap_deadline_and_saturate);
     RUN_TEST(test_pki_ccm_timing_aggregates_retry_calls_without_a_second_gate_sample);
 #if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    RUN_TEST(test_radio_gaps_report_zero_and_overflow_encoding_is_strict);
+    RUN_TEST(test_radio_gaps_controls_gate_completed_page_and_pair_owner_hooks);
+    RUN_TEST(test_radio_gaps_reject_intervals_outside_finite_run_window);
+    RUN_TEST(test_radio_gaps_stop_pending_cancel_freezes_page);
+    RUN_TEST(test_radio_gaps_stop_pending_sent_observes_before_terminal_cleanup);
+    RUN_TEST(test_router_batch_selection_requires_exact_benchmark_candidate);
     RUN_TEST(test_pki_ccm_real_auth_gate_retains_failed_admin_attempt_without_double_counting_frame);
     RUN_TEST(test_pki_ccm_auth_gate_excludes_wrong_identity_mqtt_plain_and_failed_auth);
 #endif
