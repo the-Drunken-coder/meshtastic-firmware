@@ -422,7 +422,50 @@
       ],
       [
         198,
-        35,
+        4,
+        "pki_ccm_encode_count",
+        "u32"
+      ],
+      [
+        202,
+        4,
+        "pki_ccm_encode_sum_us",
+        "u32"
+      ],
+      [
+        206,
+        4,
+        "pki_ccm_encode_max_us",
+        "u32"
+      ],
+      [
+        210,
+        4,
+        "pki_ccm_decode_count",
+        "u32"
+      ],
+      [
+        214,
+        4,
+        "pki_ccm_decode_sum_us",
+        "u32"
+      ],
+      [
+        218,
+        4,
+        "pki_ccm_decode_max_us",
+        "u32"
+      ],
+      [
+        222,
+        1,
+        "pki_ccm_available",
+        "u8",
+        "0 unavailable, 1 available"
+      ],
+      [
+        223,
+        10,
         "reserved_tail",
         "bytes",
         "zero"
@@ -457,12 +500,13 @@
     }
   },
   "validation": {
-    "reserved": "all reserved bytes zero; burst counters occupy 114..129; phase timing occupies 130..178 when available; failed-owned-TX summary occupies 179..197 when available; bytes 198..232 remain strict zero; unknown status or software-state bits invalid",
+    "reserved": "all reserved bytes zero; burst counters occupy 114..129; phase timing occupies 130..178 when available; failed-owned-TX summary occupies 179..197 when available; optional whole PKI CCM aggregates occupy198..222; bytes223..232 remain strict zero; unknown status or software-state bits invalid",
     "state": "prepared; exactly one running/complete; pending count <=16; pending status matches count; as_of flag equals running or pending",
     "sample": "sample_valid matches sample_available; unavailable sample has no success bits and i16 read results INT16_MIN; available results not INT16_MIN and result=0 exactly when respective success bit set",
     "timer": "dispatches <= accepted; late_count <= dispatches; no late_count implies late_sum=max=0; nonzero late_count implies max>0 and sum>=max; active timer has nonzero due_at, inactive has zero",
     "counter_scope": "saturating board-local counters reset with benchmark RESET; burst_count <= burst_armed <= burst_frames; a four-frame sequence reports count=1, armed=3, frames=4; phase timing uses count/sum/max triplets with sum >= max; guard lateness is relative to the accepted pre-return request deadline and includes remaining worker callback time plus owner dispatch delay, not the final ArduinoThread scheduler deadline; phase availability 0 requires all phase values zero; failed-owned-TX count records only a real TxState::Failed terminal callback and leaves stage/result unknown unless an explicit seam supplies them; exclusive primary pre-send reasons BUSY_TX then IRQ-read failure then RX-active; do not convert counts into RF occupancy",
     "host_bounds": "only correlated responses within the request finite deadline are evidence; stale, malformed, foreign, and parser/reader/write failures invalidate capture",
-    "interpretation": "on-demand reads perturb timing; report exact request and observation timestamps; no delivery, PER, capacity or recovery authorization follows from kind7 alone"
+    "interpretation": "on-demand reads perturb timing; report exact request and observation timestamps; no delivery, PER, capacity or recovery authorization follows from kind7 alone",
+    "ccm": "Default-off phase gate; caller-owned whole aes_ccm_ae/ad clocks exclude nonce, DH/cache, logging and lock wait. Encode requires exact live owner slot and DATA identity. Decode includes failed key/admin retries but commits only after successful exact authenticated direct-RF DATA identity. Count is CCM invocations, not frames. Available requires phase availability and at least one call; unavailable tail zero; count0 implies sum/max0; sum>=max; saturating counters. Older all-zero tails remain supported. Counters describe primitive calls for the matched decoded DATA identity, not the unique receiver bitmap; authenticated duplicates, pattern failures or boundary observations can make them differ from receipt counts."
   }
 }

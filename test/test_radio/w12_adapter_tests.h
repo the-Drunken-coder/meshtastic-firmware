@@ -1795,6 +1795,8 @@ static void test_w12_burst_production_four_frame_sequence_counts_and_rearms()
     const auto phaseTiming = diagnostics.phaseTiming;
     TEST_ASSERT_TRUE(phaseTiming.available);
     TEST_ASSERT_EQUAL_UINT32(4, phaseTiming.producerSendToMeshUs.count);
+    TEST_ASSERT_TRUE(phaseTiming.pkiCcmAvailable);
+    TEST_ASSERT_EQUAL_UINT32(4, phaseTiming.pkiCcmEncodeUs.count);
     TEST_ASSERT_GREATER_OR_EQUAL_UINT32(phaseTiming.producerSendToMeshUs.max, phaseTiming.producerSendToMeshUs.sum);
     TEST_ASSERT_EQUAL_UINT32(3, phaseTiming.burstPrepareUs.count);
     TEST_ASSERT_EQUAL_UINT32(3, phaseTiming.burstPrepareSuccesses);
@@ -1830,6 +1832,9 @@ static void test_w12_burst_production_router_auth_gate_records_rx_decode()
     const auto diagnostics = adapterDiagnostics->getPreSendAttributionDiagnostics();
     TEST_ASSERT_TRUE(diagnostics.phaseTiming.available);
     TEST_ASSERT_EQUAL_UINT32(1, diagnostics.phaseTiming.rxGateDecodeUs.count);
+    TEST_ASSERT_TRUE(diagnostics.phaseTiming.pkiCcmAvailable);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.phaseTiming.pkiCcmEncodeUs.count);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.phaseTiming.pkiCcmDecodeUs.count);
     TEST_ASSERT_GREATER_OR_EQUAL_UINT32(diagnostics.phaseTiming.rxGateDecodeUs.max, diagnostics.phaseTiming.rxGateDecodeUs.sum);
     TEST_ASSERT_EQUAL_UINT32(0, diagnostics.phaseTiming.failedTxCount);
 }

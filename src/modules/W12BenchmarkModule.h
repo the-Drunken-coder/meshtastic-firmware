@@ -229,6 +229,9 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
             PhaseTimingMetric burstPrepareUs;
             PhaseTimingMetric burstGuardLateMs;
             PhaseTimingMetric rxGateDecodeUs;
+            PhaseTimingMetric pkiCcmEncodeUs;
+            PhaseTimingMetric pkiCcmDecodeUs;
+            bool pkiCcmAvailable = false;
             // The fixed wire extension carries the aggregate duration triplet. Keep the
             // prepare result split in the board-local diagnostic object so a test can prove
             // both outcomes without spending bytes in the reserved tail.
@@ -335,6 +338,8 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     void onW12BurstPrepareDuration(uint32_t elapsedUs, bool success);
     void onW12BurstGuardLateness(uint32_t nowMs, uint32_t dueAtMs);
     void onRxGateDecodeDuration(uint32_t elapsedUs);
+    void onPkiCcmEncodeTiming(uint32_t count, uint32_t sumUs, uint32_t maxUs);
+    void onPkiCcmDecodeTiming(uint32_t count, uint32_t sumUs, uint32_t maxUs);
     void onTxFailureObserved(const meshtastic_MeshPacket *packet, TxFailureStage stage, int16_t radioResult);
     void onPreCanSendDeferred(const meshtastic_MeshPacket *packet);
     void onPreCanSendDeferred(const meshtastic_MeshPacket *packet, PreSendBusyReason reason);
@@ -463,6 +468,8 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     static void saturatingIncrement(uint32_t &value);
     static void saturatingAdd(uint32_t &value, uint32_t amount);
     static void recordPhaseTiming(PreSendAttributionDiagnostics::PhaseTimingMetric &metric, uint32_t sample);
+    static void recordPhaseTimingAggregate(PreSendAttributionDiagnostics::PhaseTimingMetric &metric, uint32_t count,
+                                           uint32_t sumUs, uint32_t maxUs);
 };
 
 extern W12BenchmarkModule *w12BenchmarkModule;

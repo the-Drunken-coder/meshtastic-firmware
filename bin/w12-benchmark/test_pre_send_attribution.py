@@ -36,6 +36,14 @@ class PreSendAttributionProtocolTest(unittest.TestCase):
             struct.pack_into("<h", data, offset, INT16_MIN)
         return data
 
+    def report_with_ccm_timing(self):
+        data = self.report()
+        data[178] = 1
+        struct.pack_into("<III", data, 198, 2, 80, 50)
+        struct.pack_into("<III", data, 210, 3, 120, 45)
+        data[222] = 1
+        return data
+
     def test_decodes_fixed_layout(self):
         report = decode_report(self.report())
         self.assertEqual(report.tx_timer_late_count, 3)
@@ -48,6 +56,23 @@ class PreSendAttributionProtocolTest(unittest.TestCase):
         self.assertEqual(report.burst_count, 0)
         self.assertFalse(report.phase_timing_available)
         self.assertEqual(report.producer_us_count, 0)
+        self.assertFalse(report.pki_ccm_available)
+        self.assertEqual(report.pki_ccm_decode_count, 0)
+
+    def test_decodes_optional_ccm_tail_and_keeps_retry_count(self):
+        report = decode_report(self.report_with_ccm_timing())
+        self.assertTrue(report.pki_ccm_available)
+        self.assertEqual(report.pki_ccm_encode_count, 2)
+        self.assertEqual(report.pki_ccm_encode_sum_us, 80)
+        self.assertEqual(report.pki_ccm_encode_max_us, 50)
+        self.assertEqual(report.pki_ccm_decode_count, 3)
+        self.assertEqual(report.pki_ccm_decode_sum_us, 120)
+        self.assertEqual(report.pki_ccm_decode_max_us, 45)
+
+    def test_accepts_legacy_all_zero_ccm_tail(self):
+        report = decode_report(self.report())
+        self.assertFalse(report.pki_ccm_available)
+        self.assertEqual(report.pki_ccm_encode_count, 0)
 
     def test_decodes_burst_counters_and_keeps_reserved_tail_strict(self):
         report = self.report()
@@ -135,6 +160,42 @@ class PreSendAttributionProtocolTest(unittest.TestCase):
         for mutated in adverse:
             with self.assertRaises(ValueError):
                 decode_report(mutated)
+
+    def test_rejects_malformed_ccm_tail_or_reserved_bytes(self):
+        adverse = []
+        mutated = self.report_with_ccm_timing()
+        mutated[178] = 0
+        adverse.append(mutated)
+        mutated = self.report_with_ccm_timing()
+        mutated[222] = 2
+        adverse.append(mutated)
+        mutated = self.report_with_ccm_timing()
+        struct.pack_into("<I", mutated, 202, 1)
+        adverse.append(mutated)
+        mutated = self.report_with_ccm_timing()
+        struct.pack_into("<I", mutated, 198, 0)
+        adverse.append(mutated)
+        mutated = self.report()
+        struct.pack_into("<I", mutated, 198, 1)
+        adverse.append(mutated)
+        mutated = self.report_with_ccm_timing()
+        mutated[223] = 1
+        adverse.append(mutated)
+        for mutated in adverse:
+            with self.assertRaises(ValueError):
+                decode_report(mutated)
+
+    def test_existing_clear_irq_stage_and_guard_names_remain_supported(self):
+        wire = self.report()
+        wire[178] = 1
+        struct.pack_into("<III", wire, 154, 1, 4, 4)
+        struct.pack_into("<I", wire, 179, 1)
+        wire[195] = 5
+        struct.pack_into("<h", wire, 196, -706)
+        decoded = decode_report(wire)
+        self.assertEqual(decoded.failed_tx_last_stage, 5)
+        self.assertEqual(decoded.failed_tx_last_radio_result, -706)
+        self.assertEqual(decoded.burst_guard_request_late_ms_sum, 4)
 
     def test_rejects_length_header_reserved_and_tail_changes(self):
         report = self.report()

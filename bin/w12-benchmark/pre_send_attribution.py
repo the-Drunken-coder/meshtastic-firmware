@@ -83,6 +83,13 @@ class PreSendAttribution:
     failed_tx_last_at_ms: int
     failed_tx_last_stage: int
     failed_tx_last_radio_result: int
+    pki_ccm_encode_count: int
+    pki_ccm_encode_sum_us: int
+    pki_ccm_encode_max_us: int
+    pki_ccm_decode_count: int
+    pki_ccm_decode_sum_us: int
+    pki_ccm_decode_max_us: int
+    pki_ccm_available: bool
 
 
 def _u32(data: bytes, offset: int) -> int:
@@ -104,7 +111,7 @@ def decode_report(data: bytes | bytearray | memoryview) -> PreSendAttribution:
     magic, version, kind, run_id, source, destination, elapsed_ms = _HEADER.unpack_from(raw)
     if magic != MAGIC or version != VERSION or kind != KIND:
         raise ValueError("invalid kind 7 report header")
-    if raw[22:24] != b"\0\0" or raw[77] != 0 or any(raw[198:]):
+    if raw[22:24] != b"\0\0" or raw[77] != 0 or any(raw[223:]):
         raise ValueError("nonzero reserved or unused kind 7 bytes")
     status = raw[20]
     if status & ~0x37:
@@ -200,6 +207,28 @@ def decode_report(data: bytes | bytearray | memoryview) -> PreSendAttribution:
         raise ValueError("unknown kind 7 failure stage")
     if failed_tx_count and failed_tx_last_stage == 0 and failed_tx_last_radio_result != INT16_MIN:
         raise ValueError("unknown kind 7 failure stage must have an unknown radio result")
+    pki_ccm_available = raw[222]
+    if pki_ccm_available > 1 or pki_ccm_available and not phase_available:
+        raise ValueError("invalid kind 7 PKI CCM availability")
+    pki_ccm_encode_count = _u32(raw, 198)
+    pki_ccm_encode_sum_us = _u32(raw, 202)
+    pki_ccm_encode_max_us = _u32(raw, 206)
+    pki_ccm_decode_count = _u32(raw, 210)
+    pki_ccm_decode_sum_us = _u32(raw, 214)
+    pki_ccm_decode_max_us = _u32(raw, 218)
+    ccm_metrics = (
+        (pki_ccm_encode_count, pki_ccm_encode_sum_us, pki_ccm_encode_max_us),
+        (pki_ccm_decode_count, pki_ccm_decode_sum_us, pki_ccm_decode_max_us),
+    )
+    for count, total, maximum in ccm_metrics:
+        if count == 0 and (total or maximum):
+            raise ValueError("kind 7 PKI CCM metric has a sum or maximum without samples")
+        if count and total < maximum:
+            raise ValueError("kind 7 PKI CCM metric sum is below its maximum")
+    if not pki_ccm_available and any(raw[198:222]):
+        raise ValueError("kind 7 PKI CCM tail is populated while unavailable")
+    if pki_ccm_available and not any(count for count, _, _ in ccm_metrics):
+        raise ValueError("kind 7 PKI CCM tail is available without samples")
     return PreSendAttribution(
         run_id=run_id,
         source=source,
@@ -250,6 +279,13 @@ def decode_report(data: bytes | bytearray | memoryview) -> PreSendAttribution:
         failed_tx_last_at_ms=failed_tx_last_at_ms,
         failed_tx_last_stage=failed_tx_last_stage,
         failed_tx_last_radio_result=failed_tx_last_radio_result,
+        pki_ccm_encode_count=pki_ccm_encode_count,
+        pki_ccm_encode_sum_us=pki_ccm_encode_sum_us,
+        pki_ccm_encode_max_us=pki_ccm_encode_max_us,
+        pki_ccm_decode_count=pki_ccm_decode_count,
+        pki_ccm_decode_sum_us=pki_ccm_decode_sum_us,
+        pki_ccm_decode_max_us=pki_ccm_decode_max_us,
+        pki_ccm_available=bool(pki_ccm_available),
     )
 
 

@@ -190,6 +190,44 @@ void test_PKC(void)
     TEST_ASSERT_EQUAL_MEMORY(expected_decrypted, decrypted, 10);
 }
 
+void test_PKC_optional_ccm_timing_preserves_known_answer_behavior(void)
+{
+    uint8_t private_key[32];
+    meshtastic_NodeInfoLite_public_key_t public_key;
+    uint8_t radioBytes[128] __attribute__((__aligned__));
+    uint8_t decrypted[128] __attribute__((__aligned__));
+    uint8_t expected_decrypted[32];
+
+    const uint32_t fromNode = 0x0929;
+    const uint64_t packetNum = 0x13b2d662;
+    HexToBytes(public_key.bytes, "db18fc50eea47f00251cb784819a3cf5fc361882597f589f0d7ff820e8064457");
+    public_key.size = 32;
+    HexToBytes(private_key, "a00330633e63522f8a4d81ec6d9d1e6617f6c8ffd3a4c698229537d44e522277");
+    HexToBytes(expected_decrypted, "08011204746573744800");
+    HexToBytes(radioBytes, "8c646d7a2909000062d6b2136b00000040df24abfcc30a17a3d9046726099e796a1c036a792b");
+    crypto->setDHPrivateKey(private_key);
+
+    CcmTimingAggregate decodeTiming;
+    TEST_ASSERT_TRUE(crypto->decryptCurve25519(fromNode, public_key, packetNum, 22, radioBytes + 16, decrypted, &decodeTiming));
+    TEST_ASSERT_EQUAL_UINT32(1, decodeTiming.count);
+    TEST_ASSERT_TRUE(decodeTiming.sumUs >= decodeTiming.maxUs);
+    TEST_ASSERT_EQUAL_MEMORY(expected_decrypted, decrypted, 10);
+
+    uint8_t encrypted[128] __attribute__((__aligned__));
+    CcmTimingAggregate encodeTiming;
+    TEST_ASSERT_TRUE(crypto->encryptCurve25519(0, fromNode, public_key, packetNum, 10, decrypted, encrypted, &encodeTiming));
+    TEST_ASSERT_EQUAL_UINT32(1, encodeTiming.count);
+    TEST_ASSERT_TRUE(encodeTiming.sumUs >= encodeTiming.maxUs);
+
+    uint8_t roundTrip[128] __attribute__((__aligned__));
+    TEST_ASSERT_TRUE(crypto->decryptCurve25519(fromNode, public_key, packetNum, 22, encrypted, roundTrip));
+    TEST_ASSERT_EQUAL_MEMORY(expected_decrypted, roundTrip, 10);
+    encrypted[0] ^= 1;
+    TEST_ASSERT_FALSE(crypto->decryptCurve25519(fromNode, public_key, packetNum, 22, encrypted, roundTrip, &decodeTiming));
+    TEST_ASSERT_EQUAL_UINT32(2, decodeTiming.count);
+    TEST_ASSERT_TRUE(decodeTiming.sumUs >= decodeTiming.maxUs);
+}
+
 // The signature covers the whole Data envelope, not just its payload, so these cases build a Data
 // rather than passing bare bytes. Fields left zero are what an ordinary packet carries.
 static meshtastic_Data makeSignableData(const uint8_t *payload, size_t len, uint32_t portnum = 1)
@@ -1017,6 +1055,7 @@ void setup()
     RUN_TEST(test_AES_CCM_partial_block_bounds);
     RUN_TEST(test_AES_CCM_rfc3610);
     RUN_TEST(test_PKC);
+    RUN_TEST(test_PKC_optional_ccm_timing_preserves_known_answer_behavior);
     RUN_TEST(test_XEdDSA);
     RUN_TEST(test_XEdDSA_layout_is_unambiguous);
     RUN_TEST(test_XEdDSA_cross_key_reject);
