@@ -16,6 +16,7 @@
 #include "SX1268Interface.h"
 #include "SX1280Interface.h"
 #include "UptimeClock.h"
+#include "W12BenchmarkSpi.h"
 #include "W12FlrcProfile.h"
 #include "concurrency/LockGuard.h"
 #include "configuration.h"
@@ -477,7 +478,7 @@ std::unique_ptr<RadioInterface> initLoRa()
 #if ARCH_PORTDUINO
     SPISettings loraSpiSettings(portduino_config.spiSpeed, MSBFIRST, SPI_MODE0);
 #else
-    SPISettings loraSpiSettings(4000000, MSBFIRST, SPI_MODE0);
+    SPISettings loraSpiSettings(w12_benchmark_spi::frequencyHz, MSBFIRST, SPI_MODE0);
 #endif
 
 #ifdef ARCH_PORTDUINO

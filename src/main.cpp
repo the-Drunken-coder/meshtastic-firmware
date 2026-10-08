@@ -18,6 +18,7 @@
 #include "ReliableRouter.h"
 #include "TransmitHistory.h"
 #include "UptimeClock.h"
+#include "W12BenchmarkSpi.h"
 #include "airtime.h"
 #include "buzz.h"
 #include "power/PowerHAL.h"
@@ -1004,11 +1005,11 @@ void setup()
 #if defined(HW_SPI1_DEVICE)
     SPI1.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
     LOG_DEBUG("SPI1.begin(SCK=%d, MISO=%d, MOSI=%d, NSS=%d)", LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
-    SPI1.setFrequency(4000000);
+    SPI1.setFrequency(w12_benchmark_spi::frequencyHz);
 #else
     SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
     LOG_DEBUG("SPI.begin(SCK=%d, MISO=%d, MOSI=%d, NSS=%d)", LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
-    SPI.setFrequency(4000000);
+    SPI.setFrequency(w12_benchmark_spi::frequencyHz);
 #endif
 #endif
 
