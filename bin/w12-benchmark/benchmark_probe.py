@@ -17,6 +17,7 @@ import contextlib
 import dataclasses
 import datetime as _dt
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -35,6 +36,7 @@ CONTROL_BYTES = 32
 DATA_HEADER_BYTES = 24
 REPORT_BYTES = 86
 DIAGNOSTIC_REPORT_BYTES = 233
+SPI_YIELD_REPORT_BYTES = 80
 DEFAULT_SIZE = 219
 MAX_SIZE = 219
 MAX_COUNT = 8192
@@ -55,12 +57,17 @@ CONTROL_SNAPSHOT = 4
 CONTROL_SNAPSHOT_DIAGNOSTICS = 5
 CONTROL_SNAPSHOT_RADIO_DIAGNOSTICS = 6
 CONTROL_SNAPSHOT_RADIO_GAPS = 10
+CONTROL_SNAPSHOT_SPI_YIELD = 11
+CONTROL_ENABLE_SPI_YIELD = 12
 DATA_KIND = 2
 REPORT_KIND = 3
 DIAGNOSTIC_KIND = 4
+SPI_YIELD_KIND = 9
 FLAG_NONE = 0
 DIAGNOSTIC_STATUS_MASK = 0x3F
 RADIO_DIAGNOSTIC_STATUS_MASK = 0x37
+SPI_YIELD_STATUS_MASK = 0x3F
+SPI_YIELD_SOURCE_PUBLIC_HAL = 1
 UINT32_MAX = 0xFFFFFFFF
 
 BOARD_IDENTITIES: dict[str, tuple[str, int]] = {
@@ -71,6 +78,16 @@ BOARD_IDENTITIES: dict[str, tuple[str, int]] = {
 
 class BenchmarkError(RuntimeError):
     """A protocol, identity, timing, or report-integrity failure."""
+
+
+def start_control_operations(spi_yield_requested: bool) -> tuple[int, ...]:
+    """Return the per-board RESET/optional ENABLE/START order."""
+
+    return (
+        (CONTROL_RESET, CONTROL_ENABLE_SPI_YIELD, CONTROL_START)
+        if spi_yield_requested
+        else (CONTROL_RESET, CONTROL_START)
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -370,6 +387,8 @@ def encode_control(config: RunConfig, operation: int) -> bytes:
         CONTROL_SNAPSHOT_DIAGNOSTICS,
         CONTROL_SNAPSHOT_RADIO_DIAGNOSTICS,
         CONTROL_SNAPSHOT_RADIO_GAPS,
+        CONTROL_SNAPSHOT_SPI_YIELD,
+        CONTROL_ENABLE_SPI_YIELD,
     ):
         raise BenchmarkError(f"unsupported control operation {operation}")
     payload = bytearray(CONTROL_BYTES)
@@ -411,6 +430,8 @@ def decode_control(payload: bytes) -> tuple[int, RunConfig]:
         CONTROL_SNAPSHOT_DIAGNOSTICS,
         CONTROL_SNAPSHOT_RADIO_DIAGNOSTICS,
         CONTROL_SNAPSHOT_RADIO_GAPS,
+        CONTROL_SNAPSHOT_SPI_YIELD,
+        CONTROL_ENABLE_SPI_YIELD,
     ):
         raise BenchmarkError("invalid control operation")
     validate_config(config)
@@ -1813,6 +1834,27 @@ class BoardSession:
             raise BenchmarkError(f"{self.role}: radio diagnostic response timed out")
         return dict(event["radio_diagnostics"])
 
+    def snapshot_spi_yield(self, config: RunConfig, timeout: float) -> Any:
+        """Request the optional frozen kind-9 SPI-yield page.
+
+        The decoder and response metadata guard live in ``spi_yield.py`` so the
+        page collector can share this session's address and transport checks.
+        """
+
+        try:
+            import spi_yield
+        except ImportError as error:  # pragma: no cover - hardware-only path
+            path = Path(__file__).with_name("spi_yield.py")
+            spec = importlib.util.spec_from_file_location("spi_yield", path)
+            if spec is None or spec.loader is None:
+                raise BenchmarkError("spi_yield.py cannot be loaded") from error
+            spi_yield = importlib.util.module_from_spec(spec)
+            sys.modules["spi_yield"] = spi_yield
+            spec.loader.exec_module(spi_yield)
+        return spi_yield._request_snapshot(
+            self, config, timeout, prefer_session_method=False
+        )
+
     def snapshot_config(self, output: Path, label: str) -> dict[str, Any]:
         node = self._interface.localNode
         local = node.localConfig.SerializeToString()
@@ -2143,6 +2185,26 @@ def run_hardware(args: argparse.Namespace) -> dict[str, Any]:
             "at least one --image is required for a verifiable hardware run"
         )
     diagnostics_requested = bool(getattr(args, "diagnostics", False))
+    spi_yield_requested = bool(getattr(args, "spi_yield", False))
+    base_image = getattr(args, "base_image", None)
+    walker_image = getattr(args, "walker_image", None)
+    if (base_image is None) != (walker_image is None):
+        raise BenchmarkError("--base-image and --walker-image must be provided together")
+    if spi_yield_requested and (base_image is None or walker_image is None):
+        raise BenchmarkError(
+            "SPI-yield runs require both --base-image and --walker-image for role-bound provenance"
+        )
+    spi_yield_files = (
+        Path(__file__).with_name("spi_yield.py"),
+        Path(__file__).with_name("spi-yield-protocol.json"),
+        Path(__file__).with_name("radio_gaps.py"),
+    )
+    if spi_yield_requested:
+        missing_spi_files = [str(path) for path in spi_yield_files if not path.is_file()]
+        if missing_spi_files:
+            raise BenchmarkError(
+                "SPI-yield provenance files are missing: " + ", ".join(missing_spi_files)
+            )
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(output, 0o700)
@@ -2176,14 +2238,27 @@ def run_hardware(args: argparse.Namespace) -> dict[str, Any]:
             for key, value in vars(args).items()
         },
         "image_hashes": {},
+        "image_hashes_by_role": {},
     }
     for image in args.image:
         path = Path(image)
         provenance["image_hashes"][str(path)] = sha256_file(path)
+    for role, image in (("base", base_image), ("walker", walker_image)):
+        if image is not None:
+            path = Path(image)
+            image_hash = sha256_file(path)
+            provenance["image_hashes"][str(path)] = image_hash
+            provenance["image_hashes_by_role"][role] = {
+                "path": str(path),
+                "sha256": image_hash,
+            }
     protocol_path = Path(__file__).with_name("benchmark-protocol.json")
     file_digests = {str(Path(__file__).resolve()): _script_digest()}
     if protocol_path.exists():
         file_digests[str(protocol_path.resolve())] = sha256_file(protocol_path)
+    if spi_yield_requested:
+        for path in spi_yield_files:
+            file_digests[str(path.resolve())] = sha256_file(path)
     result: dict[str, Any] = {
         "status": "error",
         "intent": {
@@ -2197,6 +2272,16 @@ def run_hardware(args: argparse.Namespace) -> dict[str, Any]:
             "fixed_wall_seconds": args.wall_seconds,
             "drain_seconds": args.drain_seconds,
             "diagnostics_requested": diagnostics_requested,
+            "spi_yield_requested": spi_yield_requested,
+            "spi_yield": {
+                "requested": spi_yield_requested,
+                "enable_operation": CONTROL_ENABLE_SPI_YIELD,
+                "snapshot_operation": CONTROL_SNAPSHOT_SPI_YIELD,
+                "scope": "board_local_public_hal",
+                "control_address": "local_self_only",
+                "rf_control": False,
+                "persistent_configuration_writes": False,
+            },
             "window_anchors": {
                 "sender": "sender_START_return",
                 "receiver": "first_authenticated_rf_data",
@@ -2420,31 +2505,40 @@ def run_hardware(args: argparse.Namespace) -> dict[str, Any]:
         result["peer_bitmap"] = peer_bitmap
         checkpoint("peer_keys_verified")
         # The receiver must be armed before the producer is released.
-        checkpoint("receiver_reset_attempt")
-        sessions[receiver_role].control(CONTROL_RESET, config)
-        checkpoint("receiver_reset_sent")
-        checkpoint("receiver_start_attempt")
-        sessions[receiver_role].control(CONTROL_START, config)
-        checkpoint("receiver_start_sent")
+        operation_labels = {
+            CONTROL_RESET: "reset",
+            CONTROL_ENABLE_SPI_YIELD: "spi_yield_enable",
+            CONTROL_START: "start",
+        }
+        for operation in start_control_operations(spi_yield_requested):
+            label = operation_labels[operation]
+            checkpoint(f"receiver_{label}_attempt")
+            sessions[receiver_role].control(operation, config)
+            checkpoint(f"receiver_{label}_sent")
         run_controls_started = True
         time.sleep(args.command_gap)
-        checkpoint("sender_reset_attempt")
-        sessions[sender_role].control(CONTROL_RESET, config)
-        checkpoint("sender_reset_sent")
-        checkpoint("sender_start_attempt")
-        sessions[sender_role].control(CONTROL_START, config)
-        # The fixed host wall starts when the sender START command has been
-        # accepted by the local client. The firmware report remains the
-        # authoritative duration check and must equal config.duration_ms.
-        start = time.monotonic()
-        start_wall = time.time()
-        start_monotonic = start
-        result["burst_started_monotonic"] = start
-        result["burst_started_wall"] = start_wall
-        result["host_clock"]["start"] = {
-            "monotonic": start,
-            "wall": start_wall,
-        }
+        start_monotonic = None
+        start_wall = None
+        for operation in start_control_operations(spi_yield_requested):
+            label = operation_labels[operation]
+            checkpoint(f"sender_{label}_attempt")
+            sessions[sender_role].control(operation, config)
+            if operation == CONTROL_START:
+                # Capture the finite-window anchor immediately after the
+                # sender START returns, before checkpoint persistence work.
+                start_monotonic = time.monotonic()
+                start_wall = time.time()
+                result["burst_started_monotonic"] = start_monotonic
+                result["burst_started_wall"] = start_wall
+                result["host_clock"]["start"] = {
+                    "monotonic": start_monotonic,
+                    "wall": start_wall,
+                }
+            checkpoint(f"sender_{label}_sent")
+        if start_monotonic is None or start_wall is None:
+            raise BenchmarkError("sender START did not establish the finite window")
+        # The firmware report remains the authoritative duration check and must
+        # equal config.duration_ms.
         wait_with_checkpoints(args.wall_seconds, "burst_running")
         wall_end = time.monotonic()
         wait_with_checkpoints(args.drain_seconds, "drain_running")
@@ -2479,7 +2573,7 @@ def run_hardware(args: argparse.Namespace) -> dict[str, Any]:
             receiver_report,
             wall_seconds=args.wall_seconds,
             drain_seconds=args.drain_seconds,
-            observed_wall_seconds=wall_end - start,
+            observed_wall_seconds=wall_end - start_monotonic,
             observed_drain_seconds=drain_end - wall_end,
             peer_bitmap=peer_bitmap,
             extra_failure_reasons=(
@@ -2614,9 +2708,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="firmware image to hash into provenance",
     )
     parser.add_argument(
+        "--base-image",
+        type=Path,
+        default=None,
+        help="base-role firmware image for role-bound SPI-yield provenance",
+    )
+    parser.add_argument(
+        "--walker-image",
+        type=Path,
+        default=None,
+        help="walker-role firmware image for role-bound SPI-yield provenance",
+    )
+    parser.add_argument(
         "--diagnostics",
         action="store_true",
         help="request frozen kind-4 aggregate diagnostics after the burst",
+    )
+    parser.add_argument(
+        "--spi-yield",
+        action="store_true",
+        help="arm the optional public-HAL SPI-yield diagnostic before START",
     )
     return parser
 

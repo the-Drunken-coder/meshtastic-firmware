@@ -39,7 +39,17 @@ void LockingArduinoHal::spiEndTransaction()
 #if ARCH_PORTDUINO
 void LockingArduinoHal::spiTransfer(uint8_t *out, size_t len, uint8_t *in)
 {
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    const bool collect = benchmarkMetrics && benchmarkMetrics->isCollecting();
+    const uint32_t startedAtUs = collect ? static_cast<uint32_t>(micros()) : 0;
+#endif
     spi->transfer(out, in, len);
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    if (collect) {
+        const uint32_t durationUs = static_cast<uint32_t>(static_cast<uint32_t>(micros()) - startedAtUs);
+        benchmarkMetrics->recordTransfer(durationUs, len);
+    }
+#endif
 }
 #endif
 
@@ -47,15 +57,64 @@ void LockingArduinoHal::spiTransfer(uint8_t *out, size_t len, uint8_t *in)
     defined(MESHTASTIC_W12_BENCHMARK_BULK_SPI) && MESHTASTIC_W12_BENCHMARK_BULK_SPI
 void LockingArduinoHal::spiTransfer(uint8_t *out, size_t len, uint8_t *in)
 {
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    const bool collect = benchmarkMetrics && benchmarkMetrics->isCollecting();
+    const uint32_t startedAtUs = collect ? static_cast<uint32_t>(micros()) : 0;
+#endif
     w12_bulk_spi::transfer(*spi, out, len, in);
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    if (collect) {
+        const uint32_t durationUs = static_cast<uint32_t>(static_cast<uint32_t>(micros()) - startedAtUs);
+        benchmarkMetrics->recordTransfer(durationUs, len);
+    }
+#endif
+}
+#endif
+
+#if W12_BENCHMARK_HAL_TIMING_ENABLED && !ARCH_PORTDUINO &&                                                                       \
+    !(defined(ARCH_ESP32) && defined(MESHNOLOGY_W12) && defined(MESHTASTIC_W12_BENCHMARK) && MESHTASTIC_W12_BENCHMARK &&         \
+      defined(MESHTASTIC_W12_BENCHMARK_BULK_SPI) && MESHTASTIC_W12_BENCHMARK_BULK_SPI)
+void LockingArduinoHal::spiTransfer(uint8_t *out, size_t len, uint8_t *in)
+{
+    const bool collect = benchmarkMetrics && benchmarkMetrics->isCollecting();
+    const uint32_t startedAtUs = collect ? static_cast<uint32_t>(micros()) : 0;
+    ArduinoHal::spiTransfer(out, len, in);
+    if (collect) {
+        const uint32_t durationUs = static_cast<uint32_t>(static_cast<uint32_t>(micros()) - startedAtUs);
+        benchmarkMetrics->recordTransfer(durationUs, len);
+    }
+}
+#endif
+
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+void LockingArduinoHal::yield()
+{
+    const bool collect = benchmarkMetrics && benchmarkMetrics->isCollecting();
+    const uint32_t startedAtUs = collect ? static_cast<uint32_t>(micros()) : 0;
+    ArduinoHal::yield();
+    if (collect) {
+        const uint32_t durationUs = static_cast<uint32_t>(static_cast<uint32_t>(micros()) - startedAtUs);
+        benchmarkMetrics->recordYield(durationUs);
+    }
 }
 #endif
 
 RadioLibInterface::RadioLibInterface(LockingArduinoHal *hal, RADIOLIB_PIN_TYPE cs, RADIOLIB_PIN_TYPE irq, RADIOLIB_PIN_TYPE rst,
                                      RADIOLIB_PIN_TYPE busy, PhysicalLayer *_iface)
-    : NotifiedWorkerThread("RadioIf"), module(hal, cs, irq, rst, busy), iface(_iface)
+    : NotifiedWorkerThread("RadioIf"), module(hal, cs, irq, rst, busy)
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+      ,
+      hal(hal), halMetrics()
+#endif
+      ,
+      iface(_iface)
 {
     instance = this;
+
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    if (this->hal)
+        this->hal->attachW12BenchmarkMetrics(&halMetrics);
+#endif
 
     // Initialize unused sample slots to a sane default; sample count controls averaging.
     for (uint8_t i = 0; i < NOISE_FLOOR_SAMPLES; i++) {

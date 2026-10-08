@@ -826,6 +826,114 @@ void test_behavior_control_is_local_authorized_and_reset_is_not_mid_run()
     TEST_ASSERT_TRUE(testModule->getStats().running);
 }
 
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+void test_spi_yield_control_lifecycle_freezes_at_owned_terminal_boundary()
+{
+    const auto run = runConfig();
+    BenchmarkDiagnosticRadio diagnosticRadio;
+
+    // Op12 is local and exact-config gated. It cannot arm an unprepared run, and a foreign
+    // configuration must not consume the request.
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::ENABLE_SPI_YIELD, run.source)));
+    constexpr NodeNum observer = 0x33333333;
+    myNodeInfo.my_node_num = observer;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, observer)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::ENABLE_SPI_YIELD, observer)));
+    myNodeInfo.my_node_num = run.source;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.source)));
+    auto foreign = run;
+    ++foreign.runId;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(foreign, W12BenchmarkModule::Op::ENABLE_SPI_YIELD, run.source)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::ENABLE_SPI_YIELD, run.source)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::ENABLE_SPI_YIELD, run.source)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::START, run.source)));
+
+    // A source run has a valid timing window. STOP marks it complete, but the report stays
+    // unavailable while the owner's terminal callback is still pending.
+    TEST_ASSERT_EQUAL_INT(0, testModule->runOnce());
+    TEST_ASSERT_EQUAL_UINT(1, testRadio->pendingCount());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::STOP, run.source)));
+    TEST_ASSERT_FALSE(testModule->getStats().running);
+    TEST_ASSERT_TRUE(testModule->getStats().complete);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::SNAPSHOT_SPI_YIELD, run.source)));
+
+    testRadio->finishAt(0, RadioInterface::TxState::Cancelled);
+    TEST_ASSERT_EQUAL_UINT(0, testRadio->pendingCount());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::SNAPSHOT_SPI_YIELD, run.source)));
+    auto *sourceReply = testModule->allocReply();
+    TEST_ASSERT_NOT_NULL(sourceReply);
+    TEST_ASSERT_EQUAL_UINT(W12BenchmarkModule::SPI_YIELD_REPORT_BYTES, sourceReply->decoded.payload.size);
+    const uint8_t *sourceWire = sourceReply->decoded.payload.bytes;
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(W12BenchmarkModule::Kind::SPI_YIELD), sourceWire[3]);
+    TEST_ASSERT_EQUAL_UINT8(1 | 4 | 8, sourceWire[20]);
+    TEST_ASSERT_EQUAL_UINT8(0, sourceWire[21]);
+    TEST_ASSERT_EQUAL_UINT32(0, read32(sourceWire, 24));
+    TEST_ASSERT_EQUAL_UINT32(0, read32(sourceWire, 28));
+    TEST_ASSERT_EQUAL_UINT32(0, read32(sourceWire, 32));
+    TEST_ASSERT_EQUAL_UINT32(0, read32(sourceWire, 40));
+    TEST_ASSERT_EQUAL_UINT8(1, sourceWire[68]);
+    TEST_ASSERT_EQUAL_UINT8(0, sourceWire[69]);
+    for (size_t offset = 70; offset < W12BenchmarkModule::SPI_YIELD_REPORT_BYTES; ++offset)
+        TEST_ASSERT_EQUAL_UINT8(0, sourceWire[offset]);
+    packetPool.release(sourceReply);
+
+    // RESET clears the nonpersistent arm and counters. A snapshot from the new prepared run is
+    // rejected until ENABLE and a complete valid window happen again.
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.source)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::SNAPSHOT_SPI_YIELD, run.source)));
+
+    // A receiver with no authenticated frame has no timing window, even when its deadline is
+    // reached, so the completed collector still cannot produce Op11.
+    myNodeInfo.my_node_num = run.destination;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.destination)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::ENABLE_SPI_YIELD, run.destination)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::START, run.destination)));
+    Time::setTestMillis(run.durationMs);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::STOP, run.destination)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::SNAPSHOT_SPI_YIELD, run.destination)));
+    TEST_ASSERT_NULL(testModule->allocReply());
+
+    // Once an authenticated frame opens the receiver window, deadline completion is a valid
+    // terminal run and the frozen page becomes available.
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.destination)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::ENABLE_SPI_YIELD, run.destination)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::START, run.destination)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(testModule->handleReceived(makeData(run, 0))));
+    Time::setTestMillis(run.durationMs);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::CONTINUE),
+                          static_cast<int>(testModule->handleReceived(makeData(run, 1))));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::SNAPSHOT_SPI_YIELD, run.destination)));
+    auto *receiverReply = testModule->allocReply();
+    TEST_ASSERT_NOT_NULL(receiverReply);
+    TEST_ASSERT_EQUAL_UINT8(1 | 4 | 8, receiverReply->decoded.payload.bytes[20]);
+    TEST_ASSERT_EQUAL_UINT8(1, receiverReply->decoded.payload.bytes[68]);
+    packetPool.release(receiverReply);
+}
+#endif
+
 void test_radio_diagnostic_tail_keeps_rx_done_after_completion_with_pending_tx()
 {
     const auto run = runConfig();
@@ -1732,6 +1840,9 @@ void setup()
     RUN_TEST(test_phase_timing_extension_is_bounded_and_default_off);
     RUN_TEST(test_phase_timing_aggregates_wrap_deadline_and_saturate);
     RUN_TEST(test_pki_ccm_timing_aggregates_retry_calls_without_a_second_gate_sample);
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    RUN_TEST(test_spi_yield_control_lifecycle_freezes_at_owned_terminal_boundary);
+#endif
 #if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
     RUN_TEST(test_radio_gaps_report_zero_and_overflow_encoding_is_strict);
     RUN_TEST(test_radio_gaps_controls_gate_completed_page_and_pair_owner_hooks);

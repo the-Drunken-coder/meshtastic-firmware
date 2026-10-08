@@ -456,8 +456,17 @@ def _load_health_helpers() -> tuple[Callable[..., Any], Callable[..., Any], Call
         import reliable_pilot
     except ImportError:
         path = Path(__file__).with_name("reliable_pilot.py")
+        if not path.is_file():
+            path = next(
+                (
+                    parent / "firmware/bin/w12-benchmark/reliable_pilot.py"
+                    for parent in Path(__file__).parents
+                    if (parent / "firmware/bin/w12-benchmark/reliable_pilot.py").is_file()
+                ),
+                path,
+            )
         spec = importlib.util.spec_from_file_location("reliable_pilot", path)
-        if spec is None or spec.loader is None:
+        if not path.is_file() or spec is None or spec.loader is None:
             raise BenchmarkError("reliable_pilot.py cannot be loaded")
         reliable_pilot = importlib.util.module_from_spec(spec)
         sys.modules["reliable_pilot"] = reliable_pilot
@@ -827,13 +836,20 @@ def _report_dict(report: RadioGapsReport) -> dict[str, Any]:
     return value
 
 
-def _install_raw_response_capture(session: Any) -> None:
-    """Add a kind-8 event seam when the shared benchmark reader predates op 10."""
+def _install_raw_page_response_capture(
+    session: Any,
+    *,
+    decoder: Callable[[bytes], Any],
+    report_dict: Callable[[Any], dict[str, Any]],
+    field_name: str,
+) -> None:
+    """Add a strict private-page event seam to the shared serial reader."""
 
     interface = getattr(session, "interface", None)
     capture = getattr(session, "capture", None)
     original = getattr(interface, "_handleFromRadio", None)
-    if capture is None or not callable(original) or getattr(interface, "_radio_gaps_capture", False):
+    marker = f"_{field_name}_capture"
+    if capture is None or not callable(original) or getattr(interface, marker, False):
         return
     try:
         from meshtastic.protobuf import mesh_pb2, portnums_pb2
@@ -850,7 +866,7 @@ def _install_raw_response_capture(session: Any) -> None:
                 if packet.HasField("decoded") and int(packet.decoded.portnum) == private_app:
                     payload = bytes(packet.decoded.payload)
                     with contextlib.suppress(ValueError):
-                        report = decode_report(payload)
+                        report = decoder(payload)
                         capture.record(
                             "packet",
                             packet_id=int(packet.id),
@@ -863,16 +879,15 @@ def _install_raw_response_capture(session: Any) -> None:
                             via_mqtt=bool(packet.via_mqtt),
                             transport=int(packet.transport_mechanism),
                             payload_size=len(payload),
-                            radio_gaps=_report_dict(report),
+                            **{field_name: report_dict(report)},
                         )
         except Exception:
             # The shared reader remains authoritative for malformed protobufs.
-            # This optional seam must never hide or replace its health signal.
             pass
         return original(data)
 
     interface._handleFromRadio = handle
-    interface._radio_gaps_capture = True
+    setattr(interface, marker, True)
 
 
 def _radio_gaps_event_matches(
@@ -882,11 +897,22 @@ def _radio_gaps_event_matches(
     config: Any,
     deadline: float,
 ) -> bool:
+    return _page_event_matches(session, event, packet_id, config, deadline, "radio_gaps")
+
+
+def _page_event_matches(
+    session: Any,
+    event: Mapping[str, Any],
+    packet_id: int,
+    config: Any,
+    deadline: float,
+    field_name: str,
+) -> bool:
     matcher = getattr(session, "_response_event_matches", None)
     if not callable(matcher):
         return False
     try:
-        matched = matcher(event, packet_id, "radio_gaps", config, deadline)
+        matched = matcher(event, packet_id, field_name, config, deadline)
     except Exception:
         return False
     if matched is not True:
@@ -909,51 +935,119 @@ def _radio_gaps_event_matches(
     )
 
 
-def _request_snapshot(session: Any, config: Any, timeout: float) -> RadioGapsReport:
-    method = getattr(session, "snapshot_radio_gaps", None)
+def _coerce_page_response(response: Any, decoder: Callable[[bytes], Any], mapping_decoder: Callable[[Mapping[str, Any]], Any], label: str) -> Any:
+    if isinstance(response, (bytes, bytearray, memoryview)):
+        return decoder(bytes(response))
+    if isinstance(response, Mapping):
+        return mapping_decoder(response)
+    if getattr(response, "raw", None):
+        return decoder(response.raw)
+    if dataclasses.is_dataclass(response):
+        return response
+    raise BenchmarkError(f"{label} response has no decodable payload")
+
+
+def _request_page_snapshot(
+    session: Any,
+    config: Any,
+    timeout: float,
+    *,
+    operation: int,
+    field_name: str,
+    decoder: Callable[[bytes], Any],
+    mapping_decoder: Callable[[Mapping[str, Any]], Any],
+    report_dict: Callable[[Any], dict[str, Any]],
+    method_name: str | None = None,
+) -> Any:
+    method = getattr(session, method_name, None) if method_name else None
     if callable(method):
-        return _report_from_response(method(config, timeout))
+        return _coerce_page_response(method(config, timeout), decoder, mapping_decoder, field_name)
     control = getattr(session, "control", None)
     capture = getattr(session, "capture", None)
     matcher = getattr(session, "_response_event_matches", None)
     if not callable(control) or capture is None or not callable(matcher):
-        raise BenchmarkError("BoardSession has no kind-8 snapshot seam")
-    _install_raw_response_capture(session)
-    packet_id = control(SNAPSHOT_OP, config, want_response=True)
+        raise BenchmarkError(f"BoardSession has no {field_name} snapshot seam")
+    _install_raw_page_response_capture(
+        session, decoder=decoder, report_dict=report_dict, field_name=field_name
+    )
+    packet_id = control(operation, config, want_response=True)
     sent_at = getattr(session, "_last_control", {}).get(packet_id)
     if not isinstance(sent_at, (int, float)) or not math.isfinite(sent_at):
-        raise BenchmarkError("kind 8 control has no finite send timestamp")
+        raise BenchmarkError(f"{field_name} control has no finite send timestamp")
     deadline = sent_at + timeout
     event = capture.wait_for(
-        lambda item: _radio_gaps_event_matches(session, item, packet_id, config, deadline),
+        lambda item: _page_event_matches(
+            session, item, packet_id, config, deadline, field_name
+        ),
         max(0.0, deadline - time.monotonic()),
     )
     if event is None:
-        raise BenchmarkError("kind 8 snapshot response timed out")
-    response = event.get("radio_gaps")
-    if response is None:
+        raise BenchmarkError(f"{field_name} snapshot response timed out")
+    response = event.get(field_name)
+    if response is None and field_name == "radio_gaps":
         response = event.get("radio_gap")
     if response is None:
         response = event.get("payload")
-    return _report_from_response(response)
+    return _coerce_page_response(response, decoder, mapping_decoder, field_name)
 
 
-def collect_radio_gaps(
+def _install_raw_response_capture(session: Any) -> None:
+    """Compatibility wrapper for the kind-8 reader seam."""
+
+    _install_raw_page_response_capture(
+        session,
+        decoder=decode_report,
+        report_dict=_report_dict,
+        field_name="radio_gaps",
+    )
+
+
+def _request_snapshot(session: Any, config: Any, timeout: float) -> RadioGapsReport:
+    return _request_page_snapshot(
+        session,
+        config,
+        timeout,
+        operation=SNAPSHOT_OP,
+        field_name="radio_gaps",
+        decoder=decode_report,
+        mapping_decoder=report_from_mapping,
+        report_dict=_report_dict,
+        method_name="snapshot_radio_gaps",
+    )
+
+
+def _collect_page(
     run_dir: Path,
     output: Path,
     *,
     command_gap: float = 0.20,
     control_timeout: float = 15.0,
     session_factory: Callable[..., Any] | None = None,
+    operation: int,
+    field_name: str,
+    page_label: str,
+    page_decoder: Callable[[bytes], Any],
+    page_mapping_decoder: Callable[[Mapping[str, Any]], Any],
+    page_report_dict: Callable[[Any], dict[str, Any]],
+    page_evaluator: Callable[[Any], dict[str, Any]],
+    session_method: str | None,
+    scope: str,
+    software_budget: str,
+    provenance_files: Sequence[Path] = (),
+    physical_claims: Mapping[str, bool] | None = None,
+    include_page_metadata: bool = False,
+    collector_script: Path | None = None,
+    page_validator: Callable[[str, Any], None] | None = None,
+    include_executed_sources: bool = False,
 ) -> dict[str, Any]:
-    """Read both board-local kind-8 pages from an existing completed run."""
+    """Collect one frozen board-local page through the shared lifecycle."""
 
     if command_gap < 0 or not math.isfinite(command_gap) or control_timeout <= 0 or not math.isfinite(control_timeout):
         raise BenchmarkError("timing options must be finite and nonnegative")
     run_dir = Path(run_dir)
     output = Path(output)
     if run_dir.resolve() == output.resolve():
-        raise BenchmarkError("radio-gaps output must be a new directory")
+        raise BenchmarkError(f"{page_label} output must be a new directory")
     result_path = run_dir / "results.json"
     if not result_path.is_file():
         raise BenchmarkError("existing run has no results.json")
@@ -965,16 +1059,58 @@ def collect_radio_gaps(
         raise BenchmarkError("existing run results.json is not an object")
 
     benchmark = _load_benchmark()
+    claims = dict(
+        physical_claims
+        or {
+            "rf_delivery": False,
+            "guard_margin": False,
+            "collision_safety": False,
+            "throughput_acceptance": False,
+        }
+    )
+    if any(value is not False for value in claims.values()):
+        raise BenchmarkError("page collector physical claims must all be false")
     config, expected_configs, verified_files = _validate_existing_run(run_dir, existing, benchmark)
     runtime_provenance = _runtime_provenance()
+    collector_script_path = Path(collector_script or __file__).resolve()
+    if not collector_script_path.is_file():
+        raise BenchmarkError(f"collector script is missing: {collector_script_path}")
+    hashed_collector_files: dict[str, str] = {}
+    for path in provenance_files:
+        resolved = Path(path).resolve()
+        if not resolved.is_file():
+            raise BenchmarkError(f"collector provenance file is missing: {resolved}")
+        hashed_collector_files[str(resolved)] = _sha256_file(resolved)
     prepare_capture_health, session_capture_health, close_sessions_and_collect_health = _load_health_helpers()
+    if include_executed_sources:
+        executed_modules = [benchmark]
+        for helper in (
+            prepare_capture_health,
+            session_capture_health,
+            close_sessions_and_collect_health,
+        ):
+            module_name = getattr(helper, "__module__", None)
+            module = sys.modules.get(module_name) if isinstance(module_name, str) else None
+            if module is None:
+                raise BenchmarkError("capture-health helper module is not loaded")
+            executed_modules.append(module)
+        for module in executed_modules:
+            module_path = getattr(module, "__file__", None)
+            if not isinstance(module_path, str) or not module_path:
+                raise BenchmarkError(
+                    f"executed module {getattr(module, '__name__', '?')} has no file"
+                )
+            resolved = Path(module_path).resolve()
+            if not resolved.is_file():
+                raise BenchmarkError(f"executed module file is missing: {resolved}")
+            hashed_collector_files[str(resolved)] = _sha256_file(resolved)
     factory = session_factory or benchmark.BoardSession
     intent = existing["intent"]
     roles = (intent["sender"], intent["receiver"])
     try:
         output.mkdir(parents=True, exist_ok=False, mode=0o700)
     except FileExistsError as error:
-        raise BenchmarkError("radio-gaps output must be a new directory") from error
+        raise BenchmarkError(f"{page_label} output must be a new directory") from error
     os.chmod(output, 0o700)
     captured: dict[str, Any] = {}
     failures: list[str] = []
@@ -1004,7 +1140,7 @@ def collect_radio_gaps(
             snapshot_config = getattr(session, "snapshot_config", None)
             if not callable(snapshot_config):
                 raise BenchmarkError(f"{role}: BoardSession has no config snapshot seam")
-            fresh = snapshot_config(output, "radio-gaps")
+            fresh = snapshot_config(output, page_label)
             if not isinstance(fresh, Mapping) or _config_fingerprint(fresh) != json.loads(expected_configs[role]):
                 raise BenchmarkError(f"{role}: live config fingerprint differs from existing run")
             if fresh.get("usb_identity") != persisted.get("usb_identity"):
@@ -1014,13 +1150,25 @@ def collect_radio_gaps(
             protocol_failures = _protocol_event_failures(row["capture_events_before"])
             if protocol_failures:
                 raise BenchmarkError(f"{role}: capture protocol error: {', '.join(protocol_failures)}")
-            report = _request_snapshot(session, config, control_timeout)
+            report = _request_page_snapshot(
+                session,
+                config,
+                control_timeout,
+                operation=operation,
+                field_name=field_name,
+                decoder=page_decoder,
+                mapping_decoder=page_mapping_decoder,
+                report_dict=page_report_dict,
+                method_name=session_method,
+            )
             if (report.run_id, report.source, report.destination) != (config.run_id, config.source, config.destination):
-                raise BenchmarkError(f"{role}: kind 8 identity mismatch")
+                raise BenchmarkError(f"{role}: {page_label} identity mismatch")
             if report.elapsed_ms != config.duration_ms:
-                raise BenchmarkError(f"{role}: kind 8 elapsed_ms does not match run duration")
-            row["report"] = _report_dict(report)
-            row["evaluation"] = evaluate_report(report)
+                raise BenchmarkError(f"{role}: {page_label} elapsed_ms does not match run duration")
+            if page_validator is not None:
+                page_validator(role, report)
+            row["report"] = page_report_dict(report)
+            row["evaluation"] = page_evaluator(report)
             row["measurement_valid"] = row["evaluation"]["measurement_valid"]
             row["status"] = row["evaluation"]["status"]
             _persist_capture(session)
@@ -1141,27 +1289,38 @@ def collect_radio_gaps(
                     "status": "invalid",
                     "measurement_valid": False,
                     "failure_reasons": ["collector_integrity_failure"],
-                    "scope": "board_local_owner_radio_timing",
-                    "physical_claims": {"rf_delivery": False, "guard_margin": False, "collision_safety": False, "throughput_acceptance": False},
+                    "scope": scope,
+                    "physical_claims": dict(claims),
                 }
 
+    provenance: dict[str, Any] = {
+        "application_files_verified_before_open": verified_files,
+        "runtime": runtime_provenance,
+        "collector_script": {
+            "path": str(collector_script_path),
+            "sha256": _sha256_file(collector_script_path),
+        },
+    }
+    if hashed_collector_files:
+        provenance["collector_files"] = hashed_collector_files
+    intent_metadata: dict[str, Any] = {
+        "control_address": "local_self_only",
+        "operation": operation,
+        "persistent_configuration_writes": False,
+        "rf_control": False,
+    }
+    if include_page_metadata:
+        intent_metadata["page"] = field_name
     output_result: dict[str, Any] = {
         "status": "measurement_valid" if not failures else "measurement_invalid",
         "measurement_valid": not failures,
-        "scope": "board_local_owner_radio_timing",
-        "software_budget": "owner callback timing only",
-        "physical_claims": {"rf_delivery": False, "guard_margin": False, "collision_safety": False, "throughput_acceptance": False},
+        "scope": scope,
+        "software_budget": software_budget,
+        "physical_claims": dict(claims),
         "existing_run": str(run_dir.resolve()),
         "existing_run_results_sha256": benchmark.sha256_file(result_path),
-        "provenance": {
-            "application_files_verified_before_open": verified_files,
-            "runtime": runtime_provenance,
-            "collector_script": {
-                "path": str(Path(__file__).resolve()),
-                "sha256": _sha256_file(Path(__file__).resolve()),
-            },
-        },
-        "intent": {"control_address": "local_self_only", "operation": SNAPSHOT_OP, "persistent_configuration_writes": False, "rf_control": False},
+        "provenance": provenance,
+        "intent": intent_metadata,
         "boards": captured,
         "capture_events": {role: row.get("capture_events_postclose", []) for role, row in captured.items()},
         "capture_health": {
@@ -1173,6 +1332,35 @@ def collect_radio_gaps(
     }
     benchmark._safe_json_write(output / "results.json", output_result)
     return output_result
+
+
+def collect_radio_gaps(
+    run_dir: Path,
+    output: Path,
+    *,
+    command_gap: float = 0.20,
+    control_timeout: float = 15.0,
+    session_factory: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Read both board-local kind-8 pages from an existing completed run."""
+
+    return _collect_page(
+        run_dir,
+        output,
+        command_gap=command_gap,
+        control_timeout=control_timeout,
+        session_factory=session_factory,
+        operation=SNAPSHOT_OP,
+        field_name="radio_gaps",
+        page_label="radio-gaps",
+        page_decoder=decode_report,
+        page_mapping_decoder=report_from_mapping,
+        page_report_dict=_report_dict,
+        page_evaluator=evaluate_report,
+        session_method="snapshot_radio_gaps",
+        scope="board_local_owner_radio_timing",
+        software_budget="owner callback timing only",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
