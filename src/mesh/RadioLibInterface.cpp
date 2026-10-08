@@ -725,11 +725,18 @@ void RadioLibInterface::onNotify(uint32_t notification)
         setTransmitDelay();
         break;
     }
-    case ISR_RX:
+    case ISR_RX: {
 #if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
         cancelW12Burst();
 #endif
         handleReceiveInterrupt();
+        const bool receiveReady = receiveRearmSafe || recoverReceiveAfterFailedConsume();
+        if (!receiveReady) {
+            // A failed consume owns the receive event but did not prove FIFO and IRQ teardown.
+            // Do not let this notification bypass the driver's bounded recovery contract.
+            isReceiving = false;
+            rxOffline = true;
+        }
 #if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
         if (w12BurstArmSuppressed) {
 #if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
@@ -741,7 +748,8 @@ void RadioLibInterface::onNotify(uint32_t notification)
             break;
         }
 #endif
-        startReceive();
+        if (receiveReady)
+            startReceive();
 #if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
         if (w12BenchmarkModule)
             w12BenchmarkModule->onOwnerRxNotification(ownerRxNotifyAtUs, static_cast<uint32_t>(micros()), ownerRxDoneBefore,
@@ -750,6 +758,7 @@ void RadioLibInterface::onNotify(uint32_t notification)
 #endif
         setTransmitDelay();
         break;
+    }
     case ISR_POLL_TICK:
 #if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
         if (w12Burst.timerPending) {
@@ -1113,6 +1122,7 @@ void RadioLibInterface::completeSending(bool success)
 
 void RadioLibInterface::handleReceiveInterrupt()
 {
+    receiveRearmSafe = true;
     // when this is called, we should be in receive mode - if we are not, just jump out instead of bombing. Possible Race
     // Condition?
     if (!isReceiving) {
@@ -1121,26 +1131,52 @@ void RadioLibInterface::handleReceiveInterrupt()
     }
 
     isReceiving = false;
-    if (!validReceiveIrq()) {
-        rxBad++;
-        return;
-    }
 
-    // read the number of actually received bytes
-    size_t length = iface->getPacketLength();
+    RadioReceiveConsumeResult receiveResult;
+    const bool consumed = consumeReceivePacket((uint8_t *)&radioBuffer, sizeof(radioBuffer), receiveResult);
+    size_t length = 0;
+    int state = RADIOLIB_ERR_NONE;
+    if (consumed) {
+        receiveRearmSafe = receiveResult.rearmSafe;
+        length = receiveResult.length;
+        state = receiveResult.state;
+        if (state == RADIOLIB_ERR_NONE && (length == 0 || length > MAX_LORA_PAYLOAD_LEN || length > sizeof(radioBuffer))) {
+            state = length == 0 ? RADIOLIB_ERR_PACKET_TOO_SHORT : RADIOLIB_ERR_PACKET_TOO_LONG;
+        }
+    } else {
+        if (!validReceiveIrq()) {
+            rxBad++;
+            return;
+        }
 
-    // Some drivers report this as a 16 bit value, so a bad readback can overrun radioBuffer in readData()
-    if (length == 0 || length > MAX_LORA_PAYLOAD_LEN || length > sizeof(radioBuffer)) {
-        LOG_ERROR("Ignore rx packet, bad length %u", (unsigned int)length);
+        // Read the number of actually received bytes.
+        length = iface->getPacketLength();
+
+        // Some drivers report this as a 16 bit value, so a bad readback can overrun radioBuffer in readData().
+        if (length == 0 || length > MAX_LORA_PAYLOAD_LEN || length > sizeof(radioBuffer)) {
+            LOG_ERROR("Ignore rx packet, bad length %u", (unsigned int)length);
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
-        if (w12BenchmarkModule)
-            w12BenchmarkModule->onRxRead(false);
+            if (w12BenchmarkModule)
+                w12BenchmarkModule->onRxRead(false);
 #endif
-        rxBad++;
-        return;
+            rxBad++;
+            return;
+        }
+
+#ifndef DISABLE_WELCOME_UNSET
+        // Preserve the generic LoRa guard before readData. A region-unset
+        // event must not consume FIFO bytes merely to discard the packet.
+        if ((RadioMode::isFlrc() ? RadioMode::activeConfig().region : config.lora.region) ==
+            meshtastic_Config_LoRaConfig_RegionCode_UNSET) {
+            LOG_WARN("lora rx disabled: Region unset");
+            airTime->logAirtime(RX_ALL_LOG, getPacketTime(length, true));
+            return;
+        }
+#endif
+        state = iface->readData((uint8_t *)&radioBuffer, length);
     }
 
-    uint32_t rxMsec = getPacketTime(length, true);
+    uint32_t rxMsec = length ? getPacketTime(length, true) : 0;
 
 #ifndef DISABLE_WELCOME_UNSET
     if ((RadioMode::isFlrc() ? RadioMode::activeConfig().region : config.lora.region) ==
@@ -1151,7 +1187,6 @@ void RadioLibInterface::handleReceiveInterrupt()
     }
 #endif
 
-    int state = iface->readData((uint8_t *)&radioBuffer, length);
 #if ARCH_PORTDUINO
     if (portduino_config.logoutputlevel == level_trace) {
         printBytes("Raw incoming packet: ", (uint8_t *)&radioBuffer, length);
@@ -1162,16 +1197,24 @@ void RadioLibInterface::handleReceiveInterrupt()
         if (w12BenchmarkModule)
             w12BenchmarkModule->onRxRead(false);
 #endif
-        // Log PacketHeader similar to RadioInterface::printPacket so we can try to match RX errors to other packets in the logs.
-        LOG_ERROR("Ignore rx packet, error=%d (maybe id=0x%08x fr=0x%08x to=0x%08x flags=0x%02x rxSNR=%g rxRSSI=%i "
-                  "nextHop=0x%x relay=0x%x)",
-                  state, radioBuffer.header.id, radioBuffer.header.from, radioBuffer.header.to, radioBuffer.header.flags,
-                  iface->getSNR(), lround(iface->getRSSI()), radioBuffer.header.next_hop, radioBuffer.header.relay_node);
+        // A failed owned consume has no trusted header or live RSSI metadata.
+        if (consumed && !receiveResult.validHeader) {
+            LOG_ERROR("Ignore rx packet, error=%d (header and RSSI unavailable)", state);
+        } else {
+            // Log PacketHeader similar to RadioInterface::printPacket so we can try to match RX errors to other packets in the
+            // logs.
+            LOG_ERROR("Ignore rx packet, error=%d (maybe id=0x%08x fr=0x%08x to=0x%08x flags=0x%02x rxSNR=%g rxRSSI=%i "
+                      "nextHop=0x%x relay=0x%x)",
+                      state, radioBuffer.header.id, radioBuffer.header.from, radioBuffer.header.to, radioBuffer.header.flags,
+                      iface->getSNR(), lround(iface->getRSSI()), radioBuffer.header.next_hop, radioBuffer.header.relay_node);
+        }
         rxBad++;
 
         airTime->logAirtime(RX_ALL_LOG, rxMsec);
 
     } else {
+        if (consumed)
+            receiveResult.validHeader = length >= sizeof(PacketHeader);
         // Skip the 4 headers that are at the beginning of the rxBuf
         int32_t payloadLen = length - sizeof(PacketHeader);
 
@@ -1227,7 +1270,10 @@ void RadioLibInterface::handleReceiveInterrupt()
             mp->next_hop = mp->hop_start == 0 ? NO_NEXT_HOP_PREFERENCE : radioBuffer.header.next_hop;
             mp->relay_node = mp->hop_start == 0 ? NO_RELAY_NODE : radioBuffer.header.relay_node;
 
-            addReceiveMetadata(mp);
+            if (consumed)
+                applyReceiveConsumeMetadata(mp, receiveResult);
+            else
+                addReceiveMetadata(mp);
 
             mp->which_payload_variant =
                 meshtastic_MeshPacket_encrypted_tag; // Mark that the payload is still encrypted at this point

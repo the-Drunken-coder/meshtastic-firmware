@@ -69,6 +69,24 @@ class W12AdapterHal : public LockingArduinoHal
     uint32_t irqOnRead = 0;
     unsigned rawStatusReads = 0;
     unsigned failRawStatusOccurrence = 0;
+    // Atomic FLRC consume draft controls. These exercise reply bytes in both
+    // command and NOP phases while preserving this fixture's existing tests.
+    bool atomicConsumeEnabled = false;
+    bool atomicTimeoutSnapshotCommand = false;
+    bool atomicFailSnapshotReply = false;
+    bool atomicFailPacketStatusReply = false;
+    bool atomicFailFifoReply = false;
+    bool atomicFailPacketTypeReply = false;
+    unsigned atomicPacketTypeFailOccurrence = 0;
+    unsigned atomicPacketTypeReads = 0;
+    unsigned atomicSnapshotCommandTimeouts = 0;
+    uint8_t atomicStatusMode = 0x01;
+    uint32_t atomicIrq = RADIOLIB_LR2021_IRQ_RX_DONE;
+    uint16_t atomicPacketLength = 0;
+    uint8_t atomicRssiAverageRaw = 0x50;
+    uint8_t atomicRssiSyncRaw = 0x30;
+    uint8_t atomicSyncWord = 0x10;
+    std::vector<uint8_t> atomicPayload;
 
     void signalReceive(uint32_t flags)
     {
@@ -105,8 +123,31 @@ class W12AdapterHal : public LockingArduinoHal
     void spiTransfer(uint8_t *out, size_t length, uint8_t *in) override
     {
         recording.spiTransfer(out, length, in);
+        if (atomicIrqReplyPending) {
+            atomicIrqReplyPending = false;
+            in[0] = atomicSnapshotReplyFailed ? 0x02 : 0x04;
+            in[1] = atomicStatusMode;
+            in[2] = static_cast<uint8_t>(atomicIrq >> 24);
+            in[3] = static_cast<uint8_t>(atomicIrq >> 16);
+            in[4] = static_cast<uint8_t>(atomicIrq >> 8);
+            in[5] = static_cast<uint8_t>(atomicIrq);
+            return;
+        }
+        if (atomicPacketStatusReplyPending) {
+            atomicPacketStatusReplyPending = false;
+            in[0] = atomicFailPacketStatusReply ? 0x02 : 0x04;
+            in[1] = atomicStatusMode;
+            in[2] = static_cast<uint8_t>(atomicPacketLength >> 8);
+            in[3] = static_cast<uint8_t>(atomicPacketLength);
+            in[4] = atomicRssiAverageRaw;
+            in[5] = atomicRssiSyncRaw;
+            in[6] = atomicSyncWord;
+            return;
+        }
         if (packetTypeReplyPending) {
             packetTypeReplyPending = false;
+            if (atomicPacketTypeReplyFailed)
+                in[0] = 0x02;
             if (packetTypeOverrideEnabled)
                 in[2] = packetTypeOverride;
             return;
@@ -201,8 +242,46 @@ class W12AdapterHal : public LockingArduinoHal
                 rxPacketLengthReplyOverride =
                     rxPacketLengthOverrideOccurrence != 0 && occurrence == rxPacketLengthOverrideOccurrence;
             }
-            if (command == RADIOLIB_LR2021_CMD_GET_PACKET_TYPE)
-                packetTypeReplyPending = !commandFailed;
+            if (command == RADIOLIB_LR2021_CMD_GET_PACKET_TYPE) {
+                if (atomicConsumeEnabled) {
+                    const unsigned occurrence = ++atomicPacketTypeReads;
+                    atomicPacketTypeReplyFailed = atomicFailPacketTypeReply && atomicPacketTypeFailOccurrence != 0 &&
+                                                  occurrence == atomicPacketTypeFailOccurrence;
+                } else {
+                    atomicPacketTypeReplyFailed = commandFailed;
+                }
+                // SPIcommand always follows the command phase with a NOP;
+                // carry a command-status fault into that reply.
+                atomicPacketTypeReplyFailed = atomicPacketTypeReplyFailed || commandFailed;
+                packetTypeReplyPending = true;
+            }
+            if (atomicConsumeEnabled && command == RADIOLIB_LR2021_CMD_GET_AND_CLEAR_IRQ_STATUS) {
+                // The command uses verify=false, so its Stat byte is observed
+                // only by the following NOP phase.
+                atomicIrqReplyPending = true;
+                atomicSnapshotReplyFailed = atomicTimeoutSnapshotCommand || atomicFailSnapshotReply || commandFailed;
+                if (atomicTimeoutSnapshotCommand) {
+                    ++atomicSnapshotCommandTimeouts;
+                    busyLevel = 1; // Exercise Module's actual post-command BUSY timeout.
+                    // An aborted command never reaches SPIcommand's NOP reply.
+                    // Its recovery standby transaction has a different size.
+                    atomicIrqReplyPending = false;
+                }
+            }
+            if (atomicConsumeEnabled && command == RADIOLIB_LR2021_CMD_GET_FLRC_PACKET_STATUS) {
+                atomicPacketStatusReplyPending = true;
+                atomicFailPacketStatusReply = atomicFailPacketStatusReply || commandFailed;
+            }
+            if (atomicConsumeEnabled && command == RADIOLIB_LR2021_CMD_READ_RX_FIFO) {
+                // READ_RX_FIFO is one transaction. With status width zero,
+                // Module copies buffIn[2..] to the payload after parsing
+                // Stat1=buffIn[0] and Stat2=buffIn[1].
+                const bool fifoFailed = atomicFailFifoReply || commandFailed;
+                in[0] = fifoFailed ? 0x02 : 0x04;
+                in[1] = atomicStatusMode;
+                for (size_t i = 0; i < atomicPayload.size() && i + 2 < length; ++i)
+                    in[i + 2] = atomicPayload[i];
+            }
             if (command == RADIOLIB_LR2021_CMD_CLEAR_IRQ && length >= 6) {
                 uint32_t mask = (uint32_t(out[2]) << 24) | (uint32_t(out[3]) << 16) | (uint32_t(out[4]) << 8) | out[5];
                 irq &= ~mask;
@@ -247,6 +326,10 @@ class W12AdapterHal : public LockingArduinoHal
     bool errorsReplyPending = false;
     bool errorsReplyFailed = false;
     bool clearRxFifoStatusFailed = false;
+    bool atomicIrqReplyPending = false;
+    bool atomicSnapshotReplyFailed = false;
+    bool atomicPacketStatusReplyPending = false;
+    bool atomicPacketTypeReplyFailed = false;
     bool packetTypeReplyPending = false;
     bool rxPacketLengthReplyPending = false;
     bool rxPacketLengthReplyFailed = false;
@@ -270,6 +353,20 @@ class TestableW12Adapter : public LR2021Interface
 #endif
     bool isOffline() const { return rxOffline; }
     bool receiving() const { return isReceiving; }
+    // The macro-enabled production seam is opted into per new test. Keeping
+    // this fixture switch false preserves the existing generic receive tests
+    // when the atomic macro is enabled for the suite.
+    bool atomicConsumeForTest = false;
+    bool forceGenericReceive = false;
+    bool consumeReceivePacket(uint8_t *data, size_t capacity, RadioReceiveConsumeResult &result) override
+    {
+        if (forceGenericReceive || !atomicConsumeForTest) {
+            result = RadioReceiveConsumeResult{};
+            return false;
+        }
+        return LR2021Interface::consumeReceivePacket(data, capacity, result);
+    }
+    bool reconfigureForTest() { return reconfigure(); }
     uint32_t badReceives() const { return rxBad; }
     uint32_t goodTransmits() const { return txGood; }
     uint16_t droppedTransmits() const { return txDrop; }
@@ -298,7 +395,6 @@ class TestableW12Adapter : public LR2021Interface
         return txQueue.enqueue(packet, &dropped) && !dropped;
     }
     void armOrdinaryTimerForTest() { setTransmitDelay(); }
-    bool reconfigureForTest() { return reconfigure(); }
     bool burstTimerPendingForTest() const { return w12Burst.timerPending; }
     bool notifyForTest(uint32_t notification, bool overwrite) { return notify(notification, overwrite); }
     meshtastic_MeshPacket *frontForTest() { return txQueue.getFront(); }
@@ -1216,9 +1312,9 @@ static void test_w12_adapter_rx_liveness_does_not_add_stats_or_rssi_reads_to_rec
     adapter->receiveInterrupt();
     TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_GET_FLRC_RX_STATS)));
     TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_GET_RSSI_INST)));
-    // The ISR reads IRQ status once. The zero-IRQ result then clears the flags, and native
-    // RadioLib's paranoid command verification performs a second existing status transaction.
-    TEST_ASSERT_EQUAL_UINT32(2, adapterIrqStatusReadCount());
+    // The ISR reads IRQ status once. Clearing zero IRQ adds a status transfer
+    // only when RadioLib's optional post-write verification is enabled.
+    TEST_ASSERT_EQUAL_UINT32(RADIOLIB_SPI_PARANOID ? 2 : 1, adapterIrqStatusReadCount());
 }
 
 static void test_w12_adapter_radio_diagnostics_counts_successful_arm_stages()
@@ -2298,6 +2394,12 @@ static void test_w12_adapter_failed_irq_status_cannot_credit_stale_tx_done()
     TEST_ASSERT_EQUAL_INT32(liveBefore, packetPoolLiveBytes());
     adapterHal->rawStatusFailed = false;
     adapter->armReceive();
+#if MESHTASTIC_W12_BENCHMARK_ATOMIC_FLRC_CONSUME && RADIOLIB_SPI_PARANOID
+    // Failed full profile recovery cannot be bypassed by merely arming RX.
+    TEST_ASSERT_FALSE(adapter->receiving());
+    TEST_ASSERT_TRUE(adapter->recover());
+    adapter->armReceive();
+#endif
     TEST_ASSERT_TRUE(adapter->receiving());
 }
 
@@ -3125,6 +3227,260 @@ static void test_w12_adapter_default_gate_refuses_flrc_send_and_releases_packet(
 }
 #endif
 
+#if MESHTASTIC_W12_BENCHMARK_ATOMIC_FLRC_CONSUME && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) &&                   \
+    ((defined(MESHTASTIC_W12_BENCHMARK_SINGLE_RX) && MESHTASTIC_W12_BENCHMARK_SINGLE_RX) ||                                      \
+     defined(MESHTASTIC_W12_BENCHMARK_RX_TIMEOUT_MS))
+// Draft-only real adapter cases. They retain the current fixture and make the
+// LR2021 Stat, Stat, Data FIFO offset and reply-phase failures observable.
+static void configureAtomicFrame(uint32_t id, const uint8_t *payload, size_t payloadLength, uint8_t rssiAverageRaw,
+                                 uint8_t rssiSyncRaw, uint8_t syncWord)
+{
+    PacketHeader header = {};
+    header.from = 0x5678;
+    header.to = NODENUM_BROADCAST;
+    header.id = id;
+    adapterHal->atomicPayload.resize(sizeof(header) + payloadLength);
+    memcpy(adapterHal->atomicPayload.data(), &header, sizeof(header));
+    memcpy(adapterHal->atomicPayload.data() + sizeof(header), payload, payloadLength);
+    adapterHal->atomicPacketLength = adapterHal->atomicPayload.size();
+    adapterHal->atomicRssiAverageRaw = rssiAverageRaw;
+    adapterHal->atomicRssiSyncRaw = rssiSyncRaw;
+    adapterHal->atomicSyncWord = syncWord;
+}
+
+static void test_w12_adapter_atomic_consume_two_finite_frames_refreshes_metadata()
+{
+    makeW12Adapter();
+    prepareAdapterReception();
+    adapter->atomicConsumeForTest = true;
+    adapterHal->atomicConsumeEnabled = true;
+    adapterHal->atomicStatusMode = 0x01;
+    adapterHal->rawStatusMode = 0x01;
+    const uint8_t firstPayload[] = {0x42, 0x53, 0x64};
+    configureAtomicFrame(0x87654321, firstPayload, sizeof(firstPayload), 0x50, 0x30, 0x10);
+
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    adapter->serviceNotifications();
+    TEST_ASSERT_EQUAL_UINT32(1, adapterReceiver->packets.size());
+    TEST_ASSERT_EQUAL_HEX32(0x87654321, adapterReceiver->packets[0].id);
+    TEST_ASSERT_EQUAL_UINT32(sizeof(firstPayload), adapterReceiver->packets[0].encrypted.size);
+    TEST_ASSERT_TRUE(adapterReceiver->packets[0].has_rx_rssi);
+    TEST_ASSERT_EQUAL_INT32(-80, adapterReceiver->packets[0].rx_rssi);
+
+    adapterHal->recording.transactions.clear();
+    const uint8_t secondPayload[] = {0xA0, 0xB0, 0xC0, 0xD0, 0xE0};
+    configureAtomicFrame(0x10203040, secondPayload, sizeof(secondPayload), 0x64, 0x20, 0x20);
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    adapter->serviceNotifications();
+
+    TEST_ASSERT_EQUAL_UINT32(2, adapterReceiver->packets.size());
+    TEST_ASSERT_EQUAL_HEX32(0x10203040, adapterReceiver->packets[1].id);
+    TEST_ASSERT_NOT_EQUAL(adapterReceiver->packets[0].id, adapterReceiver->packets[1].id);
+    TEST_ASSERT_EQUAL_UINT32(sizeof(secondPayload), adapterReceiver->packets[1].encrypted.size);
+    TEST_ASSERT_EQUAL_INT32(-100, adapterReceiver->packets[1].rx_rssi);
+    // One consume proof plus the existing full RX rearm modem query.
+    TEST_ASSERT_EQUAL_UINT32(2, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_GET_PACKET_TYPE)));
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_GET_AND_CLEAR_IRQ_STATUS)));
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_GET_FLRC_PACKET_STATUS)));
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_GET_RX_PKT_LENGTH)));
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_READ_RX_FIFO)));
+    TEST_ASSERT_TRUE(adapter->receiving());
+}
+
+static void test_w12_adapter_atomic_snapshot_command_timeout_stops_rearm()
+{
+    makeW12Adapter();
+    prepareAdapterReception();
+    adapter->atomicConsumeForTest = true;
+    adapterHal->atomicConsumeEnabled = true;
+    adapterHal->atomicTimeoutSnapshotCommand = true;
+    adapterHal->rawStatusMode = 0x01;
+    adapterHal->recording.transactions.clear();
+
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    adapter->serviceNotifications();
+
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->atomicSnapshotCommandTimeouts);
+    TEST_ASSERT_EQUAL_UINT32(0, adapterReceiver->packets.size());
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_READ_RX_FIFO)));
+    TEST_ASSERT_FALSE(adapter->receiving());
+    TEST_ASSERT_TRUE(adapter->isOffline());
+    adapterHal->recording.transactions.clear();
+    adapter->armReceive();
+    TEST_ASSERT_FALSE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+}
+
+static void test_w12_adapter_atomic_snapshot_nop_reply_failure_stops_rearm()
+{
+    makeW12Adapter();
+    prepareAdapterReception();
+    adapter->atomicConsumeForTest = true;
+    adapterHal->atomicConsumeEnabled = true;
+    adapterHal->atomicFailSnapshotReply = true;
+    adapterHal->rawStatusMode = 0x01;
+    adapterHal->recording.transactions.clear();
+
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    adapter->serviceNotifications();
+
+    TEST_ASSERT_EQUAL_UINT32(0, adapterReceiver->packets.size());
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_READ_RX_FIFO)));
+    TEST_ASSERT_FALSE(adapter->receiving());
+    TEST_ASSERT_TRUE(adapter->isOffline());
+    adapterHal->recording.transactions.clear();
+    adapter->armReceive();
+    TEST_ASSERT_FALSE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+}
+
+static void test_w12_adapter_atomic_packet_status_and_fifo_reply_failures_rearm()
+{
+    for (const bool failPacketStatus : {true, false}) {
+        makeW12Adapter();
+        prepareAdapterReception();
+        adapter->atomicConsumeForTest = true;
+        adapterHal->atomicConsumeEnabled = true;
+        adapterHal->rawStatusMode = 0x01;
+        adapterHal->atomicFailPacketStatusReply = failPacketStatus;
+        adapterHal->atomicFailFifoReply = !failPacketStatus;
+        const uint8_t payload[] = {0x42, 0x53, 0x64};
+        configureAtomicFrame(0x87654321, payload, sizeof(payload), 0x50, 0x30, 0x10);
+
+        adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+        adapter->serviceNotifications();
+
+        TEST_ASSERT_EQUAL_UINT32(0, adapterReceiver->packets.size());
+        TEST_ASSERT_TRUE(adapter->receiving());
+        TEST_ASSERT_FALSE(adapter->isOffline());
+        TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_GET_FLRC_PACKET_STATUS)));
+        TEST_ASSERT_EQUAL_UINT32(failPacketStatus ? 0u : 1u, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_READ_RX_FIFO)));
+    }
+}
+
+static void test_w12_adapter_atomic_foreign_modem_stays_offline_until_full_profile_restore()
+{
+    makeW12Adapter();
+    prepareAdapterReception();
+    adapter->atomicConsumeForTest = true;
+    adapterHal->packetTypeOverrideEnabled = true;
+    adapterHal->packetTypeOverride = RADIOLIB_LR2021_PACKET_TYPE_LORA;
+    adapterHal->recording.transactions.clear();
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    adapter->serviceNotifications();
+    TEST_ASSERT_EQUAL_UINT32(0, adapterReceiver->packets.size());
+    TEST_ASSERT_FALSE(adapter->receiving());
+    TEST_ASSERT_TRUE(adapter->isOffline());
+    TEST_ASSERT_FALSE(RadioMode::status(config.lora).active_initialized);
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_GET_AND_CLEAR_IRQ_STATUS)));
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO)));
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_CLEAR_IRQ)));
+
+    adapterHal->recording.transactions.clear();
+    adapter->armReceive();
+    TEST_ASSERT_FALSE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+    TEST_ASSERT_FALSE(adapter->reconfigureForTest());
+    TEST_ASSERT_FALSE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+
+    // Only a successful full FLRC profile restore may clear the block. This is
+    // deliberately separate from reconfigure/startReceive so cached mode does
+    // not turn a foreign modem into an initialized receiver.
+    adapterHal->packetTypeOverrideEnabled = false;
+    adapterHal->failCommand = RADIOLIB_LR2021_CMD_SET_PACKET_TYPE;
+    adapterHal->failCommandOccurrence = 1;
+    adapterHal->failCommandSeen = 0;
+    TEST_ASSERT_FALSE(adapter->recover());
+    TEST_ASSERT_FALSE(RadioMode::status(config.lora).active_initialized);
+    adapter->armReceive();
+    TEST_ASSERT_FALSE(adapter->receiving());
+    adapterHal->failCommand = 0;
+    adapterHal->failCommandOccurrence = 0;
+    TEST_ASSERT_TRUE(adapter->recover());
+    TEST_ASSERT_TRUE(RadioMode::status(config.lora).active_initialized);
+    adapter->armReceive();
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_FALSE(adapter->isOffline());
+    TEST_ASSERT_GREATER_THAN_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+}
+
+static void test_w12_adapter_atomic_recovery_reproves_packet_type_before_discard()
+{
+    makeW12Adapter();
+    prepareAdapterReception();
+    adapter->atomicConsumeForTest = true;
+    adapterHal->atomicConsumeEnabled = true;
+    adapterHal->atomicStatusMode = 0x01;
+    adapterHal->rawStatusMode = 0x01;
+    adapterHal->failRawStatusOccurrence = 1;
+    adapterHal->atomicFailPacketTypeReply = true;
+    adapterHal->atomicPacketTypeFailOccurrence = 2;
+    const uint8_t payload[] = {0x42, 0x53, 0x64};
+    configureAtomicFrame(0x87654321, payload, sizeof(payload), 0x50, 0x30, 0x10);
+
+    adapterHal->recording.transactions.clear();
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    adapter->serviceNotifications();
+
+    TEST_ASSERT_EQUAL_UINT32(0, adapterReceiver->packets.size());
+    TEST_ASSERT_FALSE(adapter->receiving());
+    TEST_ASSERT_TRUE(adapter->isOffline());
+    TEST_ASSERT_EQUAL_UINT32(2, adapterHal->atomicPacketTypeReads);
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_GET_AND_CLEAR_IRQ_STATUS)));
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_READ_RX_FIFO)));
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO)));
+    // The fresh type proof fails, so discardFlrcReceive must return before a
+    // second snapshot or any foreign FIFO/IRQ cleanup.
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_CLEAR_IRQ)));
+}
+
+static void test_w12_adapter_atomic_initial_full_restore_failure_blocks_ordinary_rearm()
+{
+    makeW12Adapter();
+    adapter->stop();
+    adapterHal->failCommand = RADIOLIB_LR2021_CMD_SET_PACKET_TYPE;
+    adapterHal->failCommandOccurrence = 1;
+    adapterHal->failCommandSeen = 0;
+    TEST_ASSERT_FALSE(adapter->recover());
+    adapterHal->recording.transactions.clear();
+    adapter->armReceive();
+    TEST_ASSERT_FALSE(adapter->receiving());
+    TEST_ASSERT_TRUE(adapter->isOffline());
+    TEST_ASSERT_FALSE(RadioMode::status(config.lora).active_initialized);
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+    TEST_ASSERT_FALSE(adapter->reconfigureForTest());
+    adapterHal->failCommand = 0;
+    adapterHal->failCommandOccurrence = 0;
+    TEST_ASSERT_TRUE(adapter->recover());
+    adapter->armReceive();
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_TRUE(RadioMode::status(config.lora).active_initialized);
+}
+
+// The generic LoRa branch must use the active FLRC snapshot in its historical
+// region guard. A live UNSET edit must not accidentally block this snapshot's
+// already-selected generic fallback read.
+static void test_w12_adapter_lora_region_guard_uses_active_snapshot_on_live_mismatch()
+{
+    makeW12Adapter();
+    prepareAdapterReception();
+    adapter->stop();
+    adapterHal->packetTypeOverrideEnabled = true;
+    adapterHal->packetTypeOverride = RADIOLIB_LR2021_PACKET_TYPE_LORA;
+    adapter->forceGenericReceive = true;
+    const auto regionBefore = config.lora.region;
+    config.lora.region = meshtastic_Config_LoRaConfig_RegionCode_UNSET;
+    adapter->armReceive();
+    adapterHal->recording.transactions.clear();
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE | RADIOLIB_LR2021_IRQ_LORA_HEADER_VALID);
+    adapter->serviceNotifications();
+    TEST_ASSERT_EQUAL_UINT32(1, adapterReceiver->packets.size());
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_READ_RX_FIFO)));
+    config.lora.region = regionBefore;
+}
+#endif
+
 static void runW12AdapterTests()
 {
     RUN_TEST(test_w12_lr2021_implicit_cached_length_preserves_driver_reads);
@@ -3147,6 +3503,18 @@ static void runW12AdapterTests()
     RUN_TEST(test_w12_adapter_checked_inner_zero_length_rejects_and_recovers);
     RUN_TEST(test_w12_adapter_checked_inner_short_length_rejects_and_recovers);
     RUN_TEST(test_w12_adapter_checked_internal_irq_status_failure_rejects_and_recovers);
+#if MESHTASTIC_W12_BENCHMARK_ATOMIC_FLRC_CONSUME && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) &&                   \
+    ((defined(MESHTASTIC_W12_BENCHMARK_SINGLE_RX) && MESHTASTIC_W12_BENCHMARK_SINGLE_RX) ||                                      \
+     defined(MESHTASTIC_W12_BENCHMARK_RX_TIMEOUT_MS))
+    RUN_TEST(test_w12_adapter_atomic_consume_two_finite_frames_refreshes_metadata);
+    RUN_TEST(test_w12_adapter_atomic_snapshot_command_timeout_stops_rearm);
+    RUN_TEST(test_w12_adapter_atomic_snapshot_nop_reply_failure_stops_rearm);
+    RUN_TEST(test_w12_adapter_atomic_packet_status_and_fifo_reply_failures_rearm);
+    RUN_TEST(test_w12_adapter_atomic_foreign_modem_stays_offline_until_full_profile_restore);
+    RUN_TEST(test_w12_adapter_atomic_recovery_reproves_packet_type_before_discard);
+    RUN_TEST(test_w12_adapter_atomic_initial_full_restore_failure_blocks_ordinary_rearm);
+    RUN_TEST(test_w12_adapter_lora_region_guard_uses_active_snapshot_on_live_mismatch);
+#endif
     RUN_TEST(test_w12_adapter_internal_irq_failure_clears_irq_after_fifo_clear_failure);
     RUN_TEST(test_w12_adapter_failed_irq_status_keeps_channel_busy_and_rejects_stale_rx);
     RUN_TEST(test_w12_adapter_transmit_requires_tx_done_and_never_double_completes);

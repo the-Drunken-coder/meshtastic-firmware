@@ -1,0 +1,31 @@
+{
+  "dependency": {
+    "name": "RadioLib",
+    "version": "7.7.1",
+    "commit": "510e00cfb05bbc3c2b7b524262785454944adb6e",
+    "uri": "https://github.com/jgromes/RadioLib/archive/510e00cfb05bbc3c2b7b524262785454944adb6e.zip"
+  },
+  "files": {
+    "cpp": "src/modules/LR2021/LR2021.cpp",
+    "header": "src/modules/LR2021/LR2021.h"
+  },
+  "states": {
+    "original": {
+      "cpp_sha256": "7662c16d8a2e4d10cd1fee7d5910a85a5a246d79f3c76586195af16a2fbbbfa9",
+      "header_sha256": "35529c7a732ec28104042199bacca21baedc79306e721b946d8de08297b56e36"
+    },
+    "checked_cpp_original_header": {
+      "cpp_sha256": "12bc9aa547d24b0b311fda8e231bff3e8f1177bf8398160238f9e836f2cae701",
+      "header_sha256": "35529c7a732ec28104042199bacca21baedc79306e721b946d8de08297b56e36"
+    },
+    "atomic": {
+      "cpp_sha256": "911cc8e66a63769e0b2a524af5f0633cbe6f781ace0175818b4617b838aaae50",
+      "header_sha256": "04ca44a86735fcde45e81fd72924ea1e7708c519fd6d5802a580c20949c2443b"
+    }
+  },
+  "patches": {
+    "correctness": "lr2021-correctness.patch",
+    "api_cpp": "lr2021-flrc-api-cpp.patch",
+    "api_header": "lr2021-flrc-api-header.patch"
+  }
+}

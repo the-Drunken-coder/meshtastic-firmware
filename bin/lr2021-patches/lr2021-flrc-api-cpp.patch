@@ -1,0 +1,326 @@
+--- a/RadioLib/src/modules/LR2021/LR2021.cpp
++++ b/RadioLib/src/modules/LR2021/LR2021.cpp
+@@ -4,6 +4,22 @@
+ #include <math.h>
+ 
+ #if !RADIOLIB_EXCLUDE_LR2021
++
++namespace
++{
++constexpr uint8_t LR2021_STAT2_MODE_MASK = 0x07;
++constexpr uint8_t LR2021_STAT2_MODE_STDBY_RC = 1;
++
++uint8_t lr2021StatusMode(uint8_t stat2)
++{
++  return static_cast<uint8_t>(stat2 & LR2021_STAT2_MODE_MASK);
++}
++
++bool lr2021IsStandbyRc(uint8_t stat2)
++{
++  return lr2021StatusMode(stat2) == LR2021_STAT2_MODE_STDBY_RC;
++}
++} // namespace
+ 
+ LR2021::LR2021(Module* mod) : LRxxxx(mod) {
+   this->freqStep = RADIOLIB_LR2021_FREQUENCY_STEP_SIZE;
+@@ -647,6 +663,300 @@
+   return(finishRead(crcState));
+ }
+ 
++int16_t LR2021::readFreshStatus(uint8_t* stat1, uint8_t* stat2, uint32_t* irq) {
++  // GET_STATUS is only valid here immediately after a known non-read command.
++  // A NOP after READ_RX_FIFO or another read can return that read's reply.
++  Module::BitWidth_t statusWidth = this->mod->spiConfig.widths[RADIOLIB_MODULE_SPI_WIDTH_STATUS];
++  this->mod->spiConfig.widths[RADIOLIB_MODULE_SPI_WIDTH_STATUS] = Module::BITS_0;
++  uint8_t localStat1 = 0;
++  uint8_t localStat2 = 0;
++  uint32_t localIrq = 0;
++  int16_t state = getStatus(&localStat1, &localStat2, &localIrq);
++  this->mod->spiConfig.widths[RADIOLIB_MODULE_SPI_WIDTH_STATUS] = statusWidth;
++  if(state != RADIOLIB_ERR_NONE) {
++    return(state);
++  }
++  // getStatus uses SPItransferStream, which already parsed buffIn[0]
++  // through the Module callback even with status width zero.
++  if(stat1) { *stat1 = localStat1; }
++  if(stat2) { *stat2 = localStat2; }
++  if(irq) { *irq = localIrq; }
++  return(RADIOLIB_ERR_NONE);
++}
++
++int16_t LR2021::readFlrcIrqSnapshot(FlrcIrqSnapshot* snapshot) {
++  if(!snapshot) {
++    return(RADIOLIB_ERR_NULL_POINTER);
++  }
++
++  *snapshot = {};
++  snapshot->state = RADIOLIB_ERR_UNKNOWN;
++  // GET_AND_CLEAR_IRQ_STATUS returns Stat1, Stat2, and the IRQ word in the
++  // same read reply. Capture all six bytes; the public RadioLib helper keeps
++  // only the IRQ word and cannot prove the LR2021 mode.
++  Module::BitWidth_t commandWidth = this->mod->spiConfig.widths[RADIOLIB_MODULE_SPI_WIDTH_CMD];
++  Module::BitWidth_t statusWidth = this->mod->spiConfig.widths[RADIOLIB_MODULE_SPI_WIDTH_STATUS];
++  this->mod->spiConfig.widths[RADIOLIB_MODULE_SPI_WIDTH_CMD] = Module::BITS_16;
++  this->mod->spiConfig.widths[RADIOLIB_MODULE_SPI_WIDTH_STATUS] = Module::BITS_0;
++  uint8_t raw[6] = {};
++  int16_t state = this->mod->SPIwriteStream(RADIOLIB_LR2021_CMD_GET_AND_CLEAR_IRQ_STATUS, nullptr, 0, true, false);
++  if(state == RADIOLIB_ERR_NONE) {
++    // LR2021 returns the reply in the documented second NOP phase. Keep the
++    // command width at zero for that phase so raw[0] is Stat1 and the Module
++    // status callback still observes the reply at buffIn[0].
++    this->mod->spiConfig.widths[RADIOLIB_MODULE_SPI_WIDTH_CMD] = Module::BITS_0;
++    state = this->mod->SPIreadStream(RADIOLIB_LR2021_CMD_NOP, raw, sizeof(raw), true, false);
++  }
++  this->mod->spiConfig.widths[RADIOLIB_MODULE_SPI_WIDTH_CMD] = commandWidth;
++  this->mod->spiConfig.widths[RADIOLIB_MODULE_SPI_WIDTH_STATUS] = statusWidth;
++  snapshot->stat1 = raw[0];
++  snapshot->stat2 = raw[1];
++  snapshot->irq = (static_cast<uint32_t>(raw[2]) << 24) | (static_cast<uint32_t>(raw[3]) << 16) |
++                  (static_cast<uint32_t>(raw[4]) << 8) | static_cast<uint32_t>(raw[5]);
++  if(state == RADIOLIB_ERR_NONE) {
++    // SPIreadStream parsed the reply status from buffIn[0], including when
++    // RADIOLIB_SPI_PARANOID is disabled because the callback runs in
++    // SPItransferStream.
++    snapshot->valid = true;
++  }
++  snapshot->state = state;
++  return(state);
++}
++
++int16_t LR2021::cleanupFlrcReceive(const FlrcIrqSnapshot& snapshot, LR2021FlrcRxDiscardStatus* status) {
++  if(!status) {
++    return(RADIOLIB_ERR_NULL_POINTER);
++  }
++
++  *status = {};
++  status->cleanupAttempted = true;
++  int16_t firstError = snapshot.state;
++  if(firstError == RADIOLIB_ERR_UNKNOWN && snapshot.valid) {
++    firstError = RADIOLIB_ERR_NONE;
++  }
++  auto remember = [&firstError](int16_t state) {
++    if((firstError == RADIOLIB_ERR_NONE || firstError == RADIOLIB_ERR_UNKNOWN) && state != RADIOLIB_ERR_NONE) {
++      firstError = state;
++    }
++  };
++
++  status->initialStatusValid = snapshot.valid;
++  status->rawStatus2 = snapshot.stat2;
++  status->mode = lr2021StatusMode(snapshot.stat2);
++  status->standbyVerified = snapshot.valid && lr2021IsStandbyRc(snapshot.stat2);
++
++  // A non-standby snapshot is already outside the finite consume proof. Make
++  // one bounded standby attempt for the owner recovery path, but never clear
++  // FIFO or all IRQs in this call. A later discard call must take a fresh
++  // STDBY_RC snapshot before destructive cleanup.
++  if(!status->standbyVerified) {
++    status->standbyAttempts = 1;
++    const bool wakeup = !snapshot.valid || status->mode == 0;
++    const int16_t standbyState = standby(RADIOLIB_LR2021_STANDBY_RC, wakeup);
++    remember(standbyState);
++
++    uint8_t stat1 = 0;
++    uint8_t stat2 = 0;
++    uint32_t irq = 0;
++    const int16_t verifyState = readFreshStatus(&stat1, &stat2, &irq);
++    remember(verifyState);
++    if(verifyState == RADIOLIB_ERR_NONE) {
++      status->rawStatus2 = stat2;
++      status->mode = lr2021StatusMode(stat2);
++      status->standbyVerified = lr2021IsStandbyRc(stat2);
++    }
++    status->rearmSafe = false;
++    status->state = firstError != RADIOLIB_ERR_NONE ? firstError : RADIOLIB_ERR_UNKNOWN;
++    return(status->state);
++  }
++
++  // The write itself deliberately skips RadioLib's optional post-write check.
++  // The immediately following fresh status is the mandatory check in both
++  // paranoia configurations and also proves the chip remained in standby.
++  const int16_t fifoWrite = this->mod->SPIwriteStream(RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO, nullptr, 0, true, false);
++  remember(fifoWrite);
++  uint8_t fifoStat1 = 0;
++  uint8_t fifoStat2 = 0;
++  uint32_t fifoIrq = 0;
++  const int16_t fifoStatus = readFreshStatus(&fifoStat1, &fifoStat2, &fifoIrq);
++  remember(fifoStatus);
++  if(fifoStatus == RADIOLIB_ERR_NONE) {
++    status->rawStatus2 = fifoStat2;
++    status->mode = lr2021StatusMode(fifoStat2);
++  }
++  status->fifoCleared = fifoWrite == RADIOLIB_ERR_NONE && fifoStatus == RADIOLIB_ERR_NONE &&
++                        lr2021IsStandbyRc(fifoStat2);
++  if(!status->fifoCleared) {
++    status->rearmSafe = false;
++    status->state = firstError != RADIOLIB_ERR_NONE ? firstError : RADIOLIB_ERR_UNKNOWN;
++    return(status->state);
++  }
++
++  const uint8_t irqBytes[] = {
++      static_cast<uint8_t>((RADIOLIB_LR2021_IRQ_ALL >> 24) & 0xFF),
++      static_cast<uint8_t>((RADIOLIB_LR2021_IRQ_ALL >> 16) & 0xFF),
++      static_cast<uint8_t>((RADIOLIB_LR2021_IRQ_ALL >> 8) & 0xFF),
++      static_cast<uint8_t>(RADIOLIB_LR2021_IRQ_ALL & 0xFF),
++  };
++  const int16_t irqWrite = this->mod->SPIwriteStream(RADIOLIB_LR2021_CMD_CLEAR_IRQ, irqBytes, sizeof(irqBytes), true, false);
++  remember(irqWrite);
++  uint8_t irqStat1 = 0;
++  uint8_t irqStat2 = 0;
++  uint32_t irqFlags = 0;
++  const int16_t irqStatus = readFreshStatus(&irqStat1, &irqStat2, &irqFlags);
++  remember(irqStatus);
++  if(irqStatus == RADIOLIB_ERR_NONE) {
++    status->rawStatus2 = irqStat2;
++    status->mode = lr2021StatusMode(irqStat2);
++  }
++  status->irqCleared = irqWrite == RADIOLIB_ERR_NONE && irqStatus == RADIOLIB_ERR_NONE &&
++                       lr2021IsStandbyRc(irqStat2);
++
++  status->rearmSafe = status->standbyVerified && status->fifoCleared && status->irqCleared;
++  status->state = firstError != RADIOLIB_ERR_NONE ? firstError :
++                  (status->rearmSafe ? RADIOLIB_ERR_NONE : RADIOLIB_ERR_UNKNOWN);
++  return(status->state);
++}
++
++int16_t LR2021::discardFlrcReceive(LR2021FlrcRxDiscardStatus* status) {
++  if(!status) {
++    return(RADIOLIB_ERR_NULL_POINTER);
++  }
++
++  *status = {};
++  uint8_t modem = RADIOLIB_LR2021_PACKET_TYPE_NONE;
++  const int16_t typeState = getPacketType(&modem);
++  if(typeState != RADIOLIB_ERR_NONE || modem != RADIOLIB_LR2021_PACKET_TYPE_FLRC) {
++    status->rearmBlocked = true;
++    status->state = typeState != RADIOLIB_ERR_NONE ? typeState : RADIOLIB_ERR_WRONG_MODEM;
++    return(status->state);
++  }
++
++  FlrcIrqSnapshot snapshot;
++  const int16_t snapshotState = readFlrcIrqSnapshot(&snapshot);
++  if(snapshotState != RADIOLIB_ERR_NONE) {
++    snapshot.state = snapshotState;
++  }
++  return(cleanupFlrcReceive(snapshot, status));
++}
++
++int16_t LR2021::readFlrcPacket(uint8_t* data, size_t capacity, LR2021FlrcRxPacketStatus* status) {
++  if(!data || !status) {
++    return(RADIOLIB_ERR_NULL_POINTER);
++  }
++
++  *status = {};
++  bool snapshotTaken = false;
++  FlrcIrqSnapshot snapshot;
++  LR2021FlrcRxDiscardStatus discardStatus;
++  auto finish = [this, status, &snapshotTaken, &snapshot, &discardStatus](int16_t primary) -> int16_t {
++    if(status->rearmBlocked) {
++      // A foreign or unproven modem owns no safe FLRC teardown contract. Do
++      // not clear its FIFO or IRQs while returning the primary error.
++      status->cleanupAttempted = false;
++      status->rearmSafe = false;
++      if(primary != RADIOLIB_ERR_NONE) {
++        status->packetLength = 0;
++        status->packetStatusReadValid = false;
++        status->rssiAverage = 0.0f;
++        status->rssiSync = 0.0f;
++        status->syncWord = 0;
++      }
++      return(primary);
++    }
++
++    const int16_t cleanup = snapshotTaken ? cleanupFlrcReceive(snapshot, &discardStatus) : discardFlrcReceive(&discardStatus);
++    status->cleanupAttempted = true;
++    status->rearmSafe = discardStatus.rearmSafe && !status->rearmBlocked;
++    const int16_t result = primary != RADIOLIB_ERR_NONE ? primary :
++                           (cleanup != RADIOLIB_ERR_NONE ? cleanup :
++                            (!discardStatus.rearmSafe ? RADIOLIB_ERR_UNKNOWN : RADIOLIB_ERR_NONE));
++    if(result != RADIOLIB_ERR_NONE) {
++      // A failed command, length, FIFO read, or teardown cannot publish stale
++      // FLRC metadata to the adapter.
++      status->packetLength = 0;
++      status->packetStatusReadValid = false;
++      status->rssiAverage = 0.0f;
++      status->rssiSync = 0.0f;
++      status->syncWord = 0;
++    }
++    return(result);
++  };
++
++  uint8_t modem = RADIOLIB_LR2021_PACKET_TYPE_NONE;
++  int16_t state = getPacketType(&modem);
++  if(state != RADIOLIB_ERR_NONE) {
++    // A failed type read does not prove which modem owns the chip. Keep the
++    // owner offline rather than rearming from an unverified cached mode.
++    status->rearmBlocked = true;
++    return(finish(state));
++  }
++  if(modem != RADIOLIB_LR2021_PACKET_TYPE_FLRC) {
++    status->rearmBlocked = true;
++    return(finish(RADIOLIB_ERR_WRONG_MODEM));
++  }
++
++  state = readFlrcIrqSnapshot(&snapshot);
++  snapshotTaken = true;
++  status->irqFlags = snapshot.irq;
++  status->irqReadValid = snapshot.valid;
++  status->rawStatus2 = snapshot.stat2;
++  status->mode = lr2021StatusMode(snapshot.stat2);
++  status->modeReadValid = snapshot.valid;
++  if(state != RADIOLIB_ERR_NONE) {
++    return(finish(state));
++  }
++
++  // GET_AND_CLEAR owns the IRQ snapshot. Reject every error or unexpected mode
++  // before using packet status, which prevents stale FLRC statistics from being
++  // mistaken for the current frame.
++  constexpr uint32_t flrcErrorIrqs =
++      RADIOLIB_LR2021_IRQ_CRC_ERROR | RADIOLIB_LR2021_IRQ_LEN_ERROR | RADIOLIB_LR2021_IRQ_ADDR_ERROR |
++      RADIOLIB_LR2021_IRQ_LORA_HDR_CRC_ERROR | RADIOLIB_LR2021_IRQ_TIMEOUT | RADIOLIB_LR2021_IRQ_ERROR |
++      RADIOLIB_LR2021_IRQ_CMD_ERROR;
++  if(!lr2021IsStandbyRc(snapshot.stat2)) {
++    return(finish(RADIOLIB_ERR_UNKNOWN));
++  }
++  if(!(snapshot.irq & RADIOLIB_LR2021_IRQ_RX_DONE)) {
++    return(finish(RADIOLIB_ERR_RX_TIMEOUT));
++  }
++  if(snapshot.irq & RADIOLIB_LR2021_IRQ_CRC_ERROR) {
++    return(finish(RADIOLIB_ERR_CRC_MISMATCH));
++  }
++  if(snapshot.irq & flrcErrorIrqs) {
++    return(finish(RADIOLIB_ERR_UNKNOWN));
++  }
++
++  uint16_t packetLength = 0;
++  float rssiAverage = 0.0f;
++  float rssiSync = 0.0f;
++  uint8_t syncWord = 0;
++  state = getFlrcPacketStatus(&packetLength, &rssiAverage, &rssiSync, &syncWord);
++  if(state != RADIOLIB_ERR_NONE) {
++    return(finish(state));
++  }
++  status->packetStatusReadValid = true;
++  if(packetLength == 0) {
++    return(finish(RADIOLIB_ERR_PACKET_TOO_SHORT));
++  }
++  if(packetLength > RADIOLIB_LR2021_MAX_PACKET_LENGTH || packetLength > capacity) {
++    return(finish(RADIOLIB_ERR_PACKET_TOO_LONG));
++  }
++
++  status->packetLength = packetLength;
++  status->rssiAverage = rssiAverage;
++  status->rssiSync = rssiSync;
++  status->syncWord = syncWord;
++  state = readRadioRxFifo(data, packetLength);
++  if(state != RADIOLIB_ERR_NONE) {
++    return(finish(state));
++  }
++
++  // READ_RX_FIFO is Stat, Stat, Data. The pinned RadioLib FIFO helper already
++  // consumes exactly packetLength data bytes and clears no status implicitly.
++  return(finish(RADIOLIB_ERR_NONE));
++}
++
+ int16_t LR2021::finishReceive() {
+   // set mode to standby to disable RF switch
+   int16_t state = standby();

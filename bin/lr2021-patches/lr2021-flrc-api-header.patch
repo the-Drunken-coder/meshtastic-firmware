@@ -1,0 +1,107 @@
+--- a/RadioLib/src/modules/LR2021/LR2021.h
++++ b/RadioLib/src/modules/LR2021/LR2021.h
+@@ -17,6 +17,51 @@
+ #define RADIOLIB_LR2021_MAX_PACKET_LENGTH                       255
+ #define RADIOLIB_LR2021_CRYSTAL_FREQ                            32.0
+ #define RADIOLIB_LR2021_DIV_EXPONENT                            25
++
++/**
++  \brief Value-owned status returned by the finite FLRC receive consume seam.
++
++  The structure contains only values copied from the chip. It never borrows
++  RadioLib or FIFO storage and is valid after the consume call returns.
++*/
++struct LR2021FlrcRxPacketStatus {
++  bool irqReadValid = false;
++  bool packetStatusReadValid = false;
++  bool modeReadValid = false;
++  bool cleanupAttempted = false;
++  // The owner must stay offline after a foreign modem result.
++  bool rearmBlocked = false;
++  uint32_t irqFlags = 0;
++  uint16_t packetLength = 0;
++  float rssiAverage = 0.0f;
++  float rssiSync = 0.0f;
++  uint8_t syncWord = 0;
++  uint8_t rawStatus2 = 0;
++  uint8_t mode = 0;
++  bool rearmSafe = false;
++};
++
++/**
++  \brief Value-owned result of bounded FLRC FIFO and IRQ discard.
++
++  FIFO destruction is permitted only after the chip has been checked in
++  STDBY_RC. A false rearmSafe value requires the owner to stop before arming
++  RX again.
++*/
++struct LR2021FlrcRxDiscardStatus {
++  int16_t state = RADIOLIB_ERR_UNKNOWN;
++  uint8_t rawStatus2 = 0;
++  uint8_t mode = 0;
++  uint8_t standbyAttempts = 0;
++  bool cleanupAttempted = false;
++  bool initialStatusValid = false;
++  bool standbyVerified = false;
++  bool fifoCleared = false;
++  bool irqCleared = false;
++  // A fresh packet-type proof failed or found a foreign modem.
++  bool rearmBlocked = false;
++  bool rearmSafe = false;
++};
+ 
+ /*!
+   \class LR2021
+@@ -359,6 +404,34 @@
+     */
+     int16_t readData(uint8_t* data, size_t len) override;
+ 
++    /**
++      \brief Read and consume one complete FLRC packet.
++
++      This is a one-shot finite-RX seam. The caller must keep the radio out of
++      receive mode until this method returns. The method checks IRQ and command
++      status, reads packet length and RSSI from one FLRC packet-status result,
++      reads exactly that many FIFO bytes, and attempts checked cleanup before
++      returning. A non-standby initial snapshot returns unsafe without destructive
++      cleanup so the owner can take a fresh bounded recovery attempt.
++
++      The active modem must be FLRC. The method checks GET_PACKET_TYPE and its
++      command status before using FLRC packet status; a wrong modem fails
++      closed without a FIFO read.
++
++      \param data Destination buffer for the packet bytes.
++      \param capacity Capacity of \p data in bytes.
++      \param status Value-owned packet status output.
++      \returns \ref status_codes
++    */
++    int16_t readFlrcPacket(uint8_t* data, size_t capacity, LR2021FlrcRxPacketStatus* status);
++
++    /**
++      \brief Bounded, checked discard of finite-RX FIFO and IRQ state.
++      \param status Value-owned cleanup and rearm-safety result.
++      \returns \ref status_codes
++    */
++    int16_t discardFlrcReceive(LR2021FlrcRxDiscardStatus* status);
++
+     /*!
+       \brief Clean up after reception is done.
+       \returns \ref status_codes
+@@ -921,6 +994,17 @@
+     // pointers to PA lookup tables - may be overridden by the user
+     LR2021PaTableEntry_t* paOptTable[2] = { nullptr, nullptr };
+ 
++    struct FlrcIrqSnapshot {
++      int16_t state = RADIOLIB_ERR_UNKNOWN;
++      uint8_t stat1 = 0;
++      uint8_t stat2 = 0;
++      uint32_t irq = 0;
++      bool valid = false;
++    };
++
++    int16_t readFreshStatus(uint8_t* stat1, uint8_t* stat2, uint32_t* irq);
++    int16_t readFlrcIrqSnapshot(FlrcIrqSnapshot* snapshot);
++    int16_t cleanupFlrcReceive(const FlrcIrqSnapshot& snapshot, LR2021FlrcRxDiscardStatus* status);
+     int16_t modSetup(float freq, uint8_t modem);
+     bool findChip(void);
+     int16_t config(uint8_t modem);

@@ -55,7 +55,11 @@ constexpr uint32_t OBSERVATION_US = 200;
 #if RADIOLIB_EXCLUDE_LR2021 != 1
 constexpr uint32_t ERROR_IRQS = RADIOLIB_LR2021_IRQ_CRC_ERROR | RADIOLIB_LR2021_IRQ_LEN_ERROR |
                                 RADIOLIB_LR2021_IRQ_LORA_HDR_CRC_ERROR | RADIOLIB_LR2021_IRQ_TIMEOUT | RADIOLIB_LR2021_IRQ_ERROR |
-                                RADIOLIB_LR2021_IRQ_CMD_ERROR;
+                                RADIOLIB_LR2021_IRQ_CMD_ERROR
+#if MESHTASTIC_W12_BENCHMARK_ATOMIC_FLRC_CONSUME
+                                | RADIOLIB_LR2021_IRQ_ADDR_ERROR
+#endif
+    ;
 constexpr uint32_t RECEIVE_IRQS = RADIOLIB_LR2021_IRQ_RX_DONE | ERROR_IRQS;
 
 inline bool acceptsIrq(uint32_t flags)
