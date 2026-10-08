@@ -5,6 +5,24 @@
 #include <SHA256.h>
 #include <memory>
 
+#ifndef MESHTASTIC_W12_BENCHMARK_PKI_PRINT_BYTES
+#define MESHTASTIC_W12_BENCHMARK_PKI_PRINT_BYTES 1
+#endif
+
+#if MESHTASTIC_W12_BENCHMARK_PKI_PRINT_BYTES != 0 && MESHTASTIC_W12_BENCHMARK_PKI_PRINT_BYTES != 1
+#error "MESHTASTIC_W12_BENCHMARK_PKI_PRINT_BYTES must be 0 or 1"
+#endif
+
+// Keep the current formatting path unless the W12 phase/benchmark diagnostic is explicitly
+// enabled and the caller supplied the opt-in CCM aggregate. Value 0 is the skip-formatting arm.
+#if defined(MESHTASTIC_W12_BENCHMARK_PHASE_TIMING) && MESHTASTIC_W12_BENCHMARK_PHASE_TIMING &&                                   \
+    ((defined(MESHTASTIC_W12_BENCHMARK) && MESHTASTIC_W12_BENCHMARK) || defined(PIO_UNIT_TESTING)) &&                            \
+    !MESHTASTIC_W12_BENCHMARK_PKI_PRINT_BYTES
+#define MESHTASTIC_W12_PKI_SKIP_PRINT_BYTES 1
+#else
+#define MESHTASTIC_W12_PKI_SKIP_PRINT_BYTES 0
+#endif
+
 #if !(MESHTASTIC_EXCLUDE_PKI)
 #include "HardwareRNG.h"
 #include "NodeDB.h"
@@ -308,8 +326,14 @@ bool CryptoEngine::encryptCurve25519(uint32_t toNode, uint32_t fromNode, meshtas
     initNonce(fromNode, packetNum, extraNonceTmp);
 
     // Calculate the shared secret with the destination node and encrypt
-    printBytes("Attempt encrypt with nonce: ", nonce, 13);
-    printBytes("Attempt encrypt with shared_key starting with: ", shared_key, 8);
+#if MESHTASTIC_W12_PKI_SKIP_PRINT_BYTES
+    if (timing == nullptr) {
+#endif
+        printBytes("Attempt encrypt with nonce: ", nonce, 13);
+        printBytes("Attempt encrypt with shared_key starting with: ", shared_key, 8);
+#if MESHTASTIC_W12_PKI_SKIP_PRINT_BYTES
+    }
+#endif
     // A non-null aggregate is the explicit opt-in for one whole CCM primitive clock.
     const uint32_t ccmStartedAtUs = timing ? micros() : 0;
     aes_ccm_ae(shared_key, 32, nonce, 8, bytes, numBytes, nullptr, 0, bytesOut, auth);
@@ -351,8 +375,14 @@ bool CryptoEngine::decryptCurve25519(uint32_t fromNode, meshtastic_NodeInfoLite_
     }
 
     initNonce(fromNode, packetNum, extraNonce);
-    printBytes("Attempt decrypt with nonce: ", nonce, 13);
-    printBytes("Attempt decrypt with shared_key starting with: ", shared_key, 8);
+#if MESHTASTIC_W12_PKI_SKIP_PRINT_BYTES
+    if (timing == nullptr) {
+#endif
+        printBytes("Attempt decrypt with nonce: ", nonce, 13);
+        printBytes("Attempt decrypt with shared_key starting with: ", shared_key, 8);
+#if MESHTASTIC_W12_PKI_SKIP_PRINT_BYTES
+    }
+#endif
     const uint32_t ccmStartedAtUs = timing ? micros() : 0;
     const bool result = aes_ccm_ad(shared_key, 32, nonce, 8, bytes, numBytes - 12, nullptr, 0, auth, bytesOut);
     if (timing)
