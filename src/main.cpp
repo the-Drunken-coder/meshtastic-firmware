@@ -63,6 +63,10 @@
 
 #ifdef ARCH_ESP32
 #include "freertosinc.h"
+#if !(MESHTASTIC_EXCLUDE_PKI) && defined(MESHTASTIC_ESP32_PKI_CCM_BATCH) && MESHTASTIC_ESP32_PKI_CCM_BATCH
+#include "platform/esp32/ESP32CryptoEngine.h"
+#include <esp_task_wdt.h>
+#endif
 #if !MESHTASTIC_EXCLUDE_WEBSERVER
 #include "mesh/http/WebServer.h"
 #endif
@@ -849,6 +853,16 @@ void setup()
 
 #ifdef ARCH_ESP32
     esp32Setup();
+#if !(MESHTASTIC_EXCLUDE_PKI) && defined(MESHTASTIC_ESP32_PKI_CCM_BATCH) && MESHTASTIC_ESP32_PKI_CCM_BATCH
+    if (!esp32PkiCcmBatchStartupSelfTest()) {
+        LOG_ERROR("Experimental PKI CCM batch self-test failed; radio startup halted");
+        RECORD_CRITICALERROR(meshtastic_CriticalErrorCode_UNSPECIFIED);
+        while (true) {
+            esp_task_wdt_reset();
+            delay(1000);
+        }
+    }
+#endif
 #endif
 
 #ifdef ARCH_NRF52

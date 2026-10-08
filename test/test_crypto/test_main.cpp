@@ -2,6 +2,16 @@
 #include "CryptoEngine.h"
 #include "mesh/Router.h" // BITFIELD_* masks the signing buffer covers
 
+#if defined(PIO_UNIT_TESTING)
+#include "pki_ccm_batch_firmware_test.h"
+#if defined(ARCH_ESP32) && !(MESHTASTIC_EXCLUDE_PKI) && defined(MESHTASTIC_ESP32_PKI_CCM_BATCH) && MESHTASTIC_ESP32_PKI_CCM_BATCH
+#include "main.h"
+#include "platform/esp32/ESP32CryptoEngine.h"
+#include "platform/esp32/pki_ccm_batch_esp32_backend.h"
+#include "platform/esp32/pki_ccm_batch_esp32_selftest.h"
+#endif
+#endif
+
 #include "TestUtil.h"
 #include "aes-ccm.h"
 #include <XEdDSA.h>
@@ -208,25 +218,49 @@ void test_PKC_optional_ccm_timing_preserves_known_answer_behavior(void)
     crypto->setDHPrivateKey(private_key);
 
     CcmTimingAggregate decodeTiming;
-    TEST_ASSERT_TRUE(crypto->decryptCurve25519(fromNode, public_key, packetNum, 22, radioBytes + 16, decrypted, &decodeTiming));
+    TEST_ASSERT_TRUE(crypto->decryptCurve25519(fromNode, public_key, packetNum, 22, radioBytes + 16, decrypted, &decodeTiming,
+                                               sizeof(decrypted)));
     TEST_ASSERT_EQUAL_UINT32(1, decodeTiming.count);
     TEST_ASSERT_TRUE(decodeTiming.sumUs >= decodeTiming.maxUs);
     TEST_ASSERT_EQUAL_MEMORY(expected_decrypted, decrypted, 10);
 
     uint8_t encrypted[128] __attribute__((__aligned__));
     CcmTimingAggregate encodeTiming;
-    TEST_ASSERT_TRUE(crypto->encryptCurve25519(0, fromNode, public_key, packetNum, 10, decrypted, encrypted, &encodeTiming));
+    TEST_ASSERT_TRUE(crypto->encryptCurve25519(0, fromNode, public_key, packetNum, 10, decrypted, encrypted, &encodeTiming,
+                                               sizeof(encrypted)));
     TEST_ASSERT_EQUAL_UINT32(1, encodeTiming.count);
     TEST_ASSERT_TRUE(encodeTiming.sumUs >= encodeTiming.maxUs);
 
     uint8_t roundTrip[128] __attribute__((__aligned__));
-    TEST_ASSERT_TRUE(crypto->decryptCurve25519(fromNode, public_key, packetNum, 22, encrypted, roundTrip));
+    TEST_ASSERT_TRUE(
+        crypto->decryptCurve25519(fromNode, public_key, packetNum, 22, encrypted, roundTrip, nullptr, sizeof(roundTrip)));
     TEST_ASSERT_EQUAL_MEMORY(expected_decrypted, roundTrip, 10);
     encrypted[0] ^= 1;
-    TEST_ASSERT_FALSE(crypto->decryptCurve25519(fromNode, public_key, packetNum, 22, encrypted, roundTrip, &decodeTiming));
+    TEST_ASSERT_FALSE(
+        crypto->decryptCurve25519(fromNode, public_key, packetNum, 22, encrypted, roundTrip, &decodeTiming, sizeof(roundTrip)));
     TEST_ASSERT_EQUAL_UINT32(2, decodeTiming.count);
     TEST_ASSERT_TRUE(decodeTiming.sumUs >= decodeTiming.maxUs);
 }
+
+#if defined(PIO_UNIT_TESTING) &&                                                                                                 \
+    ((defined(ARCH_ESP32) && !(MESHTASTIC_EXCLUDE_PKI) && defined(MESHTASTIC_ESP32_PKI_CCM_BATCH) &&                             \
+      MESHTASTIC_ESP32_PKI_CCM_BATCH) ||                                                                                         \
+     (defined(ARCH_PORTDUINO) && defined(MESHTASTIC_PKI_CCM_BATCH_NATIVE_TEST) && MESHTASTIC_PKI_CCM_BATCH_NATIVE_TEST))
+void test_PKI_CCM_batch_backend_and_wrapper_contracts(void)
+{
+#if defined(ARCH_ESP32) && !(MESHTASTIC_EXCLUDE_PKI) && defined(MESHTASTIC_ESP32_PKI_CCM_BATCH) && MESHTASTIC_ESP32_PKI_CCM_BATCH
+    // main.cpp is excluded from unit binaries. Initialize and arm the actual engine before
+    // later timing-enabled PKI tests; production boot performs this before NodeDB/radio setup.
+    esp32Setup();
+    TEST_ASSERT_TRUE(esp32PkiCcmBatchStartupSelfTest());
+    pki_ccm_batch_esp32::PublicMbedtlsAesBackend backend;
+    TEST_ASSERT_TRUE(pki_ccm_batch_esp32::runSelfTest(backend));
+    TEST_ASSERT_TRUE(pki_ccm_batch_firmware_test::runAll(backend));
+#else
+    TEST_ASSERT_TRUE(pki_ccm_batch_firmware_test::runNativePolicyTests());
+#endif
+}
+#endif
 
 // The signature covers the whole Data envelope, not just its payload, so these cases build a Data
 // rather than passing bare bytes. Fields left zero are what an ordinary packet carries.
@@ -1044,6 +1078,12 @@ void setup()
 
     initializeTestEnvironment();
     UNITY_BEGIN(); // IMPORTANT LINE!
+#if defined(PIO_UNIT_TESTING) &&                                                                                                 \
+    ((defined(ARCH_ESP32) && !(MESHTASTIC_EXCLUDE_PKI) && defined(MESHTASTIC_ESP32_PKI_CCM_BATCH) &&                             \
+      MESHTASTIC_ESP32_PKI_CCM_BATCH) ||                                                                                         \
+     (defined(ARCH_PORTDUINO) && defined(MESHTASTIC_PKI_CCM_BATCH_NATIVE_TEST) && MESHTASTIC_PKI_CCM_BATCH_NATIVE_TEST))
+    RUN_TEST(test_PKI_CCM_batch_backend_and_wrapper_contracts);
+#endif
     RUN_TEST(test_SHA256);
     RUN_TEST(test_SHA256_large_input);
     RUN_TEST(test_ECB_AES128);
