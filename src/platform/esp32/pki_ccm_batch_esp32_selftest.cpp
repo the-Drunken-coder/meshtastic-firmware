@@ -333,7 +333,7 @@ bool checkBufferLayouts(AesBackend &backend)
     return unalignedPsramOk;
 }
 
-bool checkVirtualPrimitive(PkiCcmPrimitive &primitive)
+bool checkVirtualPrimitive(CryptoEngine &primitive)
 {
     const std::array<std::size_t, 8> lengths = {0, 1, 15, 16, 17, 31, 32, 227};
     for (const std::size_t length : lengths) {
@@ -405,7 +405,7 @@ bool runSelfTest(pki_ccm_batch::AesBackend &backend)
            checkBufferLayouts(backend) && checkProductionPacketLayout(backend);
 }
 
-bool runPrimitiveSelfTest(PkiCcmPrimitive &primitive)
+bool runPrimitiveSelfTest(CryptoEngine &primitive)
 {
     return checkVirtualPrimitive(primitive);
 }

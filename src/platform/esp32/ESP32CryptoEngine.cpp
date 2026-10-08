@@ -12,11 +12,7 @@
 #include <freertos/task.h>
 #endif
 
-#if !(MESHTASTIC_EXCLUDE_PKI) && defined(MESHTASTIC_ESP32_PKI_CCM_BATCH) && MESHTASTIC_ESP32_PKI_CCM_BATCH
-class ESP32CryptoEngine : public CryptoEngine, public pki_ccm_batch_esp32::PkiCcmPrimitive
-#else
 class ESP32CryptoEngine : public CryptoEngine
-#endif
 {
 
     mbedtls_aes_context aes;
@@ -132,13 +128,13 @@ class ESP32CryptoEngine : public CryptoEngine
     }
 };
 
-CryptoEngine *crypto = new ESP32CryptoEngine();
+static ESP32CryptoEngine *const esp32Crypto = new ESP32CryptoEngine();
+CryptoEngine *crypto = esp32Crypto;
 
 bool esp32PkiCcmBatchStartupSelfTest()
 {
 #if !(MESHTASTIC_EXCLUDE_PKI) && defined(MESHTASTIC_ESP32_PKI_CCM_BATCH) && MESHTASTIC_ESP32_PKI_CCM_BATCH
-    auto *engine = static_cast<ESP32CryptoEngine *>(crypto);
-    const bool passed = engine != nullptr && engine->runPkiBatchSelfTest();
+    const bool passed = esp32Crypto->runPkiBatchSelfTest();
     // Startup-only evidence. No formatting or serial output is added to the measured packet path.
     LOG_INFO("PKI CCM batch self-test %s; stack headroom %u bytes, internal heap free %u bytes", passed ? "passed" : "failed",
              static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)),
