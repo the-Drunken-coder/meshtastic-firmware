@@ -37,6 +37,11 @@ class W12AdapterHal : public LockingArduinoHal
     uint16_t failCommand = 0;
     uint16_t failCommandOccurrence = 0;
     unsigned failCommandSeen = 0;
+    bool packetTypeOverrideEnabled = false;
+    uint8_t packetTypeOverride = RADIOLIB_LR2021_PACKET_TYPE_NONE;
+    uint16_t rxPacketLengthOverride = 0;
+    uint16_t rxPacketLengthOverrideOccurrence = 0;
+    unsigned rxPacketLengthReads = 0;
     uint16_t rssiHalfDbm = 220;
     unsigned interruptsArmed = 0;
     unsigned interruptsDisarmed = 0;
@@ -62,6 +67,8 @@ class W12AdapterHal : public LockingArduinoHal
     unsigned irqReads = 0;
     unsigned injectIrqAtRead = 0;
     uint32_t irqOnRead = 0;
+    unsigned rawStatusReads = 0;
+    unsigned failRawStatusOccurrence = 0;
 
     void signalReceive(uint32_t flags)
     {
@@ -98,6 +105,24 @@ class W12AdapterHal : public LockingArduinoHal
     void spiTransfer(uint8_t *out, size_t length, uint8_t *in) override
     {
         recording.spiTransfer(out, length, in);
+        if (packetTypeReplyPending) {
+            packetTypeReplyPending = false;
+            if (packetTypeOverrideEnabled)
+                in[2] = packetTypeOverride;
+            return;
+        }
+        if (rxPacketLengthReplyPending) {
+            rxPacketLengthReplyPending = false;
+            if (rxPacketLengthReplyFailed) {
+                in[0] = 0x02;
+                in[2] = 0;
+                in[3] = 0;
+            } else if (rxPacketLengthReplyOverride) {
+                in[2] = static_cast<uint8_t>(rxPacketLengthOverride >> 8);
+                in[3] = static_cast<uint8_t>(rxPacketLengthOverride);
+            }
+            return;
+        }
         if (rxStatsReplyPending) {
             rxStatsReplyPending = false;
             in[0] = rxStatsReplyFailed ? 0x02 : 0x04;
@@ -168,6 +193,16 @@ class W12AdapterHal : public LockingArduinoHal
                 errorsReplyPending = true;
                 errorsReplyFailed = commandFailed;
             }
+            if (command == RADIOLIB_LR2021_CMD_GET_RX_PKT_LENGTH) {
+                const unsigned occurrence = ++rxPacketLengthReads;
+                // LRxxxx checks the separate reply, not this zero-payload command transaction.
+                rxPacketLengthReplyPending = true;
+                rxPacketLengthReplyFailed = commandFailed;
+                rxPacketLengthReplyOverride =
+                    rxPacketLengthOverrideOccurrence != 0 && occurrence == rxPacketLengthOverrideOccurrence;
+            }
+            if (command == RADIOLIB_LR2021_CMD_GET_PACKET_TYPE)
+                packetTypeReplyPending = !commandFailed;
             if (command == RADIOLIB_LR2021_CMD_CLEAR_IRQ && length >= 6) {
                 uint32_t mask = (uint32_t(out[2]) << 24) | (uint32_t(out[3]) << 16) | (uint32_t(out[4]) << 8) | out[5];
                 irq &= ~mask;
@@ -187,7 +222,10 @@ class W12AdapterHal : public LockingArduinoHal
         if (length == 6 && std::all_of(out, out + length, [](uint8_t b) { return b == 0; })) {
             if (++irqReads == injectIrqAtRead)
                 signalReceive(irqOnRead);
-            in[0] = (rawStatusFailed || clearRxFifoStatusFailed) ? 0x02 : 0x04;
+            const unsigned rawStatusOccurrence = ++rawStatusReads;
+            const bool failThisRawStatus = rawStatusFailed || clearRxFifoStatusFailed ||
+                                           (failRawStatusOccurrence != 0 && rawStatusOccurrence == failRawStatusOccurrence);
+            in[0] = failThisRawStatus ? 0x02 : 0x04;
             in[1] = rawStatusMode;
             in[2] = irq >> 24;
             in[3] = irq >> 16;
@@ -209,6 +247,10 @@ class W12AdapterHal : public LockingArduinoHal
     bool errorsReplyPending = false;
     bool errorsReplyFailed = false;
     bool clearRxFifoStatusFailed = false;
+    bool packetTypeReplyPending = false;
+    bool rxPacketLengthReplyPending = false;
+    bool rxPacketLengthReplyFailed = false;
+    bool rxPacketLengthReplyOverride = false;
     void (*interruptCallback)() = nullptr;
 };
 
@@ -232,6 +274,10 @@ class TestableW12Adapter : public LR2021Interface
     uint32_t goodTransmits() const { return txGood; }
     uint16_t droppedTransmits() const { return txDrop; }
     int16_t changeCrc(uint8_t bytes) { return lora.setCRC(bytes); }
+    int16_t configureImplicitRxForTest(uint8_t len) { return lora.implicitHeader(len); }
+    int16_t configureExplicitRxForTest() { return lora.explicitHeader(); }
+    size_t driverPacketLengthForTest() { return lora.getPacketLength(); }
+    int16_t readDriverForTest(uint8_t *data, size_t len) { return lora.readData(data, len); }
     uint32_t driverDuration(size_t bytes) { return lora.getTimeOnAir(bytes); }
     void receiveInterrupt() { handleReceiveInterrupt(); }
     void transmitInterrupt() { handleTransmitInterrupt(); }
@@ -1700,6 +1746,10 @@ static void prepareAdapterReception()
     TEST_ASSERT_TRUE(adapter->queueTransmission(makeAdapterTransmission()));
     adapterHal->recording.transactions.clear();
     adapterHal->irqReads = 0;
+    adapterHal->rawStatusReads = 0;
+    adapterHal->failRawStatusOccurrence = 0;
+    adapterHal->rxPacketLengthReads = 0;
+    adapterHal->rxPacketLengthOverrideOccurrence = 0;
 }
 
 static void assertAdapterReceptionDeliveredOnce()
@@ -1734,6 +1784,261 @@ static void assertAdapterReceptionDeliveredOnce()
     assertAdapterSetRxTimeout();
     adapter->pollMissedIrqs();
     TEST_ASSERT_EQUAL_UINT32(1, adapterReceiver->packets.size());
+}
+
+static void assertAdapterRejectedRxWasCleanedUp()
+{
+    const size_t reads = adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_READ_RX_FIFO));
+    const size_t fifoClears = adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO));
+    const size_t irqClears = adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_CLEAR_IRQ));
+    TEST_ASSERT_EQUAL_UINT32(0, reads);
+    TEST_ASSERT_GREATER_THAN_UINT32(0, fifoClears);
+    TEST_ASSERT_GREATER_THAN_UINT32(0, irqClears);
+    const size_t clearFifoIndex = adapterTransactionIndex(op16(RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO), 1);
+    const size_t clearIrqIndex = adapterTransactionIndex(op16(RADIOLIB_LR2021_CMD_CLEAR_IRQ), 1);
+    TEST_ASSERT_TRUE(clearFifoIndex < clearIrqIndex);
+}
+
+static void prepareAdapterDriverFrame(uint16_t length)
+{
+    std::vector<uint8_t> frame(length + 2, 0x04);
+    for (uint16_t index = 0; index < length; ++index)
+        frame[index + 2] = static_cast<uint8_t>(0xA0 + index);
+    adapterHal->recording.reply(op16(RADIOLIB_LR2021_CMD_READ_RX_FIFO), 0, frame);
+}
+
+static void assertAdapterDriverReadLength(size_t length)
+{
+    const auto *read = adapterHal->recording.last(op16(RADIOLIB_LR2021_CMD_READ_RX_FIFO));
+    TEST_ASSERT_NOT_NULL(read);
+    TEST_ASSERT_EQUAL_UINT32(static_cast<uint32_t>(length + 2), static_cast<uint32_t>(read->size()));
+}
+
+static void assertAdapterDriverBytes(const uint8_t *data, size_t length)
+{
+    for (size_t index = 0; index < length; ++index)
+        TEST_ASSERT_EQUAL_HEX8(static_cast<uint8_t>(0xA0 + index), data[index]);
+}
+
+static void test_w12_lr2021_implicit_cached_length_preserves_driver_reads()
+{
+    constexpr uint8_t cachedLength = 5;
+    makeW12Adapter();
+    adapterHal->packetTypeOverrideEnabled = true;
+    adapterHal->packetTypeOverride = RADIOLIB_LR2021_PACKET_TYPE_LORA;
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_NONE, adapter->configureImplicitRxForTest(cachedLength));
+
+    adapterHal->recording.transactions.clear();
+    TEST_ASSERT_EQUAL_UINT32(cachedLength, adapter->driverPacketLengthForTest());
+    TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_GET_RX_PKT_LENGTH)));
+
+    prepareAdapterDriverFrame(cachedLength);
+    constexpr size_t requestedLengths[] = {0, 2, 8};
+    constexpr size_t readLengths[] = {cachedLength, 2, cachedLength};
+    for (size_t index = 0; index < sizeof(requestedLengths) / sizeof(requestedLengths[0]); ++index) {
+        adapterHal->recording.transactions.clear();
+        adapterHal->irq = RADIOLIB_LR2021_IRQ_RX_DONE;
+        uint8_t data[8] = {};
+        TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_NONE, adapter->readDriverForTest(data, requestedLengths[index]));
+        TEST_ASSERT_EQUAL_UINT32(0, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_GET_RX_PKT_LENGTH)));
+        assertAdapterDriverReadLength(readLengths[index]);
+        assertAdapterDriverBytes(data, readLengths[index]);
+    }
+}
+
+static void test_w12_lr2021_explicit_lora_prefix_preserves_driver_read()
+{
+    constexpr uint8_t actualLength = 5;
+    constexpr size_t requestedLength = 2;
+    makeW12Adapter();
+    adapterHal->packetTypeOverrideEnabled = true;
+    adapterHal->packetTypeOverride = RADIOLIB_LR2021_PACKET_TYPE_LORA;
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_NONE, adapter->configureExplicitRxForTest());
+    adapterHal->recording.reply(op16(RADIOLIB_LR2021_CMD_GET_RX_PKT_LENGTH), 0, {0x04, 0x04, 0, actualLength}, true);
+    prepareAdapterDriverFrame(actualLength);
+    adapterHal->recording.transactions.clear();
+    adapterHal->irq = RADIOLIB_LR2021_IRQ_RX_DONE | RADIOLIB_LR2021_IRQ_LORA_HEADER_VALID;
+
+    uint8_t data[actualLength] = {};
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_NONE, adapter->readDriverForTest(data, requestedLength));
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_GET_RX_PKT_LENGTH)));
+    assertAdapterDriverReadLength(requestedLength);
+    assertAdapterDriverBytes(data, requestedLength);
+}
+
+static void test_w12_lr2021_flrc_prefix_preserves_driver_read()
+{
+    constexpr uint8_t actualLength = 5;
+    constexpr size_t requestedLength = 2;
+    makeW12Adapter();
+    adapterHal->recording.reply(op16(RADIOLIB_LR2021_CMD_GET_RX_PKT_LENGTH), 0, {0x04, 0x04, 0, actualLength}, true);
+    prepareAdapterDriverFrame(actualLength);
+    adapterHal->recording.transactions.clear();
+    adapterHal->irq = RADIOLIB_LR2021_IRQ_RX_DONE;
+
+    uint8_t data[actualLength] = {};
+    TEST_ASSERT_EQUAL_INT16(RADIOLIB_ERR_NONE, adapter->readDriverForTest(data, requestedLength));
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_GET_RX_PKT_LENGTH)));
+    assertAdapterDriverReadLength(requestedLength);
+    assertAdapterDriverBytes(data, requestedLength);
+}
+
+// RadioLib 7.7.1 ignores a GET_RX_PKT_LENGTH error during its second lookup inside readData(),
+// then returns success after reading zero bytes. Pin the production receive path so that a stale
+// radioBuffer is rejected instead of delivered as a duplicate packet.
+static void test_w12_adapter_checked_rx_length_error_rejects_stale_buffer()
+{
+    makeW12Adapter();
+    prepareAdapterReception();
+
+    // Seed radioBuffer with a valid frame that the failed read could otherwise deliver again.
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    adapter->serviceNotifications();
+    TEST_ASSERT_EQUAL_UINT32(1, adapterReceiver->packets.size());
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->badReceives());
+
+    adapterHal->recording.transactions.clear();
+    adapterHal->failCommand = RADIOLIB_LR2021_CMD_GET_RX_PKT_LENGTH;
+    adapterHal->failCommandOccurrence = 2;
+    adapterHal->failCommandSeen = 0;
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    adapter->serviceNotifications();
+
+    TEST_ASSERT_EQUAL_UINT32(2, adapterHal->failCommandSeen);
+    TEST_ASSERT_EQUAL_UINT32(2, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_GET_RX_PKT_LENGTH)));
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->badReceives());
+    TEST_ASSERT_EQUAL_UINT32(1, adapterReceiver->packets.size());
+    TEST_ASSERT_TRUE(adapter->receiving());
+    assertAdapterRejectedRxWasCleanedUp();
+
+    // A later good frame must still use the newly checked path. The failed read must not leave
+    // the prior radioBuffer contents eligible for delivery, while a fresh FIFO read is valid.
+    adapterHal->failCommand = 0;
+    adapterHal->failCommandOccurrence = 0;
+    adapterHal->failCommandSeen = 0;
+    adapterHal->recording.transactions.clear();
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    adapter->serviceNotifications();
+    TEST_ASSERT_EQUAL_UINT32(2, adapterReceiver->packets.size());
+    TEST_ASSERT_EQUAL_HEX32(0x5678, adapterReceiver->packets[1].from);
+    TEST_ASSERT_EQUAL_HEX32(0x87654321, adapterReceiver->packets[1].id);
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->badReceives());
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_READ_RX_FIFO)));
+}
+
+static void runW12CheckedInnerLengthRecovery(uint16_t innerLength)
+{
+    makeW12Adapter();
+    prepareAdapterReception();
+
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    adapter->serviceNotifications();
+    TEST_ASSERT_EQUAL_UINT32(1, adapterReceiver->packets.size());
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->badReceives());
+
+    adapterHal->recording.transactions.clear();
+    adapterHal->rxPacketLengthReads = 0;
+    adapterHal->rxPacketLengthOverride = innerLength;
+    adapterHal->rxPacketLengthOverrideOccurrence = 2;
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    adapter->serviceNotifications();
+
+    // The outer length is the valid 19-byte frame. The second lookup is deliberately zero or
+    // shorter than that frame, so it must reject before any FIFO read can expose radioBuffer.
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(2, adapterHal->rxPacketLengthReads);
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->badReceives());
+    TEST_ASSERT_EQUAL_UINT32(1, adapterReceiver->packets.size());
+    TEST_ASSERT_TRUE(adapter->receiving());
+    assertAdapterRejectedRxWasCleanedUp();
+
+    adapterHal->rxPacketLengthReads = 0;
+    adapterHal->rxPacketLengthOverrideOccurrence = 0;
+    adapterHal->recording.transactions.clear();
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    adapter->serviceNotifications();
+    TEST_ASSERT_EQUAL_UINT32(2, adapterReceiver->packets.size());
+    TEST_ASSERT_EQUAL_HEX32(0x5678, adapterReceiver->packets[1].from);
+    TEST_ASSERT_EQUAL_HEX32(0x87654321, adapterReceiver->packets[1].id);
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->badReceives());
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_READ_RX_FIFO)));
+}
+
+static void test_w12_adapter_checked_inner_zero_length_rejects_and_recovers()
+{
+    runW12CheckedInnerLengthRecovery(0);
+}
+
+static void test_w12_adapter_checked_inner_short_length_rejects_and_recovers()
+{
+    runW12CheckedInnerLengthRecovery(static_cast<uint16_t>(sizeof(PacketHeader) + 1));
+}
+
+// The outer receive IRQ check succeeds, then RadioLib's readData() performs its own raw IRQ
+// status read. A command-status failure in that internal read must reject the frame and rearm RX
+// without exposing the previously delivered radioBuffer as a duplicate.
+static void test_w12_adapter_checked_internal_irq_status_failure_rejects_and_recovers()
+{
+    makeW12Adapter();
+    prepareAdapterReception();
+
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    adapter->serviceNotifications();
+    TEST_ASSERT_EQUAL_UINT32(1, adapterReceiver->packets.size());
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->badReceives());
+
+    adapterHal->recording.transactions.clear();
+    adapterHal->rawStatusReads = 0;
+    adapterHal->failRawStatusOccurrence = 2;
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    adapter->serviceNotifications();
+
+    // The first two raw status transactions are the outer validReceiveIrq() read and the
+    // internal readData() read. Re-arm may perform another status observation, so only the
+    // occurrence boundary is contractual here.
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(2, adapterHal->rawStatusReads);
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->badReceives());
+    TEST_ASSERT_EQUAL_UINT32(1, adapterReceiver->packets.size());
+    TEST_ASSERT_TRUE(adapter->receiving());
+    assertAdapterRejectedRxWasCleanedUp();
+
+    adapterHal->failRawStatusOccurrence = 0;
+    adapterHal->recording.transactions.clear();
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    adapter->serviceNotifications();
+    TEST_ASSERT_EQUAL_UINT32(2, adapterReceiver->packets.size());
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->badReceives());
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(1, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_READ_RX_FIFO)));
+}
+
+// Cleanup must continue to CLEAR_IRQ when the shared FIFO cleanup itself reports an SPI command
+// failure. The primary internal IRQ failure still rejects the frame and must not be replaced by
+// an accidental FIFO read or stale delivery.
+static void test_w12_adapter_internal_irq_failure_clears_irq_after_fifo_clear_failure()
+{
+    makeW12Adapter();
+    prepareAdapterReception();
+
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    adapter->serviceNotifications();
+    TEST_ASSERT_EQUAL_UINT32(1, adapterReceiver->packets.size());
+
+    adapterHal->recording.transactions.clear();
+    adapterHal->rawStatusReads = 0;
+    adapterHal->failRawStatusOccurrence = 2;
+    adapterHal->failCommand = RADIOLIB_LR2021_CMD_CLEAR_RX_FIFO;
+    adapterHal->failCommandOccurrence = 1;
+    adapterHal->failCommandSeen = 0;
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    adapter->serviceNotifications();
+
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(2, adapterHal->rawStatusReads);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(1, adapterHal->failCommandSeen);
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->badReceives());
+    TEST_ASSERT_EQUAL_UINT32(1, adapterReceiver->packets.size());
+    assertAdapterRejectedRxWasCleanedUp();
 }
 
 static void test_w12_adapter_busy_tx_delay_preserves_incoming_reception()
@@ -2822,6 +3127,9 @@ static void test_w12_adapter_default_gate_refuses_flrc_send_and_releases_packet(
 
 static void runW12AdapterTests()
 {
+    RUN_TEST(test_w12_lr2021_implicit_cached_length_preserves_driver_reads);
+    RUN_TEST(test_w12_lr2021_explicit_lora_prefix_preserves_driver_read);
+    RUN_TEST(test_w12_lr2021_flrc_prefix_preserves_driver_read);
     RUN_TEST(test_w12_adapter_rx_arm_uses_configured_fallback_and_expected_timeout);
     RUN_TEST(test_w12_adapter_rx_arm_fifo_clear_is_opt_in);
 #if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && defined(MESHTASTIC_W12_BENCHMARK_RX_TIMEOUT_MS)
@@ -2835,6 +3143,11 @@ static void runW12AdapterTests()
     RUN_TEST(test_w12_adapter_failed_rx_remains_offline_until_successful_rearm);
     RUN_TEST(test_w12_adapter_sensing_busy_and_failed_reads_defer_without_lora_cad);
     RUN_TEST(test_w12_adapter_terminal_rx_error_rejects_payload_and_rearms);
+    RUN_TEST(test_w12_adapter_checked_rx_length_error_rejects_stale_buffer);
+    RUN_TEST(test_w12_adapter_checked_inner_zero_length_rejects_and_recovers);
+    RUN_TEST(test_w12_adapter_checked_inner_short_length_rejects_and_recovers);
+    RUN_TEST(test_w12_adapter_checked_internal_irq_status_failure_rejects_and_recovers);
+    RUN_TEST(test_w12_adapter_internal_irq_failure_clears_irq_after_fifo_clear_failure);
     RUN_TEST(test_w12_adapter_failed_irq_status_keeps_channel_busy_and_rejects_stale_rx);
     RUN_TEST(test_w12_adapter_transmit_requires_tx_done_and_never_double_completes);
     RUN_TEST(test_w12_adapter_disabling_queued_tx_restores_receive);
