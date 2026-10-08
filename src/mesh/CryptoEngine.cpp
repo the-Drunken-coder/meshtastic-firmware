@@ -1,8 +1,11 @@
 #include "CryptoEngine.h"
+#include "RadioInterface.h"
 // #include "NodeDB.h"
 #include "aes-ccm.h"
 #include "architecture.h"
 #include <SHA256.h>
+#include <cstdint>
+#include <limits>
 #include <memory>
 
 #ifndef MESHTASTIC_W12_BENCHMARK_PKI_PRINT_BYTES
@@ -21,6 +24,74 @@
 #define MESHTASTIC_W12_PKI_SKIP_PRINT_BYTES 1
 #else
 #define MESHTASTIC_W12_PKI_SKIP_PRINT_BYTES 0
+#endif
+
+#if !(MESHTASTIC_EXCLUDE_PKI)
+namespace
+{
+constexpr size_t kPkiBatchProductionMaxPlaintext = 227;
+
+void pkiBatchSecureZero(void *memory, size_t length)
+{
+    volatile uint8_t *bytes = static_cast<volatile uint8_t *>(memory);
+    while (length--)
+        *bytes++ = 0;
+}
+
+bool pkiBatchRangesOverlap(const uint8_t *first, size_t firstLength, const uint8_t *second, size_t secondLength)
+{
+    if (first == nullptr || second == nullptr || firstLength == 0 || secondLength == 0)
+        return false;
+    const uintptr_t firstBegin = reinterpret_cast<uintptr_t>(first);
+    const uintptr_t secondBegin = reinterpret_cast<uintptr_t>(second);
+    const uintptr_t firstEnd = firstLength > std::numeric_limits<uintptr_t>::max() - firstBegin
+                                   ? std::numeric_limits<uintptr_t>::max()
+                                   : firstBegin + firstLength;
+    const uintptr_t secondEnd = secondLength > std::numeric_limits<uintptr_t>::max() - secondBegin
+                                    ? std::numeric_limits<uintptr_t>::max()
+                                    : secondBegin + secondLength;
+    return firstBegin < secondEnd && secondBegin < firstEnd;
+}
+
+struct PkiBatchOutputWipeGuard {
+    bool enabled;
+    uint8_t *output;
+    size_t capacity;
+    bool committed = false;
+
+    ~PkiBatchOutputWipeGuard()
+    {
+        if (enabled && !committed)
+            pkiBatchSecureZero(output, capacity);
+    }
+
+    void commit() { committed = true; }
+};
+} // namespace
+
+bool CryptoEngine::encryptPkiCcm(const uint8_t *key, size_t keyLen, const uint8_t *nonce, size_t nonceLen, size_t plainLen,
+                                 const uint8_t *plain, uint8_t *crypt, size_t cryptCapacity, uint8_t *auth, size_t authLen,
+                                 size_t authCapacity, size_t /*outputCapacity*/, bool batchRequested)
+{
+    if (batchRequested)
+        return false;
+    if (key == nullptr || keyLen != 32 || nonce == nullptr || nonceLen != 13 || plain == nullptr || crypt == nullptr ||
+        auth == nullptr || authLen != 8 || cryptCapacity < plainLen || authCapacity < authLen)
+        return false;
+    return aes_ccm_ae(key, keyLen, nonce, authLen, plain, plainLen, nullptr, 0, crypt, auth) == 0;
+}
+
+bool CryptoEngine::decryptPkiCcm(const uint8_t *key, size_t keyLen, const uint8_t *nonce, size_t nonceLen, size_t cryptLen,
+                                 const uint8_t *crypt, const uint8_t *auth, size_t authLen, uint8_t *plain, size_t plainCapacity,
+                                 bool batchRequested)
+{
+    if (batchRequested)
+        return false;
+    if (key == nullptr || keyLen != 32 || nonce == nullptr || nonceLen != 13 || crypt == nullptr || auth == nullptr ||
+        authLen != 8 || plain == nullptr || plainCapacity < cryptLen)
+        return false;
+    return aes_ccm_ad(key, keyLen, nonce, authLen, crypt, cryptLen, nullptr, 0, auth, plain);
+}
 #endif
 
 #if !(MESHTASTIC_EXCLUDE_PKI)
@@ -306,8 +377,21 @@ bool CryptoEngine::ensurePkiKeys(meshtastic_Config_SecurityConfig &security, mes
  */
 bool CryptoEngine::encryptCurve25519(uint32_t toNode, uint32_t fromNode, meshtastic_NodeInfoLite_public_key_t remotePublic,
                                      uint64_t packetNum, size_t numBytes, const uint8_t *bytes, uint8_t *bytesOut,
-                                     CcmTimingAggregate *timing)
+                                     CcmTimingAggregate *timing, size_t bytesOutCapacity)
 {
+    const bool batchRequested = timing != nullptr && pkiCcmBatchEnabled();
+    if (bytes == nullptr || bytesOut == nullptr || numBytes > std::numeric_limits<size_t>::max() - MESHTASTIC_PKC_OVERHEAD)
+        return false;
+    if (batchRequested) {
+        if (bytesOutCapacity == 0 || pkiBatchRangesOverlap(bytesOut, bytesOutCapacity, bytes, numBytes) ||
+            pkiBatchRangesOverlap(bytesOut, bytesOutCapacity, shared_key, sizeof(shared_key)) ||
+            pkiBatchRangesOverlap(bytesOut, bytesOutCapacity, nonce, sizeof(nonce)))
+            return false;
+    }
+    PkiBatchOutputWipeGuard batchFailureWipe{batchRequested, bytesOut, bytesOutCapacity};
+    if (batchRequested && (numBytes > kPkiBatchProductionMaxPlaintext || bytesOutCapacity < numBytes + MESHTASTIC_PKC_OVERHEAD))
+        return false;
+
     uint8_t *auth;
     // The extra nonce must be unpredictable: use the hardware RNG, falling back to the
     // seeded CSPRNG only when no hardware source is available.
@@ -336,11 +420,14 @@ bool CryptoEngine::encryptCurve25519(uint32_t toNode, uint32_t fromNode, meshtas
 #endif
     // A non-null aggregate is the explicit opt-in for one whole CCM primitive clock.
     const uint32_t ccmStartedAtUs = timing ? micros() : 0;
-    aes_ccm_ae(shared_key, 32, nonce, 8, bytes, numBytes, nullptr, 0, bytesOut, auth);
+    if (!encryptPkiCcm(shared_key, 32, nonce, 13, numBytes, bytes, bytesOut, numBytes, auth, 8, 8,
+                       batchRequested ? bytesOutCapacity : numBytes + MESHTASTIC_PKC_OVERHEAD, batchRequested))
+        return false;
     if (timing)
         timing->record(static_cast<uint32_t>(micros() - ccmStartedAtUs));
     memcpy((uint8_t *)(auth + 8), &extraNonceTmp,
            sizeof(uint32_t)); // do not use dereference on potential non aligned pointers : *extraNonce = extraNonceTmp;
+    batchFailureWipe.commit();
     return true;
 }
 
@@ -356,8 +443,25 @@ bool CryptoEngine::encryptCurve25519(uint32_t toNode, uint32_t fromNode, meshtas
  * @param bytesOut Output buffer to be populated with decrypted plaintext.
  */
 bool CryptoEngine::decryptCurve25519(uint32_t fromNode, meshtastic_NodeInfoLite_public_key_t remotePublic, uint64_t packetNum,
-                                     size_t numBytes, const uint8_t *bytes, uint8_t *bytesOut, CcmTimingAggregate *timing)
+                                     size_t numBytes, const uint8_t *bytes, uint8_t *bytesOut, CcmTimingAggregate *timing,
+                                     size_t bytesOutCapacity)
 {
+    const bool batchRequested = timing != nullptr && pkiCcmBatchEnabled();
+    if (bytes == nullptr || bytesOut == nullptr || numBytes < MESHTASTIC_PKC_OVERHEAD ||
+        numBytes > std::numeric_limits<size_t>::max() - MESHTASTIC_PKC_OVERHEAD)
+        return false;
+    if (batchRequested) {
+        if (bytesOutCapacity == 0 || numBytes > kPkiBatchProductionMaxPlaintext + MESHTASTIC_PKC_OVERHEAD ||
+            pkiBatchRangesOverlap(bytesOut, bytesOutCapacity, bytes, numBytes) ||
+            pkiBatchRangesOverlap(bytesOut, bytesOutCapacity, shared_key, sizeof(shared_key)) ||
+            pkiBatchRangesOverlap(bytesOut, bytesOutCapacity, nonce, sizeof(nonce)))
+            return false;
+    }
+    PkiBatchOutputWipeGuard batchFailureWipe{batchRequested, bytesOut, bytesOutCapacity};
+    if (batchRequested && bytesOutCapacity < numBytes - MESHTASTIC_PKC_OVERHEAD)
+        return false;
+
+    const size_t cryptLen = numBytes - MESHTASTIC_PKC_OVERHEAD;
     const uint8_t *auth = bytes + numBytes - 12; // set to last 8 bytes of text?
     uint32_t extraNonce;                         // pointer was not really used
     memcpy(&extraNonce, auth + 8,
@@ -384,10 +488,14 @@ bool CryptoEngine::decryptCurve25519(uint32_t fromNode, meshtastic_NodeInfoLite_
     }
 #endif
     const uint32_t ccmStartedAtUs = timing ? micros() : 0;
-    const bool result = aes_ccm_ad(shared_key, 32, nonce, 8, bytes, numBytes - 12, nullptr, 0, auth, bytesOut);
+    const bool result = decryptPkiCcm(shared_key, 32, nonce, 13, cryptLen, bytes, auth, 8, bytesOut,
+                                      batchRequested ? bytesOutCapacity : cryptLen, batchRequested);
     if (timing)
         timing->record(static_cast<uint32_t>(micros() - ccmStartedAtUs));
-    return result;
+    if (!result)
+        return false;
+    batchFailureWipe.commit();
+    return true;
 }
 
 // The label is domain separation only - it never needs to be secret. It is fixed length and

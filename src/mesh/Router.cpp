@@ -1014,8 +1014,8 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p, CcmTimingAggregate *ccmTimin
         // reach a node that has not yet learned their key. AES-CCM AEAD rejects wrong candidates.
         bool viaAdminKey = false;
         bool viaPendingKey = false;
-        if (haveRemoteKey &&
-            crypto->decryptCurve25519(p->from, remotePublic, p->id, rawSize, p->encrypted.bytes, bytes, ccmTiming)) {
+        if (haveRemoteKey && crypto->decryptCurve25519(p->from, remotePublic, p->id, rawSize, p->encrypted.bytes, bytes,
+                                                       ccmTiming, sizeof(bytes))) {
             decrypted = true;
             viaPendingKey = havePendingKey;
         }
@@ -1026,7 +1026,8 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p, CcmTimingAggregate *ccmTimin
                 remotePublic.size = 32;
                 memcpy(remotePublic.bytes, config.security.admin_key[i].bytes, 32);
 
-                if (crypto->decryptCurve25519(p->from, remotePublic, p->id, rawSize, p->encrypted.bytes, bytes, ccmTiming)) {
+                if (crypto->decryptCurve25519(p->from, remotePublic, p->id, rawSize, p->encrypted.bytes, bytes, ccmTiming,
+                                              sizeof(bytes))) {
                     decrypted = true;
                     viaAdminKey = true;
                     break; // stop after first successful decryption
@@ -1403,8 +1404,8 @@ meshtastic_Routing_Error perhapsEncode(meshtastic_MeshPacket *p)
             if (measureW12Encode)
                 ccmTiming = &ccmEncodeTiming;
 #endif
-            const bool encrypted =
-                crypto->encryptCurve25519(p->to, getFrom(p), destKey, p->id, numbytes, bytes, p->encrypted.bytes, ccmTiming);
+            const bool encrypted = crypto->encryptCurve25519(p->to, getFrom(p), destKey, p->id, numbytes, bytes,
+                                                             p->encrypted.bytes, ccmTiming, sizeof(p->encrypted.bytes));
 #if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
             if (measureW12Encode)
                 w12BenchmarkModule->onPkiCcmEncodeTiming(ccmEncodeTiming.count, ccmEncodeTiming.sumUs, ccmEncodeTiming.maxUs);
