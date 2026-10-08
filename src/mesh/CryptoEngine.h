@@ -143,14 +143,15 @@ class CryptoEngine
     // The remotePublic key parameter takes the public_key bytes container from
     // a stored node header. NodeInfoLite is the on-device storage type since
     // the slim refactor flattened UserLite into it.
-    // A non-null timing aggregate is the explicit experimental PKI CCM batch selection. Selected callers must
-    // provide the complete output capacity, including ciphertext, tag, and extraNonce.
+    // Timing measures the generic or selected CCM primitive. Selected batch callers must provide the complete output
+    // capacity, including ciphertext, tag, and extraNonce.
     virtual bool encryptCurve25519(uint32_t toNode, uint32_t fromNode, meshtastic_NodeInfoLite_public_key_t remotePublic,
                                    uint64_t packetNum, size_t numBytes, const uint8_t *bytes, uint8_t *bytesOut,
-                                   CcmTimingAggregate *timing = nullptr, size_t bytesOutCapacity = 0);
+                                   CcmTimingAggregate *timing = nullptr, size_t bytesOutCapacity = 0,
+                                   bool usePkiCcmBatch = false);
     virtual bool decryptCurve25519(uint32_t fromNode, meshtastic_NodeInfoLite_public_key_t remotePublic, uint64_t packetNum,
                                    size_t numBytes, const uint8_t *bytes, uint8_t *bytesOut, CcmTimingAggregate *timing = nullptr,
-                                   size_t bytesOutCapacity = 0);
+                                   size_t bytesOutCapacity = 0, bool usePkiCcmBatch = false);
     virtual bool encryptPkiCcm(const uint8_t *key, size_t keyLen, const uint8_t *nonce, size_t nonceLen, size_t plainLen,
                                const uint8_t *plain, uint8_t *crypt, size_t cryptCapacity, uint8_t *auth, size_t authLen,
                                size_t authCapacity, size_t outputCapacity, bool batchRequested);
