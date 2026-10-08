@@ -482,6 +482,13 @@ void RadioLibInterface::abortW12BurstToNormal()
 {
     const bool staleGuardEventMayRemain = w12Burst.timerPending;
     if (w12Burst.active || w12Burst.timerPending) {
+        if (sendingPacket) {
+            // Ending the producer window cancels future burst scheduling, not the physical
+            // frame already in flight. Its normal completion validates TX_DONE, rearms RX,
+            // and drains admitted packets through ordinary scheduling.
+            cancelW12Burst();
+            return;
+        }
         finishW12BurstToNormal();
         // finishW12BurstToNormal() schedules the ordinary timer after the
         // dedicated one-slot event has been cancelled from state. The event

@@ -2086,6 +2086,71 @@ static void test_w12_burst_null_tx_overwrite_restores_ordinary_timer()
     TEST_ASSERT_EQUAL_UINT32(2, adapter->goodTransmits());
 }
 
+// End the real owner window during frame two of a burst. Physical completion remains
+// owned by the TX IRQ, while already-admitted packets drain without another burst guard.
+static void assertW12BurstRunEndDrainsActiveTransmission(bool deadline)
+{
+    makeW12BurstOwnerFixture();
+    const auto liveBefore = packetPoolLiveBytes();
+    for (unsigned i = 0; i < 3; ++i)
+        TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+    adapterHal->irqOnSetTx = RADIOLIB_LR2021_IRQ_TX_DONE;
+    adapter->serviceNotifications();
+    adapter->serviceNotifications(); // frame one completes and arms the burst guard
+    TEST_ASSERT_TRUE(adapter->burstTimerPendingForTest());
+    adapterHal->irqOnSetTx = 0;
+    adapter->serviceNotifications(); // frame two is physically active, without a completion IRQ
+    TEST_ASSERT_TRUE(adapter->isSending());
+    const auto *activePacket = adapter->sendingForTest();
+    const auto rxArms = adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX));
+    if (deadline) {
+        Time::advanceTestMillis(adapterBurstRun().durationMs + 1);
+        adapterDiagnostics->runOnce();
+    } else {
+        TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                              static_cast<int>(sendAdapterBurstControl(W12BenchmarkModule::Op::STOP)));
+    }
+
+    TEST_ASSERT_FALSE(adapterDiagnostics->getStats().running);
+    TEST_ASSERT_TRUE(adapterDiagnostics->getStats().complete);
+    TEST_ASSERT_TRUE(adapter->isSending());
+    TEST_ASSERT_EQUAL_PTR(activePacket, adapter->sendingForTest());
+    TEST_ASSERT_FALSE(adapter->burstTimerPendingForTest());
+    TEST_ASSERT_EQUAL_UINT32(rxArms, adapterHal->recording.count(op16(RADIOLIB_LR2021_CMD_SET_RX)));
+    TEST_ASSERT_EQUAL_UINT32(0, adapterDiagnostics->getStats().txFailures);
+    const auto guardsAtStop = adapterDiagnostics->getPreSendAttributionDiagnostics().burstArmed;
+
+    // The normal completion path owns the current frame and returns to RX. The remaining
+    // admitted frame then drains through normal scheduling, without extending the burst.
+    adapterHal->irq = RADIOLIB_LR2021_IRQ_TX_DONE;
+    TEST_ASSERT_TRUE(adapter->queueTxNotificationForTest());
+    adapter->serviceNotifications();
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(2, adapterDiagnostics->getStats().txSucceeded);
+    adapterHal->irqOnSetTx = RADIOLIB_LR2021_IRQ_TX_DONE;
+    for (unsigned i = 0; i < 8 && adapterDiagnostics->getStats().txSucceeded < 3; ++i)
+        adapter->serviceNotifications();
+    TEST_ASSERT_EQUAL_UINT32(3, adapterDiagnostics->getStats().txSucceeded);
+    TEST_ASSERT_EQUAL_UINT32(0, adapterDiagnostics->getStats().txFailures);
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->packetsInTxQueue());
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_TRUE(adapter->receiving());
+    TEST_ASSERT_EQUAL_UINT32(guardsAtStop, adapterDiagnostics->getPreSendAttributionDiagnostics().burstArmed);
+    TEST_ASSERT_EQUAL_UINT32(3, adapterDiagnostics->getDiagnostics().txTerminal);
+    TEST_ASSERT_EQUAL_INT32(liveBefore, packetPoolLiveBytes());
+}
+
+static void test_w12_burst_stop_drains_active_transmission_before_normal_queue()
+{
+    assertW12BurstRunEndDrainsActiveTransmission(false);
+}
+
+static void test_w12_burst_deadline_drains_active_transmission_before_normal_queue()
+{
+    assertW12BurstRunEndDrainsActiveTransmission(true);
+}
+
 // STOP/deadline aborts clear the in-memory burst state before the one-slot
 // guarded event can be cancelled. Its stale dispatch must repair the ordinary
 // timer, while explicit standby must consume the same stale event without
@@ -2415,6 +2480,8 @@ static void runW12AdapterTests()
     RUN_TEST(test_w12_burst_null_tx_overwrite_restores_ordinary_timer);
     RUN_TEST(test_w12_burst_standby_release_hook_reconfigure_stays_standby);
     RUN_TEST(test_w12_burst_stop_and_standby_stale_events_preserve_normal_send);
+    RUN_TEST(test_w12_burst_stop_drains_active_transmission_before_normal_queue);
+    RUN_TEST(test_w12_burst_deadline_drains_active_transmission_before_normal_queue);
     RUN_TEST(test_w12_burst_pre_tx_defer_and_drop_preserve_hook_ownership);
     RUN_TEST(test_w12_burst_pending_tx_done_is_drained_without_rearming);
     RUN_TEST(test_w12_burst_reconfigure_consumes_stale_event_before_ordinary_send);
