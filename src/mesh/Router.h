@@ -276,7 +276,7 @@ struct CcmTimingAggregate;
  *
  * @return true for success, false for corrupt packet.
  */
-DecodeState perhapsDecode(meshtastic_MeshPacket *p, CcmTimingAggregate *ccmTiming = nullptr);
+DecodeState perhapsDecode(meshtastic_MeshPacket *p, CcmTimingAggregate *ccmTiming = nullptr, bool usePkiCcmBatch = false);
 
 /** Apply receive authentication before routing state mutation; unknown-channel packets may remain opaque relay-only. */
 RoutingAuthVerdict passesRoutingAuthGate(meshtastic_MeshPacket *p);

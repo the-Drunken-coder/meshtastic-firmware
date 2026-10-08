@@ -17,7 +17,7 @@
 #endif
 
 // Keep the current formatting path unless the W12 phase/benchmark diagnostic is explicitly
-// enabled and the caller supplied the opt-in CCM aggregate. Value 0 is the skip-formatting arm.
+// enabled and the caller supplied a timing aggregate. Value 0 is the skip-formatting arm.
 #if defined(MESHTASTIC_W12_BENCHMARK_PHASE_TIMING) && MESHTASTIC_W12_BENCHMARK_PHASE_TIMING &&                                   \
     ((defined(MESHTASTIC_W12_BENCHMARK) && MESHTASTIC_W12_BENCHMARK) || defined(PIO_UNIT_TESTING)) &&                            \
     !MESHTASTIC_W12_BENCHMARK_PKI_PRINT_BYTES
@@ -377,9 +377,9 @@ bool CryptoEngine::ensurePkiKeys(meshtastic_Config_SecurityConfig &security, mes
  */
 bool CryptoEngine::encryptCurve25519(uint32_t toNode, uint32_t fromNode, meshtastic_NodeInfoLite_public_key_t remotePublic,
                                      uint64_t packetNum, size_t numBytes, const uint8_t *bytes, uint8_t *bytesOut,
-                                     CcmTimingAggregate *timing, size_t bytesOutCapacity)
+                                     CcmTimingAggregate *timing, size_t bytesOutCapacity, bool usePkiCcmBatch)
 {
-    const bool batchRequested = timing != nullptr && pkiCcmBatchEnabled();
+    const bool batchRequested = usePkiCcmBatch && pkiCcmBatchEnabled();
     if (bytes == nullptr || bytesOut == nullptr || numBytes > std::numeric_limits<size_t>::max() - MESHTASTIC_PKC_OVERHEAD)
         return false;
     if (batchRequested) {
@@ -444,9 +444,9 @@ bool CryptoEngine::encryptCurve25519(uint32_t toNode, uint32_t fromNode, meshtas
  */
 bool CryptoEngine::decryptCurve25519(uint32_t fromNode, meshtastic_NodeInfoLite_public_key_t remotePublic, uint64_t packetNum,
                                      size_t numBytes, const uint8_t *bytes, uint8_t *bytesOut, CcmTimingAggregate *timing,
-                                     size_t bytesOutCapacity)
+                                     size_t bytesOutCapacity, bool usePkiCcmBatch)
 {
-    const bool batchRequested = timing != nullptr && pkiCcmBatchEnabled();
+    const bool batchRequested = usePkiCcmBatch && pkiCcmBatchEnabled();
     if (bytes == nullptr || bytesOut == nullptr || numBytes < MESHTASTIC_PKC_OVERHEAD ||
         numBytes > std::numeric_limits<size_t>::max() - MESHTASTIC_PKC_OVERHEAD)
         return false;

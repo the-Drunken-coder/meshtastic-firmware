@@ -436,7 +436,7 @@ bool checkCurveWrapperCapacityAndWire()
     inactiveOutput.fill(0xa5);
     CcmTimingAggregate inactiveTiming;
     if (inactive.decryptCurve25519(fromNode, publicKey, packetNum, knownWire.size(), knownWire.data(), inactiveOutput.data(),
-                                   &inactiveTiming, inactiveOutput.size()) ||
+                                   &inactiveTiming, inactiveOutput.size(), true) ||
         !allZero(inactiveOutput.data(), inactiveOutput.size()))
         return false;
 
@@ -449,7 +449,7 @@ bool checkCurveWrapperCapacityAndWire()
     rejectedOutput.fill(0xa5);
     CcmTimingAggregate rejectedTiming;
     if (engine.decryptCurve25519(fromNode, missingPublicKey, packetNum, knownWire.size(), knownWire.data(), rejectedOutput.data(),
-                                 &rejectedTiming, rejectedOutput.size()) ||
+                                 &rejectedTiming, rejectedOutput.size(), true) ||
         !allZero(rejectedOutput.data(), rejectedOutput.size()))
         return false;
 
@@ -457,7 +457,7 @@ bool checkCurveWrapperCapacityAndWire()
     decrypted.fill(0xa5);
     CcmTimingAggregate decodeTiming;
     if (!engine.decryptCurve25519(fromNode, publicKey, packetNum, knownWire.size(), knownWire.data(), decrypted.data(),
-                                  &decodeTiming, decrypted.size()) ||
+                                  &decodeTiming, decrypted.size(), true) ||
         decodeTiming.count != 1 || std::memcmp(decrypted.data(), expectedPlaintext.data(), expectedPlaintext.size()) != 0)
         return false;
 
@@ -471,7 +471,7 @@ bool checkCurveWrapperCapacityAndWire()
     undersized.fill(0xa5);
     CcmTimingAggregate undersizedTiming;
     if (engine.decryptCurve25519(fromNode, publicKey, packetNum, knownWire.size(), knownWire.data(), undersized.data(),
-                                 &undersizedTiming, undersized.size()) ||
+                                 &undersizedTiming, undersized.size(), true) ||
         !std::all_of(undersized.begin(), undersized.end(), [](std::uint8_t value) { return value == 0; }))
         return false;
 
@@ -480,14 +480,14 @@ bool checkCurveWrapperCapacityAndWire()
     const auto decryptAliasBefore = decryptAlias;
     CcmTimingAggregate decryptAliasTiming;
     if (engine.decryptCurve25519(fromNode, publicKey, packetNum, knownWire.size(), decryptAlias.data(), decryptAlias.data(),
-                                 &decryptAliasTiming, decryptAlias.size()) ||
+                                 &decryptAliasTiming, decryptAlias.size(), true) ||
         decryptAlias != decryptAliasBefore)
         return false;
 
     std::array<std::uint8_t, 128> encrypted = {0};
     CcmTimingAggregate encodeTiming;
     if (!engine.encryptCurve25519(0, fromNode, publicKey, packetNum, expectedPlaintext.size(), expectedPlaintext.data(),
-                                  encrypted.data(), &encodeTiming, encrypted.size()))
+                                  encrypted.data(), &encodeTiming, encrypted.size(), true))
         return false;
     std::uint32_t encryptedExtraNonce = 0;
     std::memcpy(&encryptedExtraNonce, encrypted.data() + expectedPlaintext.size() + pki_ccm_batch::kTagBytes,
@@ -500,7 +500,7 @@ bool checkCurveWrapperCapacityAndWire()
     const auto encryptAliasBefore = encryptAlias;
     CcmTimingAggregate encryptAliasTiming;
     if (engine.encryptCurve25519(0, fromNode, publicKey, packetNum, expectedPlaintext.size(), encryptAlias.data(),
-                                 encryptAlias.data(), &encryptAliasTiming, encryptAlias.size()) ||
+                                 encryptAlias.data(), &encryptAliasTiming, encryptAlias.size(), true) ||
         encryptAlias != encryptAliasBefore)
         return false;
 
@@ -508,7 +508,7 @@ bool checkCurveWrapperCapacityAndWire()
     roundTrip.fill(0xa5);
     CcmTimingAggregate roundTripTiming;
     if (!engine.decryptCurve25519(fromNode, publicKey, packetNum, expectedPlaintext.size() + pki_ccm_batch::kWireOverhead,
-                                  encrypted.data(), roundTrip.data(), &roundTripTiming, roundTrip.size()) ||
+                                  encrypted.data(), roundTrip.data(), &roundTripTiming, roundTrip.size(), true) ||
         std::memcmp(roundTrip.data(), expectedPlaintext.data(), expectedPlaintext.size()) != 0)
         return false;
 
@@ -516,7 +516,7 @@ bool checkCurveWrapperCapacityAndWire()
     roundTrip.fill(0xa5);
     CcmTimingAggregate tamperedTiming;
     return !engine.decryptCurve25519(fromNode, publicKey, packetNum, expectedPlaintext.size() + pki_ccm_batch::kWireOverhead,
-                                     encrypted.data(), roundTrip.data(), &tamperedTiming, roundTrip.size()) &&
+                                     encrypted.data(), roundTrip.data(), &tamperedTiming, roundTrip.size(), true) &&
            allZero(roundTrip.data(), roundTrip.size());
 }
 

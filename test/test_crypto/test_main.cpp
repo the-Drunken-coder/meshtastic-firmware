@@ -219,7 +219,7 @@ void test_PKC_optional_ccm_timing_preserves_known_answer_behavior(void)
 
     CcmTimingAggregate decodeTiming;
     TEST_ASSERT_TRUE(crypto->decryptCurve25519(fromNode, public_key, packetNum, 22, radioBytes + 16, decrypted, &decodeTiming,
-                                               sizeof(decrypted)));
+                                               sizeof(decrypted), false));
     TEST_ASSERT_EQUAL_UINT32(1, decodeTiming.count);
     TEST_ASSERT_TRUE(decodeTiming.sumUs >= decodeTiming.maxUs);
     TEST_ASSERT_EQUAL_MEMORY(expected_decrypted, decrypted, 10);
@@ -227,20 +227,92 @@ void test_PKC_optional_ccm_timing_preserves_known_answer_behavior(void)
     uint8_t encrypted[128] __attribute__((__aligned__));
     CcmTimingAggregate encodeTiming;
     TEST_ASSERT_TRUE(crypto->encryptCurve25519(0, fromNode, public_key, packetNum, 10, decrypted, encrypted, &encodeTiming,
-                                               sizeof(encrypted)));
+                                               sizeof(encrypted), false));
     TEST_ASSERT_EQUAL_UINT32(1, encodeTiming.count);
     TEST_ASSERT_TRUE(encodeTiming.sumUs >= encodeTiming.maxUs);
 
     uint8_t roundTrip[128] __attribute__((__aligned__));
     TEST_ASSERT_TRUE(
-        crypto->decryptCurve25519(fromNode, public_key, packetNum, 22, encrypted, roundTrip, nullptr, sizeof(roundTrip)));
+        crypto->decryptCurve25519(fromNode, public_key, packetNum, 22, encrypted, roundTrip, nullptr, sizeof(roundTrip), false));
     TEST_ASSERT_EQUAL_MEMORY(expected_decrypted, roundTrip, 10);
     encrypted[0] ^= 1;
-    TEST_ASSERT_FALSE(
-        crypto->decryptCurve25519(fromNode, public_key, packetNum, 22, encrypted, roundTrip, &decodeTiming, sizeof(roundTrip)));
+    TEST_ASSERT_FALSE(crypto->decryptCurve25519(fromNode, public_key, packetNum, 22, encrypted, roundTrip, &decodeTiming,
+                                                sizeof(roundTrip), false));
     TEST_ASSERT_EQUAL_UINT32(2, decodeTiming.count);
     TEST_ASSERT_TRUE(decodeTiming.sumUs >= decodeTiming.maxUs);
 }
+
+#if defined(PIO_UNIT_TESTING) && !(MESHTASTIC_EXCLUDE_PKI)
+namespace
+{
+
+class PkiCcmSelectionProbe final : public CryptoEngine
+{
+  public:
+    bool pkiCcmBatchEnabled() const override { return true; }
+
+    bool encryptPkiCcm(const uint8_t *key, size_t keyLen, const uint8_t *nonce, size_t nonceLen, size_t plainLen,
+                       const uint8_t *plain, uint8_t *crypt, size_t cryptCapacity, uint8_t *auth, size_t authLen,
+                       size_t authCapacity, size_t outputCapacity, bool batchRequested) override
+    {
+        encryptBatchRequested = batchRequested;
+        return CryptoEngine::encryptPkiCcm(key, keyLen, nonce, nonceLen, plainLen, plain, crypt, cryptCapacity, auth, authLen,
+                                           authCapacity, outputCapacity, false);
+    }
+
+    bool decryptPkiCcm(const uint8_t *key, size_t keyLen, const uint8_t *nonce, size_t nonceLen, size_t cryptLen,
+                       const uint8_t *crypt, const uint8_t *auth, size_t authLen, uint8_t *plain, size_t plainCapacity,
+                       bool batchRequested) override
+    {
+        decryptBatchRequested = batchRequested;
+        return CryptoEngine::decryptPkiCcm(key, keyLen, nonce, nonceLen, cryptLen, crypt, auth, authLen, plain, plainCapacity,
+                                           false);
+    }
+
+    bool encryptBatchRequested = false;
+    bool decryptBatchRequested = false;
+};
+
+} // namespace
+
+// Timing instrumentation must not select the experimental backend by itself. This guards ordinary packet timing from
+// inheriting batch-only capacity and aliasing rules when a caller has not opted in.
+void test_PKC_backend_selection_is_explicit(void)
+{
+    uint8_t private_key[32];
+    meshtastic_NodeInfoLite_public_key_t public_key;
+    uint8_t radioBytes[128] __attribute__((__aligned__));
+    uint8_t decrypted[128] __attribute__((__aligned__));
+    uint8_t encrypted[128] __attribute__((__aligned__));
+
+    const uint32_t fromNode = 0x0929;
+    const uint64_t packetNum = 0x13b2d662;
+    HexToBytes(public_key.bytes, "db18fc50eea47f00251cb784819a3cf5fc361882597f589f0d7ff820e8064457");
+    public_key.size = 32;
+    HexToBytes(private_key, "a00330633e63522f8a4d81ec6d9d1e6617f6c8ffd3a4c698229537d44e522277");
+    HexToBytes(radioBytes, "8c646d7a2909000062d6b2136b00000040df24abfcc30a17a3d9046726099e796a1c036a792b");
+
+    PkiCcmSelectionProbe engine;
+    engine.setDHPrivateKey(private_key);
+    CcmTimingAggregate genericTiming;
+    TEST_ASSERT_TRUE(engine.decryptCurve25519(fromNode, public_key, packetNum, 22, radioBytes + 16, decrypted, &genericTiming,
+                                              sizeof(decrypted)));
+    TEST_ASSERT_FALSE(engine.decryptBatchRequested);
+    TEST_ASSERT_EQUAL_UINT32(1, genericTiming.count);
+
+    CcmTimingAggregate selectedEncodeTiming;
+    TEST_ASSERT_TRUE(engine.encryptCurve25519(0, fromNode, public_key, packetNum, 10, decrypted, encrypted, &selectedEncodeTiming,
+                                              sizeof(encrypted), true));
+    TEST_ASSERT_TRUE(engine.encryptBatchRequested);
+    TEST_ASSERT_EQUAL_UINT32(1, selectedEncodeTiming.count);
+
+    CcmTimingAggregate selectedDecodeTiming;
+    TEST_ASSERT_TRUE(engine.decryptCurve25519(fromNode, public_key, packetNum, 22, encrypted, decrypted, &selectedDecodeTiming,
+                                              sizeof(decrypted), true));
+    TEST_ASSERT_TRUE(engine.decryptBatchRequested);
+    TEST_ASSERT_EQUAL_UINT32(1, selectedDecodeTiming.count);
+}
+#endif
 
 #if defined(PIO_UNIT_TESTING) &&                                                                                                 \
     ((defined(ARCH_ESP32) && !(MESHTASTIC_EXCLUDE_PKI) && defined(MESHTASTIC_ESP32_PKI_CCM_BATCH) &&                             \
@@ -1096,6 +1168,9 @@ void setup()
     RUN_TEST(test_AES_CCM_rfc3610);
     RUN_TEST(test_PKC);
     RUN_TEST(test_PKC_optional_ccm_timing_preserves_known_answer_behavior);
+#if defined(PIO_UNIT_TESTING) && !(MESHTASTIC_EXCLUDE_PKI)
+    RUN_TEST(test_PKC_backend_selection_is_explicit);
+#endif
     RUN_TEST(test_XEdDSA);
     RUN_TEST(test_XEdDSA_layout_is_unambiguous);
     RUN_TEST(test_XEdDSA_cross_key_reject);
