@@ -58,7 +58,8 @@
           "STOP": 3,
           "SNAPSHOT": 4,
           "SNAPSHOT_DIAGNOSTICS": 5,
-          "SNAPSHOT_RADIO_DIAGNOSTICS": 6
+          "SNAPSHOT_RADIO_DIAGNOSTICS": 6,
+          "SNAPSHOT_RADIO_GAPS": 10
         }
       ],
       [
@@ -1204,5 +1205,14 @@
     "counter_rules": "All counts, sums, maxima, ages, and buckets are u32 and saturate at UINT32_MAX. Phase durations use micros() and unsigned wrap subtraction. RX buckets use the explicit START timestamp, independently of the receiver's first-authenticated-frame timing window. Chip status is observed only from the existing successful one-second RX poll and does not assert hardware state.",
     "poll_rules": "The one-second poll reports only the raw IRQ read already performed by receiveIrqPending(). No additional SPI read is made. TX polling exposes only the existing boolean check result, never an invented RadioLib error code. Successful LR2021 IRQ status bytes data[0..1] are retained alongside IRQ data[2..5].",
     "state_rules": "Snapshot state is the software's published isReceiving/rxOffline/IRQ attachment state. It is not a hardware RX assertion. IRQ GPIO is unavailable because this path does not already read it. No ISR performs logging, allocation, module calls, or diagnostic counter updates."
+  },
+  "owner_radio_gaps": {
+    "protocol_file": "radio-gaps-protocol.json",
+    "operation": 10,
+    "kind": 8,
+    "bytes": 112,
+    "source": "OWNER_NOTIFY",
+    "requires_phase_timing": true,
+    "scope": "owner software service intervals; no physical RX_DONE, SET_TX, RF guard margin or collision claim"
   }
 }

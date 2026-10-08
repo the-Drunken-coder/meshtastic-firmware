@@ -570,6 +570,29 @@ static AdapterPreSendAttributionReply takeAdapterPreSendAttributionReply()
     return result;
 }
 
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+struct AdapterRadioGapsReply {
+    uint8_t bytes[W12BenchmarkModule::RADIO_GAPS_REPORT_BYTES] = {};
+};
+
+static uint32_t adapterRadioGapsU32(const AdapterRadioGapsReply &reply, size_t offset)
+{
+    return uint32_t(reply.bytes[offset]) | (uint32_t(reply.bytes[offset + 1]) << 8) | (uint32_t(reply.bytes[offset + 2]) << 16) |
+           (uint32_t(reply.bytes[offset + 3]) << 24);
+}
+
+static AdapterRadioGapsReply takeAdapterRadioGapsReply()
+{
+    auto *reply = adapterDiagnostics->allocReply();
+    TEST_ASSERT_NOT_NULL(reply);
+    TEST_ASSERT_EQUAL_UINT(W12BenchmarkModule::RADIO_GAPS_REPORT_BYTES, reply->decoded.payload.size);
+    AdapterRadioGapsReply result;
+    memcpy(result.bytes, reply->decoded.payload.bytes, sizeof(result.bytes));
+    packetPool.release(reply);
+    return result;
+}
+#endif
+
 static uint16_t adapterPreSendU16(const AdapterPreSendAttributionReply &reply, size_t offset)
 {
     return uint16_t(reply.bytes[offset]) | (uint16_t(reply.bytes[offset + 1]) << 8);
@@ -608,6 +631,7 @@ static void prepareAdapterDiagnosticReceiverWindow()
 }
 
 static meshtastic_MeshPacket *makeAdapterTransmission();
+static void prepareAdapterReception();
 #endif
 
 static AirTime *savedAdapterAirTime;
@@ -1064,6 +1088,47 @@ static void test_w12_adapter_radio_diagnostic_software_irq_state_tracks_standby_
     adapter->armReceive();
     TEST_ASSERT_EQUAL_UINT32(0x15, adapter->getW12DiagnosticRadioState());
 }
+
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+// A real RX_DONE notification must pass through the RadioLib adapter's read, queue, and RX
+// rearm path before the owner gap page records one valid sample.
+static void test_w12_adapter_owner_gap_rx_done_notification_records_rearm()
+{
+    makeW12AdapterWithDiagnostics();
+    prepareAdapterReception();
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    adapter->serviceNotifications();
+
+    const auto gaps = adapterDiagnostics->getRadioGapDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(1, adapterReceiver->packets.size());
+    TEST_ASSERT_EQUAL_UINT32(1, gaps.rxNotifications);
+    TEST_ASSERT_EQUAL_UINT32(1, gaps.rxValidDone);
+    TEST_ASSERT_EQUAL_UINT32(0, gaps.rxInvalid);
+    TEST_ASSERT_EQUAL_UINT32(0, gaps.rxArmFailures);
+    TEST_ASSERT_EQUAL_UINT32(1, gaps.ownerRxNotifyToRearmUs.count);
+    TEST_ASSERT_TRUE(adapter->receiving());
+}
+
+// A frame that was read successfully but cannot rearm RX is an invalid owner sample. It must
+// keep the read delivery while excluding the failed rearm from the timing metric.
+static void test_w12_adapter_owner_gap_rx_rearm_failure_is_invalid_without_sample()
+{
+    makeW12AdapterWithDiagnostics();
+    prepareAdapterReception();
+    adapterHal->failCommand = RADIOLIB_LR2021_CMD_SET_RX;
+    adapterHal->signalReceive(RADIOLIB_LR2021_IRQ_RX_DONE);
+    adapter->serviceNotifications();
+
+    const auto gaps = adapterDiagnostics->getRadioGapDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(1, adapterReceiver->packets.size());
+    TEST_ASSERT_EQUAL_UINT32(1, gaps.rxNotifications);
+    TEST_ASSERT_EQUAL_UINT32(1, gaps.rxValidDone);
+    TEST_ASSERT_EQUAL_UINT32(1, gaps.rxArmFailures);
+    TEST_ASSERT_EQUAL_UINT32(1, gaps.rxInvalid);
+    TEST_ASSERT_EQUAL_UINT32(0, gaps.ownerRxNotifyToRearmUs.count);
+    TEST_ASSERT_TRUE(adapter->isOffline());
+}
+#endif
 #endif
 
 static void test_w12_adapter_recovery_preserves_active_flrc_and_rearms_rx()
@@ -1890,6 +1955,114 @@ static void test_w12_burst_owned_start_failure_records_exact_stage_and_success_k
     TEST_ASSERT_EQUAL_UINT8(failed.failedTxLastStage, after.failedTxLastStage);
     TEST_ASSERT_EQUAL_INT16(failed.failedTxLastRadioResult, after.failedTxLastRadioResult);
 }
+
+// Two admitted owner packets must use the real RadioLib TX_DONE poll/notification path. The
+// second frame is drained by STOP, so its completion is observed before the owner slot releases.
+static void test_w12_burst_owner_gap_pairs_real_tx_done_with_next_start_and_drains_stop()
+{
+    makeW12BurstOwnerFixture();
+    for (unsigned i = 0; i < 2; ++i)
+        TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+
+    adapterHal->irqOnSetTx = 0;
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->isSending());
+
+    adapterHal->irq = RADIOLIB_LR2021_IRQ_TX_DONE;
+    adapter->serviceNotifications(); // The production poll discovers TX_DONE.
+    adapter->serviceNotifications(); // The production ISR_TX notification completes frame one.
+    TEST_ASSERT_FALSE(adapter->isSending());
+    TEST_ASSERT_TRUE(adapter->burstTimerPendingForTest());
+
+    adapter->serviceNotifications(); // The guarded owner handoff starts frame two.
+    TEST_ASSERT_TRUE(adapter->isSending());
+
+    adapterHal->irq = RADIOLIB_LR2021_IRQ_TX_DONE;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterBurstControl(W12BenchmarkModule::Op::STOP)));
+    adapter->stop(); // Standby drains the pending poll and its ISR_TX before forced completion.
+
+    const auto gaps = adapterDiagnostics->getRadioGapDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(1, gaps.ownerTxNotifyToStartTransmitCallUs.count);
+    TEST_ASSERT_EQUAL_UINT32(2, gaps.txValidDone);
+    TEST_ASSERT_EQUAL_UINT32(1, gaps.txUnpaired);
+    TEST_ASSERT_EQUAL_UINT32(0, gaps.txStartFailures);
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->packetsInTxQueue());
+    TEST_ASSERT_FALSE(adapter->isSending());
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterBurstControl(W12BenchmarkModule::Op::SNAPSHOT_RADIO_GAPS)));
+    const auto wire = takeAdapterRadioGapsReply();
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(W12BenchmarkModule::Kind::OWNER_RADIO_GAPS), wire.bytes[3]);
+    TEST_ASSERT_EQUAL_UINT32(1, adapterRadioGapsU32(wire, 44));
+    TEST_ASSERT_EQUAL_UINT32(2, adapterRadioGapsU32(wire, 80));
+    TEST_ASSERT_EQUAL_UINT32(1, adapterRadioGapsU32(wire, 92));
+}
+
+// A SET_TX failure after a completed owner frame must consume the pending pairing attempt as a
+// failed start and leave the successful TX gap metric empty.
+static void test_w12_burst_owner_gap_failed_set_tx_after_completion_has_no_pair()
+{
+    makeW12BurstOwnerFixture();
+    for (unsigned i = 0; i < 2; ++i)
+        TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+
+    adapterHal->irqOnSetTx = 0;
+    adapter->serviceNotifications();
+    adapterHal->irq = RADIOLIB_LR2021_IRQ_TX_DONE;
+    adapter->serviceNotifications();
+    adapter->serviceNotifications();
+    TEST_ASSERT_TRUE(adapter->burstTimerPendingForTest());
+
+    adapterHal->failCommand = RADIOLIB_LR2021_CMD_SET_TX;
+    adapter->serviceNotifications(); // The guarded handoff reaches the real startTransmit call.
+    TEST_ASSERT_FALSE(adapter->isSending());
+
+    const auto gaps = adapterDiagnostics->getRadioGapDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(1, gaps.txValidDone);
+    TEST_ASSERT_EQUAL_UINT32(1, gaps.txStartFailures);
+    TEST_ASSERT_EQUAL_UINT32(0, gaps.ownerTxNotifyToStartTransmitCallUs.count);
+    TEST_ASSERT_EQUAL_UINT32(0, gaps.txUnpaired);
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterBurstControl(W12BenchmarkModule::Op::STOP)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterBurstControl(W12BenchmarkModule::Op::SNAPSHOT_RADIO_GAPS)));
+    const auto wire = takeAdapterRadioGapsReply();
+    TEST_ASSERT_EQUAL_UINT32(1, adapterRadioGapsU32(wire, 88));
+    TEST_ASSERT_EQUAL_UINT32(0, adapterRadioGapsU32(wire, 44));
+}
+
+// STOP may complete a producer window while an owner packet remains queued. Cancelling that
+// packet must freeze the page, and a later stale ISR_TX notification must not touch its slot.
+static void test_w12_burst_owner_gap_stop_cancel_freezes_after_stale_tx_notification()
+{
+    makeW12BurstOwnerFixture();
+    const auto liveBefore = packetPoolLiveBytes();
+    TEST_ASSERT_EQUAL_INT(0, adapterDiagnostics->runOnce());
+    TEST_ASSERT_EQUAL_UINT32(1, adapter->packetsInTxQueue());
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterBurstControl(W12BenchmarkModule::Op::STOP)));
+    adapter->releaseQueuedTransmissions();
+    TEST_ASSERT_EQUAL_UINT32(0, adapter->packetsInTxQueue());
+    TEST_ASSERT_EQUAL_INT32(liveBefore, packetPoolLiveBytes());
+
+    const auto frozen = adapterDiagnostics->getRadioGapDiagnostics();
+    TEST_ASSERT_TRUE(adapter->queueTxNotificationForTest());
+    adapter->serviceNotifications();
+    const auto after = adapterDiagnostics->getRadioGapDiagnostics();
+    TEST_ASSERT_EQUAL_UINT32(frozen.rxNotifications, after.rxNotifications);
+    TEST_ASSERT_EQUAL_UINT32(frozen.txValidDone, after.txValidDone);
+    TEST_ASSERT_EQUAL_UINT32(frozen.txUnpaired, after.txUnpaired);
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterBurstControl(W12BenchmarkModule::Op::SNAPSHOT_RADIO_GAPS)));
+    const auto wire = takeAdapterRadioGapsReply();
+    TEST_ASSERT_EQUAL_UINT8(0, wire.bytes[21]);
+    TEST_ASSERT_EQUAL_UINT32(0, adapterRadioGapsU32(wire, 80));
+    TEST_ASSERT_EQUAL_UINT32(0, adapterRadioGapsU32(wire, 92));
+}
 #endif
 
 // Use a real W12 owner slot while TX_DONE is already pending, then enter the
@@ -2463,6 +2636,10 @@ static void runW12AdapterTests()
     RUN_TEST(test_w12_adapter_radio_diagnostics_counts_irq_map_failure_and_result);
     RUN_TEST(test_w12_adapter_radio_diagnostics_poll_reads_raw_status_once);
     RUN_TEST(test_w12_adapter_radio_diagnostic_software_irq_state_tracks_standby_and_rx);
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    RUN_TEST(test_w12_adapter_owner_gap_rx_done_notification_records_rearm);
+    RUN_TEST(test_w12_adapter_owner_gap_rx_rearm_failure_is_invalid_without_sample);
+#endif
 #endif
 #if defined(MESHTASTIC_W12_FLRC_EXPERIMENTAL_TX) && MESHTASTIC_W12_FLRC_EXPERIMENTAL_TX
     RUN_TEST(test_w12_adapter_tx_attempt_tracks_queue_start_done_and_pool_reuse);
@@ -2478,6 +2655,9 @@ static void runW12AdapterTests()
     RUN_TEST(test_w12_burst_production_router_auth_gate_records_rx_decode);
     RUN_TEST(test_w12_burst_owned_start_failure_records_exact_stage_and_success_keeps_summary);
     RUN_TEST(test_w12_burst_owned_irq_failure_records_validation_stage_without_invented_result);
+    RUN_TEST(test_w12_burst_owner_gap_pairs_real_tx_done_with_next_start_and_drains_stop);
+    RUN_TEST(test_w12_burst_owner_gap_failed_set_tx_after_completion_has_no_pair);
+    RUN_TEST(test_w12_burst_owner_gap_stop_cancel_freezes_after_stale_tx_notification);
 #endif
     RUN_TEST(test_w12_burst_production_pending_tx_done_standby_does_not_arm);
     RUN_TEST(test_w12_burst_production_reconfigure_inflight_frame_resumes_ordinary_queue);

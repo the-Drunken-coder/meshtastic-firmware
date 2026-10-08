@@ -54,6 +54,7 @@ CONTROL_STOP = 3
 CONTROL_SNAPSHOT = 4
 CONTROL_SNAPSHOT_DIAGNOSTICS = 5
 CONTROL_SNAPSHOT_RADIO_DIAGNOSTICS = 6
+CONTROL_SNAPSHOT_RADIO_GAPS = 10
 DATA_KIND = 2
 REPORT_KIND = 3
 DIAGNOSTIC_KIND = 4
@@ -368,6 +369,7 @@ def encode_control(config: RunConfig, operation: int) -> bytes:
         CONTROL_SNAPSHOT,
         CONTROL_SNAPSHOT_DIAGNOSTICS,
         CONTROL_SNAPSHOT_RADIO_DIAGNOSTICS,
+        CONTROL_SNAPSHOT_RADIO_GAPS,
     ):
         raise BenchmarkError(f"unsupported control operation {operation}")
     payload = bytearray(CONTROL_BYTES)
@@ -408,6 +410,7 @@ def decode_control(payload: bytes) -> tuple[int, RunConfig]:
         CONTROL_SNAPSHOT,
         CONTROL_SNAPSHOT_DIAGNOSTICS,
         CONTROL_SNAPSHOT_RADIO_DIAGNOSTICS,
+        CONTROL_SNAPSHOT_RADIO_GAPS,
     ):
         raise BenchmarkError("invalid control operation")
     validate_config(config)

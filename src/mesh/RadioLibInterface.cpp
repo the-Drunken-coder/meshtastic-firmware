@@ -592,6 +592,15 @@ void RadioLibInterface::deliverPendingIrqFromPoll(PendingISR cause)
 void RadioLibInterface::onNotify(uint32_t notification)
 {
 
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
+    const uint32_t ownerRxNotifyAtUs = notification == ISR_RX ? static_cast<uint32_t>(micros()) : 0;
+    const uint32_t ownerRxDoneBefore =
+        notification == ISR_RX && w12BenchmarkModule ? w12BenchmarkModule->getRadioRxDoneCount() : 0;
+    const uint32_t ownerRxArmFailuresBefore =
+        notification == ISR_RX && w12BenchmarkModule ? w12BenchmarkModule->getRadioRxArmFailureCount() : 0;
+    const uint32_t ownerTxNotifyAtUs = notification == ISR_TX ? static_cast<uint32_t>(micros()) : 0;
+#endif
+
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
 #if !(MESHTASTIC_W12_BENCHMARK_TX_BURST)
     if (w12BenchmarkModule)
@@ -610,6 +619,10 @@ void RadioLibInterface::onNotify(uint32_t notification)
         // event, restore the ordinary RX/CCA handoff immediately because that one-slot event
         // is gone. Explicit standby keeps the inert behavior by suppressing this handoff.
         if (!sendingPacket) {
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
+            if (w12BenchmarkModule)
+                w12BenchmarkModule->onOwnerTxNotification(ownerTxNotifyAtUs, false, false);
+#endif
             const bool normalHandoffRequired = w12Burst.active || w12Burst.timerPending || w12BurstResumeAfterStale;
             const bool ordinaryHandoffRequired = isReceiving && !txQueue.empty();
             if (w12BurstArmSuppressed)
@@ -622,9 +635,14 @@ void RadioLibInterface::onNotify(uint32_t notification)
                 cancelW12Burst();
             break;
         }
-        // ownsTx() must run before handleTransmitInterrupt(), because completion releases the packet and its owner slot.
+        // Capture burst eligibility before handleTransmitInterrupt(); owner TX attribution runs inside it before
+        // completion releases the packet and its owner slot.
         const bool completedPacketEligible = isW12BurstPacket(sendingPacket);
-        const bool transmitSucceeded = handleTransmitInterrupt(); // completeSending() restored the home config
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
+        const bool transmitSucceeded = handleTransmitInterrupt(&ownerTxNotifyAtUs);
+#else
+        const bool transmitSucceeded = handleTransmitInterrupt();
+#endif
         if (transmitSucceeded && !w12BurstArmSuppressed && armW12BurstAfterSuccess(completedPacketEligible))
             break;
         cancelW12Burst();
@@ -634,7 +652,11 @@ void RadioLibInterface::onNotify(uint32_t notification)
         if (w12BurstArmSuppressed)
             break;
 #else
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
+        handleTransmitInterrupt(&ownerTxNotifyAtUs);
+#else
         handleTransmitInterrupt(); // completeSending() already restored the radio to the home config
+#endif
 #endif
         // Let the hooks pre-stage the radio for the NEXT queued packet. Not required for correctness -
         // TRANSMIT_DELAY_COMPLETED asks again before the scan, which is where the answer is acted on -
@@ -650,10 +672,23 @@ void RadioLibInterface::onNotify(uint32_t notification)
 #endif
         handleReceiveInterrupt();
 #if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
-        if (w12BurstArmSuppressed)
+        if (w12BurstArmSuppressed) {
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
+            if (w12BenchmarkModule)
+                w12BenchmarkModule->onOwnerRxNotification(ownerRxNotifyAtUs, static_cast<uint32_t>(micros()), ownerRxDoneBefore,
+                                                          w12BenchmarkModule->getRadioRxDoneCount(), ownerRxArmFailuresBefore,
+                                                          w12BenchmarkModule->getRadioRxArmFailureCount(), false);
+#endif
             break;
+        }
 #endif
         startReceive();
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
+        if (w12BenchmarkModule)
+            w12BenchmarkModule->onOwnerRxNotification(ownerRxNotifyAtUs, static_cast<uint32_t>(micros()), ownerRxDoneBefore,
+                                                      w12BenchmarkModule->getRadioRxDoneCount(), ownerRxArmFailuresBefore,
+                                                      w12BenchmarkModule->getRadioRxArmFailureCount(), isReceiving && !rxOffline);
+#endif
         setTransmitDelay();
         break;
     case ISR_POLL_TICK:
@@ -956,16 +991,24 @@ bool RadioLibInterface::removePendingTXPacket(NodeNum from, PacketId id, uint32_
     return false;
 }
 
-bool RadioLibInterface::handleTransmitInterrupt()
+bool RadioLibInterface::handleTransmitInterrupt(const uint32_t *ownerTxNotifyAtUs)
 {
+#if !(MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)))
+    (void)ownerTxNotifyAtUs;
+#endif
     // This can be null if we forced the device to enter standby mode.  In that case
     // ignore the transmit interrupt
     bool success = false;
     if (sendingPacket) {
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
+        const bool ownerTxPacketOwned = w12BenchmarkModule && w12BenchmarkModule->ownsTx(sendingPacket);
+#endif
         success = validTransmitIrq();
 #if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
         if (!success && w12BenchmarkModule)
             w12BenchmarkModule->onTxFailureObserved(sendingPacket, W12BenchmarkModule::TxFailureStage::TX_IRQ, INT16_MIN);
+        if (ownerTxNotifyAtUs && w12BenchmarkModule)
+            w12BenchmarkModule->onOwnerTxNotification(*ownerTxNotifyAtUs, ownerTxPacketOwned, success);
 #endif
         completeSending(success);
     }
@@ -1319,8 +1362,16 @@ bool RadioLibInterface::startSend(meshtastic_MeshPacket *txp)
         if (res == RADIOLIB_ERR_NONE) {
 #if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
             failureStage = W12BenchmarkModule::TxFailureStage::START_TRANSMIT;
+            const bool ownerTxPacketOwned = w12BenchmarkModule && w12BenchmarkModule->ownsTx(txp);
+            const uint32_t ownerTxStartAtUs = static_cast<uint32_t>(micros());
 #endif
             res = iface->startTransmit((uint8_t *)&radioBuffer, numbytes);
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
+            if (w12BenchmarkModule)
+                w12BenchmarkModule->onOwnerTxStartTransmitCall(ownerTxStartAtUs, ownerTxPacketOwned);
+            if (w12BenchmarkModule)
+                w12BenchmarkModule->onOwnerTxStartTransmitResult(res == RADIOLIB_ERR_NONE);
+#endif
         }
         if (res != RADIOLIB_ERR_NONE) {
             LOG_ERROR("startTransmit failed, error=%d", res);

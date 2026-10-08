@@ -326,6 +326,13 @@ class ProtocolTests(unittest.TestCase):
             (benchmark.CONTROL_SNAPSHOT_RADIO_DIAGNOSTICS, run),
         )
 
+    def test_owner_radio_gap_control_uses_local_control_shape(self):
+        run = config()
+        encoded = benchmark.encode_control(run, benchmark.CONTROL_SNAPSHOT_RADIO_GAPS)
+        self.assertEqual(len(encoded), benchmark.CONTROL_BYTES)
+        self.assertEqual(encoded[3], 10)
+        self.assertEqual(benchmark.decode_control(encoded), (10, run))
+
     def test_diagnostic_report_round_trips_all_counter_groups(self):
         run = config()
         decoded = benchmark.decode_diagnostics(diagnostic_payload(run))
