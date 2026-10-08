@@ -9,10 +9,25 @@ import json
 import re
 from datetime import datetime
 from typing import Dict
+from pathlib import Path
 
 from readprops import readProps
+from apply_lr2021_patch import apply_patch as apply_lr2021_patch
 
 Import("env")
+
+def _radiolib_configured(environment):
+    configured = environment.GetProjectOption("lib_deps") or []
+    if isinstance(configured, str):
+        configured = [configured]
+    return any("radiolib" in str(dep).lower() for dep in configured)
+
+if _radiolib_configured(env):
+    radiolib_root = Path(env.subst("$PROJECT_LIBDEPS_DIR")) / env.subst("$PIOENV") / "RadioLib"
+    print(f"Checking pinned RadioLib LR2021 dependency under {radiolib_root}")
+    apply_lr2021_patch(radiolib_root)
+else:
+    print("RadioLib is not configured for this environment; skipping LR2021 patch")
 platform = env.PioPlatform()
 progname = env.get("PROGNAME")
 lfsbin = f"{progname.replace('firmware-', 'littlefs-')}.bin"
