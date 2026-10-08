@@ -30,6 +30,9 @@ bool validOperation(W12BenchmarkModule::Op op)
 #if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
     valid = valid || op == W12BenchmarkModule::Op::SNAPSHOT_RADIO_GAPS;
 #endif
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    valid = valid || op == W12BenchmarkModule::Op::SNAPSHOT_SPI_YIELD || op == W12BenchmarkModule::Op::ENABLE_SPI_YIELD;
+#endif
     return valid;
 }
 
@@ -537,6 +540,42 @@ size_t W12BenchmarkModule::encodePreSendAttributionReport(uint8_t *bytes, size_t
     return PRE_SEND_ATTRIBUTION_REPORT_BYTES;
 }
 
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+size_t W12BenchmarkModule::encodeSpiYieldReport(uint8_t *bytes, size_t capacity, const Stats &value,
+                                                const W12BenchmarkHalMetrics::Snapshot &metrics, uint8_t pendingTxCount)
+{
+    if (!bytes || capacity < SPI_YIELD_REPORT_BYTES)
+        return 0;
+
+    memset(bytes, 0, SPI_YIELD_REPORT_BYTES);
+    put16(bytes, MAGIC);
+    bytes[2] = VERSION;
+    bytes[3] = static_cast<uint8_t>(Kind::SPI_YIELD);
+    put32(bytes + 4, value.config.runId);
+    put32(bytes + 8, value.config.source);
+    put32(bytes + 12, value.config.destination);
+    put32(bytes + 16, value.elapsedMs);
+    bytes[20] =
+        static_cast<uint8_t>((value.prepared ? 1 : 0) | (value.running ? 2 : 0) | (value.complete ? 4 : 0) |
+                             (metrics.frozen ? 8 : 0) | (pendingTxCount ? 16 : 0) | ((value.running || pendingTxCount) ? 32 : 0));
+    bytes[21] = pendingTxCount;
+    put32(bytes + 24, metrics.requestedHz);
+    put32(bytes + 28, metrics.transferCount);
+    for (uint8_t i = 0; i < sizeof(metrics.transferredBytes); i++)
+        bytes[32 + i] = static_cast<uint8_t>(metrics.transferredBytes >> (i * 8));
+    for (uint8_t i = 0; i < sizeof(metrics.transferSumUs); i++)
+        bytes[40 + i] = static_cast<uint8_t>(metrics.transferSumUs >> (i * 8));
+    put32(bytes + 48, metrics.transferMaxUs);
+    put32(bytes + 52, metrics.yieldCount);
+    for (uint8_t i = 0; i < sizeof(metrics.yieldSumUs); i++)
+        bytes[56 + i] = static_cast<uint8_t>(metrics.yieldSumUs >> (i * 8));
+    put32(bytes + 64, metrics.yieldMaxUs);
+    bytes[68] = 1;
+    bytes[69] = static_cast<uint8_t>(metrics.overflow);
+    return SPI_YIELD_REPORT_BYTES;
+}
+#endif
+
 #if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
 size_t W12BenchmarkModule::encodeRadioGapsReport(uint8_t *bytes, size_t capacity, const Stats &value,
                                                  const RadioGapDiagnostics &d, uint8_t pendingTxCount)
@@ -754,6 +793,9 @@ void W12BenchmarkModule::onTxFinished(const meshtastic_MeshPacket *packet, Radio
         finalizeOwnerTxCandidate();
         radioGapRunLatched = false;
     }
+#endif
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    freezeSpiYieldTiming();
 #endif
 }
 
@@ -1526,6 +1568,21 @@ void W12BenchmarkModule::markReceived(uint32_t sequence)
     receivedBitmap[sequence / 8] |= static_cast<uint8_t>(1u << (sequence % 8));
 }
 
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+void W12BenchmarkModule::freezeSpiYieldTiming()
+{
+    // finishRun has already completed its abort/stop work before this boundary. The last owner
+    // terminal callback reaches here before packetReleased/packetPool release and final RX rearm.
+    if (!spiYieldArmed || !stats.complete || stats.running || pendingTxCount != 0 || spiYieldFrozen)
+        return;
+
+    if (!RadioLibInterface::instance)
+        return;
+    RadioLibInterface::instance->freezeW12HalTiming();
+    spiYieldFrozen = RadioLibInterface::instance->getW12HalTiming().frozen;
+}
+#endif
+
 void W12BenchmarkModule::resetRun(const RunConfig &config)
 {
     activeConfig = config;
@@ -1567,6 +1624,15 @@ void W12BenchmarkModule::resetRun(const RunConfig &config)
     rxLivenessRearmUsed = false;
     preSendSnapshotRequested = false;
     preSendSnapshotRunMatches = false;
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    spiYieldArmed = false;
+    spiYieldWindowValid = false;
+    spiYieldFrozen = false;
+    spiYieldSnapshotRequested = false;
+    spiYieldSnapshotRunMatches = false;
+    if (RadioLibInterface::instance)
+        RadioLibInterface::instance->resetW12HalTiming();
+#endif
     for (auto &slot : txSlots)
         slot = TxSlot{};
     pendingTxCount = 0;
@@ -1634,6 +1700,9 @@ void W12BenchmarkModule::finishRun()
         if (pendingTxCount == 0)
             radioGapRunLatched = false;
 #endif
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+        freezeSpiYieldTiming();
+#endif
         return;
     }
 
@@ -1653,6 +1722,9 @@ void W12BenchmarkModule::finishRun()
         finalizeOwnerTxCandidate();
     if (pendingTxCount == 0)
         radioGapRunLatched = false;
+#endif
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    freezeSpiYieldTiming();
 #endif
 }
 
@@ -1685,6 +1757,12 @@ bool W12BenchmarkModule::handleControl(const meshtastic_MeshPacket &mp)
         radioDiagnosticWindowStarted = true;
         receiverWindowStarted = nodeDB->getNodeNum() != activeConfig.destination;
         startedAtMs = receiverWindowStarted ? Time::getMillis() : 0;
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+        spiYieldWindowValid = receiverWindowStarted;
+        spiYieldFrozen = false;
+        if (spiYieldArmed && RadioLibInterface::instance)
+            RadioLibInterface::instance->beginW12HalTiming();
+#endif
         setIntervalFromNow(0);
         return true;
     case Op::STOP:
@@ -1744,6 +1822,22 @@ bool W12BenchmarkModule::handleControl(const meshtastic_MeshPacket &mp)
         preSendSnapshotRequested = true;
         preSendSnapshotRunMatches = true;
         return true;
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    case Op::ENABLE_SPI_YIELD:
+        if (stats.running || stats.complete || pendingTxCount != 0 ||
+            (nodeDB->getNodeNum() != activeConfig.source && nodeDB->getNodeNum() != activeConfig.destination))
+            return false;
+        // This local arm is nonpersistent and applies to the next accepted START. Repeating it
+        // before that START is intentionally idempotent; RESET clears it with the counters.
+        spiYieldArmed = true;
+        return true;
+    case Op::SNAPSHOT_SPI_YIELD:
+        if (stats.running || !stats.complete || pendingTxCount != 0 || !spiYieldArmed || !spiYieldWindowValid || !spiYieldFrozen)
+            return false;
+        spiYieldSnapshotRequested = true;
+        spiYieldSnapshotRunMatches = true;
+        return true;
+#endif
 #if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
     case Op::SNAPSHOT_RADIO_GAPS:
         if (stats.running || !stats.complete || pendingTxCount != 0)
@@ -1771,6 +1865,9 @@ bool W12BenchmarkModule::handleData(const meshtastic_MeshPacket &mp)
     if (!receiverWindowStarted) {
         receiverWindowStarted = true;
         startedAtMs = Time::getMillis();
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+        spiYieldWindowValid = true;
+#endif
     }
 
     if (Throttle::hasElapsed(startedAtMs, activeConfig.durationMs)) {
@@ -1842,13 +1939,18 @@ meshtastic_MeshPacket *W12BenchmarkModule::allocReply()
     const bool radioDiagnosticsRequested = radioDiagnosticSnapshotRequested && radioDiagnosticSnapshotRunMatches;
     const bool rxLivenessRequested = rxLivenessSnapshotRequested && rxLivenessSnapshotRunMatches;
     const bool preSendRequested = preSendSnapshotRequested && preSendSnapshotRunMatches;
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    const bool spiYieldRequested = spiYieldSnapshotRequested && spiYieldSnapshotRunMatches;
+#else
+    const bool spiYieldRequested = false;
+#endif
 #if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
     const bool radioGapsRequested = radioGapsSnapshotRequested && radioGapsSnapshotRunMatches;
 #else
     const bool radioGapsRequested = false;
 #endif
     if (!reportRequested && !diagnosticsRequested && !radioDiagnosticsRequested && !rxLivenessRequested && !preSendRequested &&
-        !radioGapsRequested)
+        !spiYieldRequested && !radioGapsRequested)
         return nullptr;
 
     meshtastic_MeshPacket *reply = router->allocForSending();
@@ -1862,6 +1964,13 @@ meshtastic_MeshPacket *W12BenchmarkModule::allocReply()
     if (preSendRequested) {
         reply->decoded.payload.size = encodePreSendAttributionReport(
             reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes), currentStats, preSendDiagnostics, pendingTxCount);
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    } else if (spiYieldRequested) {
+        const auto metrics =
+            RadioLibInterface::instance ? RadioLibInterface::instance->getW12HalTiming() : W12BenchmarkHalMetrics::Snapshot{};
+        reply->decoded.payload.size = encodeSpiYieldReport(reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes),
+                                                           currentStats, metrics, pendingTxCount);
+#endif
 #if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
     } else if (radioGapsRequested) {
         reply->decoded.payload.size = encodeRadioGapsReport(reply->decoded.payload.bytes, sizeof(reply->decoded.payload.bytes),
@@ -1896,6 +2005,10 @@ meshtastic_MeshPacket *W12BenchmarkModule::allocReply()
     rxLivenessSnapshotRunMatches = false;
     preSendSnapshotRequested = false;
     preSendSnapshotRunMatches = false;
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    spiYieldSnapshotRequested = false;
+    spiYieldSnapshotRunMatches = false;
+#endif
 #if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
     radioGapsSnapshotRequested = false;
     radioGapsSnapshotRunMatches = false;

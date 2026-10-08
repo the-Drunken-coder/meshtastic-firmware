@@ -15,6 +15,16 @@ from types import SimpleNamespace
 from unittest import mock
 
 MODULE_PATH = Path(__file__).with_name("benchmark_probe.py")
+PROTOCOL_PATH = MODULE_PATH.with_name("benchmark-protocol.json")
+if not PROTOCOL_PATH.is_file():
+    PROTOCOL_PATH = next(
+        (
+            parent / "firmware/bin/w12-benchmark/benchmark-protocol.json"
+            for parent in MODULE_PATH.parents
+            if (parent / "firmware/bin/w12-benchmark/benchmark-protocol.json").is_file()
+        ),
+        PROTOCOL_PATH,
+    )
 SPEC = importlib.util.spec_from_file_location("benchmark_probe", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 benchmark = importlib.util.module_from_spec(SPEC)
@@ -397,7 +407,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_protocol_manifest_records_frozen_diagnostic_operation_and_offsets(self):
         manifest = json.loads(
-            (MODULE_PATH.with_name("benchmark-protocol.json")).read_text()
+            PROTOCOL_PATH.read_text()
         )
         operation = next(
             field for field in manifest["control"]["fields"] if field[2] == "op"
@@ -1340,6 +1350,8 @@ class HardwareHarnessTests(unittest.TestCase):
             output = Path(directory) / "run"
             image = Path(directory) / "firmware.bin"
             image.write_bytes(b"test image")
+            walker_image = Path(directory) / "walker-firmware.bin"
+            walker_image.write_bytes(b"walker test image")
             args = benchmark.build_parser().parse_args(
                 [
                     "--output",
@@ -1390,10 +1402,20 @@ class HardwareHarnessTests(unittest.TestCase):
             )
             self.assertTrue(all(session.closed for session in FakeSession.instances))
             self.assertGreaterEqual(len(FakeSession.instances), 4)
+            self.assertFalse(result["intent"]["spi_yield_requested"])
             saved = json.loads((output / "results.json").read_text())
             self.assertEqual(saved["firmware_reports"], result["firmware_reports"])
             for role in ("base", "walker"):
                 events = json.loads((output / role / "capture-events.json").read_text())
+                control_operations = [
+                    event["operation"]
+                    for event in events
+                    if event.get("kind") == "control_attempt"
+                ]
+                self.assertEqual(
+                    control_operations[:2],
+                    [benchmark.CONTROL_RESET, benchmark.CONTROL_START],
+                )
                 self.assertTrue(
                     any(event["kind"] == "control_attempt" for event in events)
                 )
@@ -1428,6 +1450,82 @@ class HardwareHarnessTests(unittest.TestCase):
                         == "board_local_radio_phase"
                         for event in events
                     )
+                )
+
+            # Cover the actual opt-in workflow, including receiver-then-sender
+            # RESET/ENABLE/START ordering.
+            FakeSession.instances.clear()
+            spi_output = Path(directory) / "spi-run"
+            spi_args = benchmark.build_parser().parse_args(
+                [
+                    "--output",
+                    str(spi_output),
+                    "--count",
+                    "1000",
+                    "--wall-seconds",
+                    "60",
+                    "--drain-seconds",
+                    "10",
+                    "--run-id",
+                    "305419897",
+                    "--image",
+                    str(image),
+                    "--image",
+                    str(walker_image),
+                    "--base-image",
+                    str(image),
+                    "--walker-image",
+                    str(walker_image),
+                    "--spi-yield",
+                ]
+            )
+            with mock.patch.object(
+                benchmark, "BoardSession", FakeSession
+            ), mock.patch.object(
+                benchmark, "_fresh_config_snapshots", fresh_snapshots
+            ), mock.patch.object(
+                benchmark.time, "monotonic", clock.monotonic
+            ), mock.patch.object(
+                benchmark.time, "time", clock.time
+            ), mock.patch.object(
+                benchmark.time, "sleep", clock.sleep
+            ):
+                spi_result = benchmark.run_hardware(spi_args)
+
+            self.assertEqual(spi_result["status"], "measurement_valid")
+            self.assertTrue(spi_result["intent"]["spi_yield_requested"])
+            self.assertEqual(
+                set(spi_result["provenance"]["image_hashes_by_role"]),
+                {"base", "walker"},
+            )
+            self.assertEqual(
+                spi_result["provenance"]["image_hashes_by_role"]["base"]["path"],
+                str(image),
+            )
+            self.assertEqual(
+                spi_result["provenance"]["image_hashes_by_role"]["walker"]["path"],
+                str(walker_image),
+            )
+            self.assertEqual(
+                spi_result["intent"]["spi_yield"]["enable_operation"],
+                benchmark.CONTROL_ENABLE_SPI_YIELD,
+            )
+            for role in ("walker", "base"):
+                events = json.loads(
+                    (spi_output / role / "capture-events.json").read_text()
+                )
+                control_operations = [
+                    event["operation"]
+                    for event in events
+                    if event.get("kind") == "control_attempt"
+                ]
+                self.assertEqual(
+                    control_operations[:3],
+                    [
+                        benchmark.CONTROL_RESET,
+                        benchmark.CONTROL_ENABLE_SPI_YIELD,
+                        benchmark.CONTROL_START,
+                    ],
                 )
 
     def test_run_hardware_receiver_timeout_stops_and_preserves_lifecycle(self):

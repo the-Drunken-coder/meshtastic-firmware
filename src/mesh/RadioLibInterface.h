@@ -2,6 +2,7 @@
 
 #include "MeshPacketQueue.h"
 #include "RadioInterface.h"
+#include "W12BenchmarkHalMetrics.h"
 #include "concurrency/NotifiedWorkerThread.h"
 
 #include <RadioLib.h>
@@ -89,10 +90,19 @@ struct W12RxRearmResult {
 /**
  * We need to override the RadioLib ArduinoHal class to add mutex protection for SPI bus access
  */
+class RadioLibInterface;
+
 class LockingArduinoHal : public ArduinoHal
 {
   public:
-    LockingArduinoHal(SPIClass &spi, SPISettings spiSettings) : ArduinoHal(spi, spiSettings) {};
+    LockingArduinoHal(SPIClass &spi, SPISettings spiSettings)
+        : ArduinoHal(spi, spiSettings)
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+          ,
+          requestedHz(requestedClockHz(spiSettings))
+#endif
+    {
+    }
 
     void spiBeginTransaction() override;
     void spiEndTransaction() override;
@@ -100,9 +110,47 @@ class LockingArduinoHal : public ArduinoHal
     void spiTransfer(uint8_t *out, size_t len, uint8_t *in) override;
 
 #endif
+#if W12_BENCHMARK_HAL_TIMING_ENABLED && !ARCH_PORTDUINO &&                                                                       \
+    !(defined(ARCH_ESP32) && defined(MESHNOLOGY_W12) && defined(MESHTASTIC_W12_BENCHMARK) && MESHTASTIC_W12_BENCHMARK &&         \
+      defined(MESHTASTIC_W12_BENCHMARK_BULK_SPI) && MESHTASTIC_W12_BENCHMARK_BULK_SPI)
+    void spiTransfer(uint8_t *out, size_t len, uint8_t *in) override;
+#endif
 #if defined(ARCH_ESP32) && defined(MESHNOLOGY_W12) && defined(MESHTASTIC_W12_BENCHMARK) && MESHTASTIC_W12_BENCHMARK &&           \
     defined(MESHTASTIC_W12_BENCHMARK_BULK_SPI) && MESHTASTIC_W12_BENCHMARK_BULK_SPI
     void spiTransfer(uint8_t *out, size_t len, uint8_t *in) override;
+#endif
+
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    void yield() override;
+#endif
+
+  private:
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    friend class RadioLibInterface;
+
+    static uint32_t requestedClockHz(const SPISettings &settings)
+    {
+#if ARCH_PORTDUINO
+        return settings.getClockFreq();
+#elif defined(ARDUINO_ARCH_ESP32)
+        return settings._clock;
+#else
+        (void)settings;
+        return 0;
+#endif
+    }
+
+    void attachW12BenchmarkMetrics(W12BenchmarkHalMetrics *metrics)
+    {
+        benchmarkMetrics = metrics;
+        if (benchmarkMetrics)
+            benchmarkMetrics->setRequestedHz(requestedHz);
+    }
+
+    void detachW12BenchmarkMetrics() { benchmarkMetrics = nullptr; }
+
+    W12BenchmarkHalMetrics *benchmarkMetrics = nullptr;
+    uint32_t requestedHz = 0;
 #endif
 };
 
@@ -185,6 +233,12 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     STM32WLx_ModuleWrapper module;
 #endif
 
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    // The production interface is the sole owner of this non-owning HAL pointer.
+    LockingArduinoHal *hal = nullptr;
+    W12BenchmarkHalMetrics halMetrics;
+#endif
+
     /**
      * provides lowest common denominator RadioLib API
      */
@@ -224,6 +278,10 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
     /** Clear instance on destruction so stale pointer checks in loop() are safe */
     virtual ~RadioLibInterface()
     {
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+        if (hal)
+            hal->detachW12BenchmarkMetrics();
+#endif
         if (instance == this)
             instance = nullptr;
     }
@@ -339,6 +397,13 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
   public:
     RadioLibInterface(LockingArduinoHal *hal, RADIOLIB_PIN_TYPE cs, RADIOLIB_PIN_TYPE irq, RADIOLIB_PIN_TYPE rst,
                       RADIOLIB_PIN_TYPE busy, PhysicalLayer *iface = NULL);
+
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    void beginW12HalTiming() { halMetrics.begin(); }
+    void resetW12HalTiming() { halMetrics.reset(); }
+    void freezeW12HalTiming() { halMetrics.freeze(); }
+    W12BenchmarkHalMetrics::Snapshot getW12HalTiming() const { return halMetrics.get(); }
+#endif
 
     virtual ErrorCode send(meshtastic_MeshPacket *p) override;
 

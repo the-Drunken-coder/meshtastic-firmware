@@ -274,6 +274,192 @@ class TestableW12Adapter : public LR2021Interface
     }
 };
 
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+class W12ProductionHalAdapter : public LR2021Interface
+{
+  public:
+    W12ProductionHalAdapter() : LR2021Interface(&productionHal(), 1, 3, 4, 2) {}
+
+    void exerciseProductionHal()
+    {
+        RadioLibHal *radioLibHal = hal;
+        TEST_ASSERT_NOT_NULL(radioLibHal);
+        uint8_t out[64] = {};
+        uint8_t in[64] = {};
+        radioLibHal->spiBeginTransaction();
+        radioLibHal->spiTransfer(out, sizeof(out), in);
+        radioLibHal->yield();
+        radioLibHal->spiEndTransaction();
+    }
+
+    static void exerciseAttachedHal()
+    {
+        RadioLibHal *radioLibHal = &productionHal();
+        uint8_t out[64] = {};
+        uint8_t in[64] = {};
+        radioLibHal->spiBeginTransaction();
+        radioLibHal->spiTransfer(out, sizeof(out), in);
+        radioLibHal->yield();
+        radioLibHal->spiEndTransaction();
+    }
+
+  private:
+    static SPIClass &localSpi()
+    {
+        static SPIClass spi;
+        return spi;
+    }
+
+    static LockingArduinoHal &productionHal()
+    {
+        static LockingArduinoHal hal(localSpi(), SPISettings(4000000, MSBFIRST, SPI_MODE0));
+        static const bool initialized = [] {
+            auto &spi = localSpi();
+            spi.end();
+            spi.begin("/dev/w12-hal-timing-device-does-not-exist");
+            return true;
+        }();
+        (void)initialized;
+        return hal;
+    }
+};
+
+class W12BenchmarkHalMetricsTestAccess
+{
+  public:
+    static void recordTransfer(W12BenchmarkHalMetrics &metrics, uint32_t durationUs, size_t logicalBytes)
+    {
+        metrics.recordTransfer(durationUs, logicalBytes);
+    }
+
+    static void recordYield(W12BenchmarkHalMetrics &metrics, uint32_t durationUs) { metrics.recordYield(durationUs); }
+
+    static W12BenchmarkHalMetrics::Snapshot &snapshot(W12BenchmarkHalMetrics &metrics) { return metrics.snapshot; }
+};
+
+static void test_w12_hal_metrics_saturate_and_preserve_zero_duration()
+{
+    W12BenchmarkHalMetrics metrics;
+    metrics.begin();
+    W12BenchmarkHalMetricsTestAccess::recordTransfer(metrics, 0, 64);
+    W12BenchmarkHalMetricsTestAccess::recordYield(metrics, 0);
+    auto snapshot = metrics.get();
+    TEST_ASSERT_EQUAL_UINT32(1, snapshot.transferCount);
+    TEST_ASSERT_EQUAL_UINT64(64, snapshot.transferredBytes);
+    TEST_ASSERT_EQUAL_UINT64(0, snapshot.transferSumUs);
+    TEST_ASSERT_EQUAL_UINT32(0, snapshot.transferMaxUs);
+    TEST_ASSERT_EQUAL_UINT32(1, snapshot.yieldCount);
+    TEST_ASSERT_EQUAL_UINT64(0, snapshot.yieldSumUs);
+    TEST_ASSERT_EQUAL_UINT32(0, snapshot.yieldMaxUs);
+
+    auto &mutableSnapshot = W12BenchmarkHalMetricsTestAccess::snapshot(metrics);
+    mutableSnapshot.transferCount = UINT32_MAX;
+    mutableSnapshot.transferredBytes = UINT64_MAX;
+    mutableSnapshot.transferSumUs = UINT64_MAX;
+    mutableSnapshot.yieldCount = UINT32_MAX;
+    mutableSnapshot.yieldSumUs = UINT64_MAX;
+    W12BenchmarkHalMetricsTestAccess::recordTransfer(metrics, 7, 1);
+    W12BenchmarkHalMetricsTestAccess::recordYield(metrics, 9);
+    snapshot = metrics.get();
+    TEST_ASSERT_TRUE(snapshot.overflow);
+    TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, snapshot.transferCount);
+    TEST_ASSERT_EQUAL_UINT64(UINT64_MAX, snapshot.transferredBytes);
+    TEST_ASSERT_EQUAL_UINT64(UINT64_MAX, snapshot.transferSumUs);
+    TEST_ASSERT_EQUAL_UINT32(UINT32_MAX, snapshot.yieldCount);
+    TEST_ASSERT_EQUAL_UINT64(UINT64_MAX, snapshot.yieldSumUs);
+    TEST_ASSERT_EQUAL_UINT32(7, snapshot.transferMaxUs);
+    TEST_ASSERT_EQUAL_UINT32(9, snapshot.yieldMaxUs);
+
+    metrics.freeze();
+    TEST_ASSERT_TRUE(metrics.get().frozen);
+}
+
+static void test_w12_production_hal_virtual_transfer_and_yield_are_counted()
+{
+    auto *production = new W12ProductionHalAdapter();
+    production->exerciseProductionHal();
+    auto snapshot = production->getW12HalTiming();
+    TEST_ASSERT_EQUAL_UINT32(4000000, snapshot.requestedHz);
+    TEST_ASSERT_EQUAL_UINT32(0, snapshot.transferCount);
+    TEST_ASSERT_EQUAL_UINT64(0, snapshot.transferredBytes);
+    TEST_ASSERT_EQUAL_UINT32(0, snapshot.yieldCount);
+    TEST_ASSERT_FALSE(snapshot.frozen);
+
+    production->beginW12HalTiming();
+    production->exerciseProductionHal();
+    production->freezeW12HalTiming();
+    snapshot = production->getW12HalTiming();
+    TEST_ASSERT_EQUAL_UINT32(4000000, snapshot.requestedHz);
+    TEST_ASSERT_EQUAL_UINT32(1, snapshot.transferCount);
+    TEST_ASSERT_EQUAL_UINT64(64, snapshot.transferredBytes);
+    TEST_ASSERT_EQUAL_UINT32(1, snapshot.yieldCount);
+    TEST_ASSERT_TRUE(snapshot.transferMaxUs <= snapshot.transferSumUs);
+    TEST_ASSERT_TRUE(snapshot.yieldMaxUs <= snapshot.yieldSumUs);
+    TEST_ASSERT_TRUE(snapshot.frozen);
+
+    // A frozen collector ignores later virtual HAL activity and keeps the completed snapshot.
+    const auto frozen = snapshot;
+    production->exerciseProductionHal();
+    snapshot = production->getW12HalTiming();
+    TEST_ASSERT_EQUAL_UINT32(frozen.transferCount, snapshot.transferCount);
+    TEST_ASSERT_EQUAL_UINT64(frozen.transferredBytes, snapshot.transferredBytes);
+    TEST_ASSERT_EQUAL_UINT64(frozen.transferSumUs, snapshot.transferSumUs);
+    TEST_ASSERT_EQUAL_UINT32(frozen.transferMaxUs, snapshot.transferMaxUs);
+    TEST_ASSERT_EQUAL_UINT32(frozen.yieldCount, snapshot.yieldCount);
+    TEST_ASSERT_EQUAL_UINT64(frozen.yieldSumUs, snapshot.yieldSumUs);
+    TEST_ASSERT_EQUAL_UINT32(frozen.yieldMaxUs, snapshot.yieldMaxUs);
+    TEST_ASSERT_TRUE(snapshot.frozen);
+
+    // RESET makes the next interval inactive until a fresh logical START arms it.
+    production->resetW12HalTiming();
+    production->exerciseProductionHal();
+    snapshot = production->getW12HalTiming();
+    TEST_ASSERT_EQUAL_UINT32(4000000, snapshot.requestedHz);
+    TEST_ASSERT_EQUAL_UINT32(0, snapshot.transferCount);
+    TEST_ASSERT_EQUAL_UINT64(0, snapshot.transferredBytes);
+    TEST_ASSERT_EQUAL_UINT64(0, snapshot.transferSumUs);
+    TEST_ASSERT_EQUAL_UINT32(0, snapshot.transferMaxUs);
+    TEST_ASSERT_EQUAL_UINT32(0, snapshot.yieldCount);
+    TEST_ASSERT_EQUAL_UINT64(0, snapshot.yieldSumUs);
+    TEST_ASSERT_EQUAL_UINT32(0, snapshot.yieldMaxUs);
+    TEST_ASSERT_FALSE(snapshot.frozen);
+
+    production->beginW12HalTiming();
+    production->exerciseProductionHal();
+    production->freezeW12HalTiming();
+    snapshot = production->getW12HalTiming();
+    TEST_ASSERT_EQUAL_UINT32(1, snapshot.transferCount);
+    TEST_ASSERT_EQUAL_UINT64(64, snapshot.transferredBytes);
+    TEST_ASSERT_EQUAL_UINT32(1, snapshot.yieldCount);
+    TEST_ASSERT_TRUE(snapshot.frozen);
+    delete production;
+}
+
+static void test_w12_production_hal_detach_and_reattach_does_not_use_freed_metrics()
+{
+    auto *first = new W12ProductionHalAdapter();
+    first->beginW12HalTiming();
+    first->exerciseProductionHal();
+    delete first;
+
+    // The HAL outlives the interface in production. After destruction, its non-owning metrics
+    // pointer must be detached before this virtual transfer/yield pair runs.
+    W12ProductionHalAdapter::exerciseAttachedHal();
+
+    auto *second = new W12ProductionHalAdapter();
+    second->beginW12HalTiming();
+    second->exerciseProductionHal();
+    second->freezeW12HalTiming();
+    const auto snapshot = second->getW12HalTiming();
+    TEST_ASSERT_EQUAL_UINT32(1, snapshot.transferCount);
+    TEST_ASSERT_EQUAL_UINT64(64, snapshot.transferredBytes);
+    TEST_ASSERT_EQUAL_UINT32(1, snapshot.yieldCount);
+    TEST_ASSERT_TRUE(snapshot.frozen);
+    delete second;
+    W12ProductionHalAdapter::exerciseAttachedHal();
+}
+#endif
+
 static W12AdapterHal *adapterHal;
 static TestableW12Adapter *adapter;
 #if (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)) && MESHTASTIC_W12_BENCHMARK_TX_BURST
@@ -471,13 +657,13 @@ static W12BenchmarkModule::RunConfig adapterDiagnosticRun()
     return run;
 }
 
-static ProcessMessage sendAdapterDiagnosticControl(W12BenchmarkModule::Op op)
+static ProcessMessage sendAdapterDiagnosticControl(W12BenchmarkModule::Op op, NodeNum localNode = adapterDiagnosticDestination)
 {
     TEST_ASSERT_NOT_NULL(adapterDiagnostics);
     TEST_ASSERT_NOT_NULL(adapterDiagnosticsNodeDB);
     meshtastic_MeshPacket control = meshtastic_MeshPacket_init_zero;
     control.from = 0;
-    control.to = adapterDiagnosticDestination;
+    control.to = localNode;
     control.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_INTERNAL;
     control.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
     control.decoded.portnum = meshtastic_PortNum_PRIVATE_APP;
@@ -512,6 +698,42 @@ static void makeW12AdapterWithDiagnostics()
     makeW12Adapter();
     startAdapterDiagnostics();
 }
+
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+static void test_w12_production_hal_controls_collect_end_to_end()
+{
+    prepareAdapterDiagnostics();
+    auto *production = new W12ProductionHalAdapter();
+    myNodeInfo.my_node_num = adapterDiagnosticSource;
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterDiagnosticControl(W12BenchmarkModule::Op::RESET, adapterDiagnosticSource)));
+    TEST_ASSERT_EQUAL_INT(
+        static_cast<int>(ProcessMessage::STOP),
+        static_cast<int>(sendAdapterDiagnosticControl(W12BenchmarkModule::Op::ENABLE_SPI_YIELD, adapterDiagnosticSource)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterDiagnosticControl(W12BenchmarkModule::Op::START, adapterDiagnosticSource)));
+
+    auto snapshot = production->getW12HalTiming();
+    TEST_ASSERT_EQUAL_UINT32(4000000, snapshot.requestedHz);
+    TEST_ASSERT_EQUAL_UINT32(0, snapshot.transferCount);
+    TEST_ASSERT_EQUAL_UINT32(0, snapshot.yieldCount);
+    production->exerciseProductionHal();
+    snapshot = production->getW12HalTiming();
+    TEST_ASSERT_EQUAL_UINT32(1, snapshot.transferCount);
+    TEST_ASSERT_EQUAL_UINT64(64, snapshot.transferredBytes);
+    TEST_ASSERT_EQUAL_UINT32(1, snapshot.yieldCount);
+
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendAdapterDiagnosticControl(W12BenchmarkModule::Op::STOP, adapterDiagnosticSource)));
+    snapshot = production->getW12HalTiming();
+    TEST_ASSERT_TRUE(snapshot.frozen);
+    TEST_ASSERT_EQUAL_INT(
+        static_cast<int>(ProcessMessage::STOP),
+        static_cast<int>(sendAdapterDiagnosticControl(W12BenchmarkModule::Op::SNAPSHOT_SPI_YIELD, adapterDiagnosticSource)));
+    delete production;
+}
+#endif
 
 static size_t adapterIrqStatusReadCount()
 {
@@ -2622,6 +2844,12 @@ static void runW12AdapterTests()
     RUN_TEST(test_w12_adapter_failed_observation_defers_fresh_recovery_until_rx_done_is_delivered);
     RUN_TEST(test_w12_adapter_failed_observation_preserves_active_reception_and_later_completion);
 #if MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING)
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    RUN_TEST(test_w12_hal_metrics_saturate_and_preserve_zero_duration);
+    RUN_TEST(test_w12_production_hal_virtual_transfer_and_yield_are_counted);
+    RUN_TEST(test_w12_production_hal_controls_collect_end_to_end);
+    RUN_TEST(test_w12_production_hal_detach_and_reattach_does_not_use_freed_metrics);
+#endif
     RUN_TEST(test_w12_adapter_rx_liveness_snapshot_reads_stats_irq_and_rssi_once);
     RUN_TEST(test_w12_adapter_pre_send_snapshot_reads_raw_rx_state_without_clearing);
     RUN_TEST(test_w12_adapter_active_rx_failure_is_classified_by_one_irq_read);

@@ -19,6 +19,7 @@
 #include "concurrency/OSThread.h"
 #include "mesh/MeshModule.h"
 #include "mesh/RadioInterface.h"
+#include "mesh/W12BenchmarkHalMetrics.h"
 #include <cstddef>
 #include <cstdint>
 
@@ -38,6 +39,9 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     static constexpr uint16_t RADIO_DIAGNOSTIC_REPORT_BYTES = 233;
     static constexpr uint16_t RX_LIVENESS_REPORT_BYTES = 80;
     static constexpr uint16_t PRE_SEND_ATTRIBUTION_REPORT_BYTES = 233;
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    static constexpr uint16_t SPI_YIELD_REPORT_BYTES = 80;
+#endif
 #if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
     static constexpr uint16_t RADIO_GAPS_REPORT_BYTES = 112;
 #endif
@@ -59,6 +63,10 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
         REARM_RX_LIVENESS = 8,
         SNAPSHOT_PRE_SEND_ATTRIBUTION = 9,
         SNAPSHOT_RADIO_GAPS = 10,
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+        SNAPSHOT_SPI_YIELD = 11,
+        ENABLE_SPI_YIELD = 12,
+#endif
     };
 
     enum class Kind : uint8_t {
@@ -70,6 +78,9 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
         RX_LIVENESS = 6,
         PRE_SEND_ATTRIBUTION = 7,
         OWNER_RADIO_GAPS = 8,
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+        SPI_YIELD = 9,
+#endif
     };
 
     enum class CcaReason : uint8_t {
@@ -432,6 +443,10 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
                                          const RxLivenessDiagnostics &diagnostics, uint8_t pendingTxCount);
     static size_t encodePreSendAttributionReport(uint8_t *bytes, size_t capacity, const Stats &stats,
                                                  const PreSendAttributionDiagnostics &diagnostics, uint8_t pendingTxCount);
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    static size_t encodeSpiYieldReport(uint8_t *bytes, size_t capacity, const Stats &stats,
+                                       const W12BenchmarkHalMetrics::Snapshot &metrics, uint8_t pendingTxCount);
+#endif
 #if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
     static size_t encodeRadioGapsReport(uint8_t *bytes, size_t capacity, const Stats &stats,
                                         const RadioGapDiagnostics &diagnostics, uint8_t pendingTxCount);
@@ -502,6 +517,13 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     bool rxLivenessRearmUsed = false;
     bool preSendSnapshotRequested = false;
     bool preSendSnapshotRunMatches = false;
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    bool spiYieldArmed = false;
+    bool spiYieldWindowValid = false;
+    bool spiYieldFrozen = false;
+    bool spiYieldSnapshotRequested = false;
+    bool spiYieldSnapshotRunMatches = false;
+#endif
 
     bool isLocalControl(const meshtastic_MeshPacket &mp) const;
     bool handleControl(const meshtastic_MeshPacket &mp);
@@ -533,6 +555,9 @@ class W12BenchmarkModule : public MeshModule, private concurrency::OSThread
     bool captureRxLiveness();
     bool capturePreSendAttribution();
     bool performRxLivenessRearm();
+#if W12_BENCHMARK_HAL_TIMING_ENABLED
+    void freezeSpiYieldTiming();
+#endif
     static void saturatingIncrement(uint32_t &value);
     static void saturatingAdd(uint32_t &value, uint32_t amount);
     static void recordPhaseTiming(PreSendAttributionDiagnostics::PhaseTimingMetric &metric, uint32_t sample);
