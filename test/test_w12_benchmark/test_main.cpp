@@ -1216,6 +1216,9 @@ void test_phase_timing_extension_is_bounded_and_default_off()
     diagnostics.phaseTiming.burstPrepareUs = {2, 12, 8};
     diagnostics.phaseTiming.burstGuardLateMs = {1, 4, 4};
     diagnostics.phaseTiming.rxGateDecodeUs = {4, 100, 30};
+    diagnostics.phaseTiming.pkiCcmEncodeUs = {2, 90, 55};
+    diagnostics.phaseTiming.pkiCcmDecodeUs = {3, 120, 50};
+    diagnostics.phaseTiming.pkiCcmAvailable = true;
     diagnostics.phaseTiming.failedTxCount = 1;
     diagnostics.phaseTiming.failedTxLastPacketId = 0x1234;
     diagnostics.phaseTiming.failedTxLastSequence = 37;
@@ -1244,8 +1247,19 @@ void test_phase_timing_extension_is_bounded_and_default_off()
     TEST_ASSERT_EQUAL_UINT32(0x1234, read32(wire, 183));
     TEST_ASSERT_EQUAL_UINT32(37, read32(wire, 187));
     TEST_ASSERT_EQUAL_UINT32(99, read32(wire, 191));
+    TEST_ASSERT_EQUAL_UINT32(2, read32(wire, 198));
+    TEST_ASSERT_EQUAL_UINT32(90, read32(wire, 202));
+    TEST_ASSERT_EQUAL_UINT32(55, read32(wire, 206));
+    TEST_ASSERT_EQUAL_UINT32(3, read32(wire, 210));
+    TEST_ASSERT_EQUAL_UINT32(120, read32(wire, 214));
+    TEST_ASSERT_EQUAL_UINT32(50, read32(wire, 218));
+    TEST_ASSERT_EQUAL_UINT8(1, wire[222]);
+    for (size_t offset = 223; offset < W12BenchmarkModule::PRE_SEND_ATTRIBUTION_REPORT_BYTES; offset++)
+        TEST_ASSERT_EQUAL_UINT8(0, wire[offset]);
 #else
     for (size_t offset = 130; offset <= 197; offset++)
+        TEST_ASSERT_EQUAL_UINT8(0, wire[offset]);
+    for (size_t offset = 198; offset < W12BenchmarkModule::PRE_SEND_ATTRIBUTION_REPORT_BYTES; offset++)
         TEST_ASSERT_EQUAL_UINT8(0, wire[offset]);
 #endif
 }
@@ -1284,6 +1298,113 @@ void test_phase_timing_aggregates_wrap_deadline_and_saturate()
     TEST_ASSERT_FALSE(diagnostics.phaseTiming.available);
 #endif
 }
+
+void test_pki_ccm_timing_aggregates_retry_calls_without_a_second_gate_sample()
+{
+    const auto run = runConfig();
+    myNodeInfo.my_node_num = run.source;
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::RESET, run.source)));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ProcessMessage::STOP),
+                          static_cast<int>(sendControl(run, W12BenchmarkModule::Op::START, run.source)));
+
+    testModule->onPkiCcmEncodeTiming(1, 12, 12);
+    testModule->onPkiCcmDecodeTiming(2, 80, 50);
+    testModule->onPkiCcmDecodeTiming(1, 20, 20);
+    const auto diagnostics = testModule->getPreSendAttributionDiagnostics();
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    TEST_ASSERT_TRUE(diagnostics.phaseTiming.available);
+    TEST_ASSERT_TRUE(diagnostics.phaseTiming.pkiCcmAvailable);
+    TEST_ASSERT_EQUAL_UINT32(1, diagnostics.phaseTiming.pkiCcmEncodeUs.count);
+    TEST_ASSERT_EQUAL_UINT32(12, diagnostics.phaseTiming.pkiCcmEncodeUs.sum);
+    TEST_ASSERT_EQUAL_UINT32(3, diagnostics.phaseTiming.pkiCcmDecodeUs.count);
+    TEST_ASSERT_EQUAL_UINT32(100, diagnostics.phaseTiming.pkiCcmDecodeUs.sum);
+    TEST_ASSERT_EQUAL_UINT32(50, diagnostics.phaseTiming.pkiCcmDecodeUs.max);
+#else
+    TEST_ASSERT_FALSE(diagnostics.phaseTiming.pkiCcmAvailable);
+    TEST_ASSERT_EQUAL_UINT32(0, diagnostics.phaseTiming.pkiCcmEncodeUs.count);
+    TEST_ASSERT_EQUAL_UINT32(0, diagnostics.phaseTiming.pkiCcmDecodeUs.count);
+#endif
+}
+
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+static meshtastic_MeshPacket encryptedBenchmarkForAdminFallback(const W12BenchmarkModule::RunConfig &frame, PacketId packetId,
+                                                                bool trustedAdmin = true)
+{
+    uint8_t senderPublic[32], senderPrivate[32], receiverPublic[32], receiverPrivate[32], wrongPublic[32], wrongPrivate[32];
+    crypto->generateKeyPair(senderPublic, senderPrivate);
+    crypto->generateKeyPair(receiverPublic, receiverPrivate);
+    crypto->generateKeyPair(wrongPublic, wrongPrivate);
+    auto packet = makeData(frame, 0);
+    packet.id = packetId;
+    uint8_t plaintext[256];
+    const size_t size = pb_encode_to_bytes(plaintext, sizeof(plaintext), &meshtastic_Data_msg, &packet.decoded);
+    TEST_ASSERT_GREATER_THAN_UINT32(0, size);
+    meshtastic_NodeInfoLite_public_key_t destinationKey = {};
+    destinationKey.size = sizeof(receiverPublic);
+    memcpy(destinationKey.bytes, receiverPublic, sizeof(receiverPublic));
+    crypto->setDHPrivateKey(senderPrivate);
+    TEST_ASSERT_TRUE(crypto->encryptCurve25519(frame.destination, frame.source, destinationKey, packet.id, size, plaintext,
+                                               packet.encrypted.bytes));
+    packet.which_payload_variant = meshtastic_MeshPacket_encrypted_tag;
+    packet.encrypted.size = size + MESHTASTIC_PKC_OVERHEAD;
+    packet.channel = 0;
+    packet.pki_encrypted = false;
+
+    crypto->setDHPrivateKey(receiverPrivate);
+    testNodeDB->clearTestNodes();
+    testNodeDB->addPublicKey(frame.destination, receiverPublic);
+    config.security.admin_key[0].size = sizeof(wrongPublic);
+    memcpy(config.security.admin_key[0].bytes, wrongPublic, sizeof(wrongPublic));
+    config.security.admin_key[1].size = trustedAdmin ? sizeof(senderPublic) : 0;
+    memcpy(config.security.admin_key[1].bytes, senderPublic, sizeof(senderPublic));
+    resetRoutingAuthEvaluationCount();
+    resetAdminKeyFallbackBudget();
+    return packet;
+}
+
+void test_pki_ccm_real_auth_gate_retains_failed_admin_attempt_without_double_counting_frame()
+{
+    const auto run = runConfig();
+    myNodeInfo.my_node_num = run.destination;
+    sendControl(run, W12BenchmarkModule::Op::RESET, run.destination);
+    sendControl(run, W12BenchmarkModule::Op::START, run.destination);
+    auto packet = encryptedBenchmarkForAdminFallback(run, 0x70123456);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(RoutingAuthVerdict::ACCEPT), static_cast<int>(passesRoutingAuthGate(&packet)));
+    TEST_ASSERT_EQUAL_UINT8(meshtastic_MeshPacket_encrypted_tag, packet.which_payload_variant);
+    const auto timing = testModule->getPreSendAttributionDiagnostics().phaseTiming;
+    TEST_ASSERT_TRUE(timing.pkiCcmAvailable);
+    TEST_ASSERT_EQUAL_UINT32(2, timing.pkiCcmDecodeUs.count);
+    TEST_ASSERT_EQUAL_UINT32(1, timing.rxGateDecodeUs.count);
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(timing.pkiCcmDecodeUs.max, timing.pkiCcmDecodeUs.sum);
+    // Repeating the same wire frame uses the auth cache and must not charge CCM twice.
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(RoutingAuthVerdict::ACCEPT), static_cast<int>(passesRoutingAuthGate(&packet)));
+    TEST_ASSERT_EQUAL_UINT32(2, testModule->getPreSendAttributionDiagnostics().phaseTiming.pkiCcmDecodeUs.count);
+}
+
+void test_pki_ccm_auth_gate_excludes_wrong_identity_mqtt_plain_and_failed_auth()
+{
+    const auto run = runConfig();
+    myNodeInfo.my_node_num = run.destination;
+    sendControl(run, W12BenchmarkModule::Op::RESET, run.destination);
+    sendControl(run, W12BenchmarkModule::Op::START, run.destination);
+    auto wrong = run;
+    ++wrong.runId;
+    auto packet = encryptedBenchmarkForAdminFallback(wrong, 0x70123457);
+    passesRoutingAuthGate(&packet);
+    packet = encryptedBenchmarkForAdminFallback(run, 0x70123458);
+    packet.via_mqtt = true;
+    passesRoutingAuthGate(&packet);
+    packet = makeData(run, 1, meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA, false);
+    passesRoutingAuthGate(&packet);
+    packet = encryptedBenchmarkForAdminFallback(run, 0x70123459, false);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(RoutingAuthVerdict::REJECT), static_cast<int>(passesRoutingAuthGate(&packet)));
+    const auto timing = testModule->getPreSendAttributionDiagnostics().phaseTiming;
+    TEST_ASSERT_FALSE(timing.pkiCcmAvailable);
+    TEST_ASSERT_EQUAL_UINT32(0, timing.pkiCcmDecodeUs.count);
+    TEST_ASSERT_EQUAL_UINT32(0, timing.rxGateDecodeUs.count);
+}
+#endif
 
 void setUp()
 {
@@ -1328,6 +1449,11 @@ void setup()
     RUN_TEST(test_pre_send_attribution_page_is_fixed_and_local_without_radio_sample);
     RUN_TEST(test_phase_timing_extension_is_bounded_and_default_off);
     RUN_TEST(test_phase_timing_aggregates_wrap_deadline_and_saturate);
+    RUN_TEST(test_pki_ccm_timing_aggregates_retry_calls_without_a_second_gate_sample);
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    RUN_TEST(test_pki_ccm_real_auth_gate_retains_failed_admin_attempt_without_double_counting_frame);
+    RUN_TEST(test_pki_ccm_auth_gate_excludes_wrong_identity_mqtt_plain_and_failed_auth);
+#endif
     RUN_TEST(test_diagnostic_snapshot_accepts_zero_first_receiver_window);
     RUN_TEST(test_radio_diagnostic_page_tracks_authorization_stages_buckets_and_reset);
     RUN_TEST(test_radio_diagnostic_tail_keeps_rx_done_after_completion_with_pending_tx);

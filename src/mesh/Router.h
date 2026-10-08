@@ -269,12 +269,14 @@ class Router : protected concurrency::OSThread, protected PacketHistory
 enum DecodeState { DECODE_SUCCESS, DECODE_FAILURE, DECODE_OPAQUE, DECODE_FATAL, DECODE_POLICY_REJECT };
 enum class RoutingAuthVerdict { ACCEPT, OPAQUE_RELAY_ONLY, REJECT };
 
+struct CcmTimingAggregate;
+
 /** FIXME - move this into a mesh packet class
  * Remove any encryption and decode the protobufs inside this packet (if necessary).
  *
  * @return true for success, false for corrupt packet.
  */
-DecodeState perhapsDecode(meshtastic_MeshPacket *p);
+DecodeState perhapsDecode(meshtastic_MeshPacket *p, CcmTimingAggregate *ccmTiming = nullptr);
 
 /** Apply receive authentication before routing state mutation; unknown-channel packets may remain opaque relay-only. */
 RoutingAuthVerdict passesRoutingAuthGate(meshtastic_MeshPacket *p);

@@ -858,13 +858,17 @@ RoutingAuthVerdict passesRoutingAuthGate(meshtastic_MeshPacket *p)
         w12BenchmarkModule ? w12BenchmarkModule->getStats() : W12BenchmarkModule::Stats{};
     const bool measureW12Decode =
         w12BenchmarkModule && phaseStats.running && nodeDB->getNodeNum() == phaseStats.config.destination;
+    CcmTimingAggregate ccmDecodeTiming;
     const uint32_t decodeStartedAtUs = measureW12Decode ? micros() : 0;
-    state = perhapsDecode(&authCandidate);
+    state = perhapsDecode(&authCandidate, measureW12Decode ? &ccmDecodeTiming : nullptr);
     const uint32_t decodeElapsedUs = measureW12Decode ? static_cast<uint32_t>(micros() - decodeStartedAtUs) : 0;
     // isBenchmarkData() is deliberately evaluated after the interval. It verifies the decoded
-    // run identity without charging its validation work to the decrypt/protobuf interval.
-    if (measureW12Decode && state == DecodeState::DECODE_SUCCESS && w12BenchmarkModule->isBenchmarkData(authCandidate))
+    // run identity without charging its validation work to the decrypt/protobuf interval. The CCM
+    // aggregate retains every decrypt attempt, including failed admin-key retries.
+    if (measureW12Decode && state == DecodeState::DECODE_SUCCESS && w12BenchmarkModule->isBenchmarkData(authCandidate)) {
         w12BenchmarkModule->onRxGateDecodeDuration(decodeElapsedUs);
+        w12BenchmarkModule->onPkiCcmDecodeTiming(ccmDecodeTiming.count, ccmDecodeTiming.sumUs, ccmDecodeTiming.maxUs);
+    }
 #else
     state = perhapsDecode(&authCandidate);
 #endif
@@ -955,7 +959,7 @@ static void adminKeyFallbackRefund()
 }
 #endif
 
-DecodeState perhapsDecode(meshtastic_MeshPacket *p)
+DecodeState perhapsDecode(meshtastic_MeshPacket *p, CcmTimingAggregate *ccmTiming)
 {
     concurrency::LockGuard g(cryptLock);
 
@@ -1010,7 +1014,8 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
         // reach a node that has not yet learned their key. AES-CCM AEAD rejects wrong candidates.
         bool viaAdminKey = false;
         bool viaPendingKey = false;
-        if (haveRemoteKey && crypto->decryptCurve25519(p->from, remotePublic, p->id, rawSize, p->encrypted.bytes, bytes)) {
+        if (haveRemoteKey &&
+            crypto->decryptCurve25519(p->from, remotePublic, p->id, rawSize, p->encrypted.bytes, bytes, ccmTiming)) {
             decrypted = true;
             viaPendingKey = havePendingKey;
         }
@@ -1021,7 +1026,7 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p)
                 remotePublic.size = 32;
                 memcpy(remotePublic.bytes, config.security.admin_key[i].bytes, 32);
 
-                if (crypto->decryptCurve25519(p->from, remotePublic, p->id, rawSize, p->encrypted.bytes, bytes)) {
+                if (crypto->decryptCurve25519(p->from, remotePublic, p->id, rawSize, p->encrypted.bytes, bytes, ccmTiming)) {
                     decrypted = true;
                     viaAdminKey = true;
                     break; // stop after first successful decryption
@@ -1390,7 +1395,21 @@ meshtastic_Routing_Error perhapsEncode(meshtastic_MeshPacket *p)
             }
             // On failure encrypted.bytes holds no ciphertext, so continuing would put the plaintext
             // on the air labelled pki_encrypted.
-            if (!crypto->encryptCurve25519(p->to, getFrom(p), destKey, p->id, numbytes, bytes, p->encrypted.bytes)) {
+            CcmTimingAggregate *ccmTiming = nullptr;
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
+            CcmTimingAggregate ccmEncodeTiming;
+            const bool measureW12Encode =
+                w12BenchmarkModule && w12BenchmarkModule->ownsTx(p) && w12BenchmarkModule->ownsDataIdentity(*p);
+            if (measureW12Encode)
+                ccmTiming = &ccmEncodeTiming;
+#endif
+            const bool encrypted =
+                crypto->encryptCurve25519(p->to, getFrom(p), destKey, p->id, numbytes, bytes, p->encrypted.bytes, ccmTiming);
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING && (MESHTASTIC_W12_BENCHMARK || defined(PIO_UNIT_TESTING))
+            if (measureW12Encode)
+                w12BenchmarkModule->onPkiCcmEncodeTiming(ccmEncodeTiming.count, ccmEncodeTiming.sumUs, ccmEncodeTiming.maxUs);
+#endif
+            if (!encrypted) {
                 LOG_WARN("PKI encryption failed for 0x%08x", p->to);
                 return meshtastic_Routing_Error_PKI_FAILED;
             }

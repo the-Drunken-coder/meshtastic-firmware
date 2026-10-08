@@ -16,6 +16,23 @@ struct CryptoKey {
     int8_t length;
 };
 
+// One aggregate sample per PKI CCM invocation. The caller owns this object and may retain
+// failed decrypt retries in the same aggregate.
+struct CcmTimingAggregate {
+    uint32_t count = 0;
+    uint32_t sumUs = 0;
+    uint32_t maxUs = 0;
+
+    void record(uint32_t elapsedUs)
+    {
+        if (count != UINT32_MAX)
+            ++count;
+        sumUs = UINT32_MAX - sumUs < elapsedUs ? UINT32_MAX : sumUs + elapsedUs;
+        if (elapsedUs > maxUs)
+            maxUs = elapsedUs;
+    }
+};
+
 /**
  * see docs/software/crypto.md for details.
  *
@@ -127,9 +144,11 @@ class CryptoEngine
     // a stored node header. NodeInfoLite is the on-device storage type since
     // the slim refactor flattened UserLite into it.
     virtual bool encryptCurve25519(uint32_t toNode, uint32_t fromNode, meshtastic_NodeInfoLite_public_key_t remotePublic,
-                                   uint64_t packetNum, size_t numBytes, const uint8_t *bytes, uint8_t *bytesOut);
+                                   uint64_t packetNum, size_t numBytes, const uint8_t *bytes, uint8_t *bytesOut,
+                                   CcmTimingAggregate *timing = nullptr);
     virtual bool decryptCurve25519(uint32_t fromNode, meshtastic_NodeInfoLite_public_key_t remotePublic, uint64_t packetNum,
-                                   size_t numBytes, const uint8_t *bytes, uint8_t *bytesOut);
+                                   size_t numBytes, const uint8_t *bytes, uint8_t *bytesOut,
+                                   CcmTimingAggregate *timing = nullptr);
     virtual bool setDHPublicKey(uint8_t *publicKey);
 
     // Temporary holder for a peer's not-yet-verified public key, learned in-band during an

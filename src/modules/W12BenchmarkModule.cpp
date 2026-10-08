@@ -59,6 +59,15 @@ void W12BenchmarkModule::recordPhaseTiming(PreSendAttributionDiagnostics::PhaseT
         metric.max = sample;
 }
 
+void W12BenchmarkModule::recordPhaseTimingAggregate(PreSendAttributionDiagnostics::PhaseTimingMetric &metric, uint32_t count,
+                                                    uint32_t sumUs, uint32_t maxUs)
+{
+    saturatingAdd(metric.count, count);
+    saturatingAdd(metric.sum, sumUs);
+    if (maxUs > metric.max)
+        metric.max = maxUs;
+}
+
 void W12BenchmarkModule::put16(uint8_t *bytes, uint16_t value)
 {
     bytes[0] = static_cast<uint8_t>(value);
@@ -457,6 +466,13 @@ size_t W12BenchmarkModule::encodePreSendAttributionReport(uint8_t *bytes, size_t
     put32(bytes + 191, d.phaseTiming.failedTxLastAtMs);
     bytes[195] = d.phaseTiming.failedTxLastStage;
     put16(bytes + 196, static_cast<uint16_t>(d.phaseTiming.failedTxLastRadioResult));
+    put32(bytes + 198, d.phaseTiming.pkiCcmEncodeUs.count);
+    put32(bytes + 202, d.phaseTiming.pkiCcmEncodeUs.sum);
+    put32(bytes + 206, d.phaseTiming.pkiCcmEncodeUs.max);
+    put32(bytes + 210, d.phaseTiming.pkiCcmDecodeUs.count);
+    put32(bytes + 214, d.phaseTiming.pkiCcmDecodeUs.sum);
+    put32(bytes + 218, d.phaseTiming.pkiCcmDecodeUs.max);
+    bytes[222] = static_cast<uint8_t>(d.phaseTiming.pkiCcmAvailable);
 #endif
     return PRE_SEND_ATTRIBUTION_REPORT_BYTES;
 }
@@ -763,6 +779,36 @@ void W12BenchmarkModule::onRxGateDecodeDuration(uint32_t elapsedUs)
     recordPhaseTiming(preSendDiagnostics.phaseTiming.rxGateDecodeUs, elapsedUs);
 #else
     (void)elapsedUs;
+#endif
+}
+
+void W12BenchmarkModule::onPkiCcmEncodeTiming(uint32_t count, uint32_t sumUs, uint32_t maxUs)
+{
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    if (!collectTxLifecycleDiagnostics() || count == 0)
+        return;
+    preSendDiagnostics.phaseTiming.available = true;
+    preSendDiagnostics.phaseTiming.pkiCcmAvailable = true;
+    recordPhaseTimingAggregate(preSendDiagnostics.phaseTiming.pkiCcmEncodeUs, count, sumUs, maxUs);
+#else
+    (void)count;
+    (void)sumUs;
+    (void)maxUs;
+#endif
+}
+
+void W12BenchmarkModule::onPkiCcmDecodeTiming(uint32_t count, uint32_t sumUs, uint32_t maxUs)
+{
+#if MESHTASTIC_W12_BENCHMARK_PHASE_TIMING
+    if (!collectDiagnostics() || count == 0)
+        return;
+    preSendDiagnostics.phaseTiming.available = true;
+    preSendDiagnostics.phaseTiming.pkiCcmAvailable = true;
+    recordPhaseTimingAggregate(preSendDiagnostics.phaseTiming.pkiCcmDecodeUs, count, sumUs, maxUs);
+#else
+    (void)count;
+    (void)sumUs;
+    (void)maxUs;
 #endif
 }
 

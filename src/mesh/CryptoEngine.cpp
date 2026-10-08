@@ -287,7 +287,8 @@ bool CryptoEngine::ensurePkiKeys(meshtastic_Config_SecurityConfig &security, mes
  * @param bytesOut Output buffer to be populated with encrypted ciphertext.
  */
 bool CryptoEngine::encryptCurve25519(uint32_t toNode, uint32_t fromNode, meshtastic_NodeInfoLite_public_key_t remotePublic,
-                                     uint64_t packetNum, size_t numBytes, const uint8_t *bytes, uint8_t *bytesOut)
+                                     uint64_t packetNum, size_t numBytes, const uint8_t *bytes, uint8_t *bytesOut,
+                                     CcmTimingAggregate *timing)
 {
     uint8_t *auth;
     // The extra nonce must be unpredictable: use the hardware RNG, falling back to the
@@ -309,7 +310,11 @@ bool CryptoEngine::encryptCurve25519(uint32_t toNode, uint32_t fromNode, meshtas
     // Calculate the shared secret with the destination node and encrypt
     printBytes("Attempt encrypt with nonce: ", nonce, 13);
     printBytes("Attempt encrypt with shared_key starting with: ", shared_key, 8);
+    // A non-null aggregate is the explicit opt-in for one whole CCM primitive clock.
+    const uint32_t ccmStartedAtUs = timing ? micros() : 0;
     aes_ccm_ae(shared_key, 32, nonce, 8, bytes, numBytes, nullptr, 0, bytesOut, auth);
+    if (timing)
+        timing->record(static_cast<uint32_t>(micros() - ccmStartedAtUs));
     memcpy((uint8_t *)(auth + 8), &extraNonceTmp,
            sizeof(uint32_t)); // do not use dereference on potential non aligned pointers : *extraNonce = extraNonceTmp;
     return true;
@@ -327,7 +332,7 @@ bool CryptoEngine::encryptCurve25519(uint32_t toNode, uint32_t fromNode, meshtas
  * @param bytesOut Output buffer to be populated with decrypted plaintext.
  */
 bool CryptoEngine::decryptCurve25519(uint32_t fromNode, meshtastic_NodeInfoLite_public_key_t remotePublic, uint64_t packetNum,
-                                     size_t numBytes, const uint8_t *bytes, uint8_t *bytesOut)
+                                     size_t numBytes, const uint8_t *bytes, uint8_t *bytesOut, CcmTimingAggregate *timing)
 {
     const uint8_t *auth = bytes + numBytes - 12; // set to last 8 bytes of text?
     uint32_t extraNonce;                         // pointer was not really used
@@ -348,7 +353,11 @@ bool CryptoEngine::decryptCurve25519(uint32_t fromNode, meshtastic_NodeInfoLite_
     initNonce(fromNode, packetNum, extraNonce);
     printBytes("Attempt decrypt with nonce: ", nonce, 13);
     printBytes("Attempt decrypt with shared_key starting with: ", shared_key, 8);
-    return aes_ccm_ad(shared_key, 32, nonce, 8, bytes, numBytes - 12, nullptr, 0, auth, bytesOut);
+    const uint32_t ccmStartedAtUs = timing ? micros() : 0;
+    const bool result = aes_ccm_ad(shared_key, 32, nonce, 8, bytes, numBytes - 12, nullptr, 0, auth, bytesOut);
+    if (timing)
+        timing->record(static_cast<uint32_t>(micros() - ccmStartedAtUs));
+    return result;
 }
 
 // The label is domain separation only - it never needs to be secret. It is fixed length and
